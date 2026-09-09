@@ -1033,10 +1033,18 @@ const SEMANTIC: Record<string, () => void> = {
       { preupdate: "off" },
     );
     check("  preupdate", sub.capabilities.preupdate, false);
+    // Not just "a reason is given" — WHICH reason. The option and a library
+    // genuinely built without SQLITE_ENABLE_PREUPDATE_HOOK share one code
+    // path, so the only thing keeping "you turned this off" apart from "your
+    // SQLite cannot do this" is this string. They have different remedies and
+    // must never be told to the wrong caller.
+    const why = sub.capabilities.preupdateUnavailable ?? "";
+    check("  reason given", why.length > 0, true);
+    check("  names the option", why.includes('preupdate: "off"'), true);
     check(
-      "  reason given",
-      typeof sub.capabilities.preupdateUnavailable === "string",
-      true,
+      "  does not blame the library",
+      why.includes("does not export") || why.includes("compile-time option"),
+      false,
     );
     const blob = db.openBlob({
       table: "t",

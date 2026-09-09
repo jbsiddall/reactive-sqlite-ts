@@ -79,6 +79,75 @@ The gated test prints a visible `SKIP` line naming the library when it takes the
 absent branch, so a run that quietly proved nothing is not mistakable for a run
 that proved something.
 
+### The refusal branches are a separate question, and mostly the answer is no
+
+The table above is about the branch taken when a capability is PRESENT. Each
+capability also has a branch that refuses the option when it is absent, and
+whether those run is not the same question. `deno task test:capability-coverage`
+measures it rather than asserting it: every refusal's condition is rewritten to
+`false` in the source and the semantic suite is re-run. A suite that still
+passes was not relying on that refusal.
+
+Measured against system 3.45.1, 2026-09-09:
+
+| Refusal for     | Exercised?                | By what                                          |
+| --------------- | ------------------------- | ------------------------------------------------ |
+| `normalizedSql` | yes, against real absence | 3.45.1 genuinely lacks `SQLITE_ENABLE_NORMALIZE` |
+| `trace`         | no                        | —                                                |
+| `authorize`     | no                        | —                                                |
+| `busy`          | no                        | —                                                |
+| `collation`     | no                        | —                                                |
+| `progress`      | no                        | —                                                |
+| `preupdate`     | no                        | —                                                |
+
+One of seven. That is a measured negative, recorded here rather than left as an
+absence someone later mistakes for a gap nobody checked.
+
+**Why it is not simply fixable.** A refusal can only be exercised by a library
+that genuinely lacks the symbol, or by an option that fakes the absence. Both
+reachable libraries have every symbol except `SQLITE_ENABLE_NORMALIZE`, and only
+`preupdate` has a faking option. So five of these branches have no way in at all
+from this repository.
+
+**`preupdate` is the one that looks covered and is not.** Five tests use
+`preupdate: "off"`, and they are real tests of the fallback's behaviour — the
+option and a genuinely absent API converge on one code path immediately, with
+the reason carried as data. What `"off"` cannot reach is the DETECTION: the
+`dlopen` that fails and the message composed from it, and the `"required"`
+refusal, which on a library that HAS the symbol never fires. The two reasons in
+`preupdateUnavailable` stay distinguishable on purpose, and there is now a test
+asserting the option's reason names the option and does not blame the library:
+"you turned this off" and "your SQLite was built without the flag" have
+different remedies, and telling a caller the wrong one sends them to rebuild
+SQLite over a config line.
+
+`--check` compares the measurement against the states recorded in the tool and
+fails on drift in either direction, so a branch that starts being exercised has
+to be recorded as such and one that stops has to be explained. The tool has two
+pinned controls — `normalizedSql` must classify as covered, `progress` as
+uncovered — and withholds the whole report if either is wrong, because a wrong
+control means every other row came out of the same broken machinery. Finding
+zero branches is also a failure: a table of no rows reads as "nothing
+uncovered".
+
+### Recommendation: the prebuilt column should not survive vendoring
+
+The `@db/sqlite prebuilt` column in README's capability table is the only
+library reachable here that genuinely lacks `preupdate` and `progress`, so it is
+the only thing that could ever cover those two refusals. It is also not a
+library this project chooses, pins or ships: it is whatever `@db/sqlite` 0.13.0
+downloads into `$DENO_DIR/plug/` when `DENO_SQLITE_PATH` is unset, it changes
+without notice, and once the vendored library ships it is not a configuration
+any user of this package is in.
+
+Recommendation: **drop the column** when the table is regenerated at vendoring,
+and keep this section as the record of what went with it. Reporting a library
+nobody runs, cannot pin, and is being actively steered away from is worse than
+reporting two columns and saying plainly that five refusal branches have no
+library here that can reach them. The alternative — keeping the column to hold
+onto two rows of coverage — buys coverage of a configuration the project is
+telling people not to use.
+
 ### Which callbacks can be on the stack at once
 
 Three of our callbacks fire MID-STATEMENT: `preupdate`, trace `row`, and

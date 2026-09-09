@@ -668,8 +668,23 @@ export type EventOptions = {
    *   to find out which happened; `preupdate` events simply never arrive in the
    *   second case.
    * - `"required"` — throw a {@linkcode SqliteHooksError} at attach time rather
-   *   than let a caller believe validation is running when it is not.
-   * - `"off"` — do not even look for it. Also how the fallback path is tested.
+   *   than let a caller believe validation is running when it is not. Its
+   *   message says which of the two facts it is: the option, or the build.
+   * - `"off"` — do not even look for it. From there on the connection takes
+   *   the SAME path a library genuinely without the API takes: no preupdate
+   *   symbols are opened, `preupdate` is false, `preupdate` events never
+   *   arrive, and `"required"` is refused. What it does NOT stand in for is
+   *   the DETECTION — the dlopen that fails, and the message composed from
+   *   that failure. So `"off"` exercises the fallback's BEHAVIOUR but not its
+   *   trigger, and a test using it has not shown what happens on a library
+   *   that really lacks the symbol.
+   *
+   * {@linkcode Capabilities.preupdateUnavailable} keeps the two apart on
+   * purpose. "You turned this off" and "your libsqlite3 was built without
+   * SQLITE_ENABLE_PREUPDATE_HOOK" have different remedies — a config line
+   * versus a different SQLite — so one mechanism carries two distinguishable
+   * reasons rather than collapsing into one message that would misdirect
+   * whichever caller it was not written for.
    */
   preupdate?: "auto" | "required" | "off";
 };
