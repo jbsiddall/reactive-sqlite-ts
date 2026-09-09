@@ -7,6 +7,7 @@
  */
 import type {
   Attachment,
+  AttachOptions,
   Backend,
   BackendHandlers,
   RawPreUpdate,
@@ -71,13 +72,39 @@ const PREUPDATE_SYMBOLS = {
   sqlite3_value_bytes: { parameters: ["pointer"], result: "i32" },
 } as const;
 
+/**
+ * WAL. Absent only from a build made with SQLITE_OMIT_WAL, but opened
+ * separately for the same reason preupdate is: a missing optional feature must
+ * not read as "your libsqlite3 is unusable".
+ */
+const WAL_SYMBOLS = {
+  sqlite3_wal_hook: {
+    parameters: ["pointer", "function", "pointer"],
+    result: "pointer",
+  },
+  /** (db, zDb, mode, out nLog, out nCkpt) -> rc. Mode 0 is PASSIVE. */
+  sqlite3_wal_checkpoint_v2: {
+    parameters: ["pointer", "pointer", "i32", "pointer", "pointer"],
+    result: "i32",
+  },
+} as const;
+
+/** PASSIVE: what sqlite3_wal_checkpoint(), and so SQLite's own hook, uses. */
+const CHECKPOINT_PASSIVE = 0;
+
 type CoreLib = Deno.DynamicLibrary<typeof SYMBOLS>;
+type WalLib = Deno.DynamicLibrary<typeof WAL_SYMBOLS>;
 type PreSymbols = Deno.DynamicLibrary<typeof PREUPDATE_SYMBOLS>["symbols"];
 
 /** SQLITE_NULL etc., as returned by sqlite3_value_type. */
 const VALUE_INTEGER = 1, VALUE_FLOAT = 2, VALUE_TEXT = 3, VALUE_BLOB = 4;
 
-type Opened = { lib: CoreLib; pre: PreSymbols | null; unavailable: string };
+type Opened = {
+  lib: CoreLib;
+  pre: PreSymbols | null;
+  wal: WalLib | null;
+  unavailable: string;
+};
 
 /**
  * Capabilities are DERIVED from `pre`, never carried beside it: two fields
@@ -85,11 +112,14 @@ type Opened = { lib: CoreLib; pre: PreSymbols | null; unavailable: string };
  * preupdate events the caller believes it does not have.
  */
 const capabilitiesOf = (opened: Opened): Capabilities =>
-  opened.pre !== null ? { hooks: true, preupdate: true } : {
-    hooks: true,
-    preupdate: false,
-    preupdateUnavailable: opened.unavailable,
-  };
+  opened.pre !== null
+    ? { hooks: true, preupdate: true, wal: opened.wal !== null }
+    : {
+      hooks: true,
+      preupdate: false,
+      preupdateUnavailable: opened.unavailable,
+      wal: opened.wal !== null,
+    };
 
 /**
  * dlopen the library, taking the preupdate API if it is there.
@@ -119,7 +149,12 @@ function openLibrary(
           ...PREUPDATE_SYMBOLS,
         } as const,
       );
-      return { lib: full, pre: full.symbols, unavailable: "" };
+      return {
+        lib: full,
+        pre: full.symbols,
+        wal: openWal(libPath),
+        unavailable: "",
+      };
     } catch (cause) {
       // Either the preupdate API is absent (the interesting case) or the whole
       // library is wrong — the core dlopen below tells those two apart.
@@ -144,7 +179,16 @@ function openLibrary(
       `preupdate: "required" was asked for, but ${unavailable}`,
     );
   }
-  return { lib, pre: null, unavailable };
+  return { lib, pre: null, wal: openWal(libPath), unavailable };
+}
+
+/** Null when the build has no WAL. Its own handle, so its absence is isolated. */
+function openWal(libPath: string): WalLib | null {
+  try {
+    return Deno.dlopen(libPath, WAL_SYMBOLS);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -157,6 +201,7 @@ export function probeFfi(libPath: string): Capabilities {
     return capabilitiesOf(opened);
   } finally {
     opened.lib.close();
+    opened.wal?.close();
   }
 }
 
@@ -167,7 +212,7 @@ export function openFfiBackend(
   want: NonNullable<EventOptions["preupdate"]>,
 ): Backend {
   const opened = openLibrary(libPath, want);
-  const { lib, pre } = opened;
+  const { lib, pre, wal } = opened;
   const capabilities = capabilitiesOf(opened);
   const version = readC(lib.symbols.sqlite3_libversion());
 
@@ -290,8 +335,12 @@ export function openFfiBackend(
   return {
     capabilities,
     version,
-    close: () => release(() => lib.close()),
-    attach(handlers: BackendHandlers): Attachment {
+    close: () =>
+      release(() => {
+        lib.close();
+        wal?.close();
+      }),
+    attach(handlers: BackendHandlers, options: AttachOptions): Attachment {
       const preupdateCb = pre
         ? new Deno.UnsafeCallback(
           {
@@ -348,6 +397,38 @@ export function openFfiBackend(
         },
       );
 
+      const threshold = options.walCheckpointThreshold;
+      const walCb = wal
+        ? new Deno.UnsafeCallback(
+          {
+            parameters: ["pointer", "pointer", "pointer", "i32"],
+            result: "i32",
+          } as const,
+          (_arg, dbh, zDb, frames) => {
+            safely(handlers, () => {
+              // Checkpoint FIRST, exactly as sqlite3WalDefaultHook did before
+              // our hook displaced it, so a slow or throwing listener cannot
+              // cost the database a checkpoint. Its result is discarded for
+              // the same reason SQLite discards it.
+              if (threshold !== null && frames >= threshold) {
+                wal.symbols.sqlite3_wal_checkpoint_v2(
+                  dbh,
+                  zDb,
+                  CHECKPOINT_PASSIVE,
+                  null,
+                  null,
+                );
+              }
+              handlers.wal(() => ({ db: readC(zDb), frames }));
+            });
+            // Always SQLITE_OK: a non-OK return makes the statement that
+            // provoked an already-completed commit report an error, and the
+            // listener has no say in that.
+            return 0;
+          },
+        )
+        : null;
+
       const rollback = new Deno.UnsafeCallback(
         { parameters: ["pointer"], result: "void" } as const,
         () => safely(handlers, () => handlers.rollback()),
@@ -359,6 +440,7 @@ export function openFfiBackend(
       commit.unref();
       rollback.unref();
       preupdateCb?.unref();
+      walCb?.unref();
 
       if (pre && preupdateCb) {
         pre.sqlite3_preupdate_hook(handle, preupdateCb.pointer, null);
@@ -366,6 +448,9 @@ export function openFfiBackend(
       lib.symbols.sqlite3_update_hook(handle, update.pointer, null);
       lib.symbols.sqlite3_commit_hook(handle, commit.pointer, null);
       lib.symbols.sqlite3_rollback_hook(handle, rollback.pointer, null);
+      if (wal && walCb) {
+        wal.symbols.sqlite3_wal_hook(handle, walCb.pointer, null);
+      }
 
       return {
         detach: (live: boolean) =>
@@ -377,12 +462,15 @@ export function openFfiBackend(
               lib.symbols.sqlite3_commit_hook(handle, null, null);
               lib.symbols.sqlite3_rollback_hook(handle, null, null);
               pre?.sqlite3_preupdate_hook(handle, null, null);
+              if (walCb) wal?.symbols.sqlite3_wal_hook(handle, null, null);
             }
             update.close();
             commit.close();
             rollback.close();
             preupdateCb?.close();
+            walCb?.close();
             lib.close();
+            wal?.close();
           }),
       };
     },

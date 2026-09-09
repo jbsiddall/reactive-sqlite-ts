@@ -16,6 +16,13 @@ import type { Capabilities, RowValue } from "./hooks.ts";
 /** SQLite's own opcodes, as both sides of the seam must agree on them. */
 export const SQLITE_DELETE = 9, SQLITE_INSERT = 18, SQLITE_UPDATE = 23;
 
+/** One WAL commit, as sqlite3_wal_hook reports it. */
+export type RawWal = {
+  db: string;
+  /** Frames in the WAL, as SQLite counted them BEFORE any checkpoint of ours. */
+  frames: number;
+};
+
 /** One row from the update hook, already read out of SQLite's memory. */
 export type RawChange = {
   opcode: number;
@@ -59,6 +66,12 @@ export type BackendHandlers = {
    */
   update(read: () => RawChange): void;
   preupdate(read: () => RawPreUpdate): void;
+  /**
+   * A WAL commit. The listener cannot veto: SQLite treats a non-OK return as
+   * an error on the provoking statement, and the commit has already happened,
+   * so a backend must always report success whatever this does.
+   */
+  wal(read: () => RawWal): void;
   /** `true` turns the COMMIT into a ROLLBACK. */
   commit(): boolean;
   rollback(): void;
@@ -68,6 +81,15 @@ export type BackendHandlers = {
    * raised BELOW the seam can be reported without unwinding through C.
    */
   fail(error: unknown): void;
+};
+
+export type AttachOptions = {
+  /**
+   * Frames after which the backend checkpoints from inside the WAL hook,
+   * replicating what SQLite's own hook did before ours displaced it. `null`
+   * hands checkpointing to the caller entirely.
+   */
+  walCheckpointThreshold: number | null;
 };
 
 export type Attachment = {
@@ -83,7 +105,7 @@ export interface Backend {
   readonly capabilities: Capabilities;
   /** The SQLite version this backend is bound to, for the same-library check. */
   readonly version: string;
-  attach(handlers: BackendHandlers): Attachment;
+  attach(handlers: BackendHandlers, options: AttachOptions): Attachment;
   /** Release the backend without ever having attached. */
   close(): void;
 }

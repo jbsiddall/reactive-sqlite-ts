@@ -150,7 +150,7 @@ return value can change what the database does.
 | Commit                      | `sqlite3_commit_hook`      | yes | no   | **yes** → rollback         | Scope is the whole transaction, not one row              |
 | Rollback                    | `sqlite3_rollback_hook`    | no  | yes  | no                         |                                                          |
 | Commit landed               | — (synthesised)            | no  | yes  | n/a, already happened      | No C hook: commit hook runs _before_ commit              |
-| 📅 WAL frame written        | `sqlite3_wal_hook`         | no  | yes  | no; controls checkpoint    |                                                          |
+| WAL commit written          | `sqlite3_wal_hook`         | no  | yes  | **no** — see note below    | Displaces auto-checkpointing; we replicate it            |
 | 📅 Statement lifecycle      | `sqlite3_trace_v2`         | yes | yes  | no                         |                                                          |
 | 📅 Statement progress       | `sqlite3_progress_handler` | —   | —    | **yes** → aborts stmt      | Fires during execution                                   |
 | 📅 Lock contention          | `sqlite3_busy_handler`     | —   | —    | **yes** → retry or busy    | Fires during execution                                   |
@@ -199,7 +199,7 @@ wa-sqlite has had no npm release since January 2024.
 | `commit_hook`                    | yes, and can veto           | not in a release; PR #1337 open       | no                                      | no           | no                                      | no                      | yes         |
 | `rollback_hook`                  | yes                         | not in a release; PR #1337 open       | no                                      | no           | no                                      | no                      | yes         |
 | post-commit (synthesised)        | yes                         | no                                    | no                                      | no           | no                                      | no                      | no          |
-| `wal_hook`                       | 📅                          | no                                    | no                                      | no           | no                                      | no                      | no          |
+| `wal_hook`                       | yes                         | no                                    | no                                      | no           | no                                      | no                      | no          |
 | `trace_v2` / profile             | 📅                          | `verbose` option logs each SQL string | `diagnostics_channel` `sqlite.db.query` | no           | yes — `trace` and `profile` events      | no                      | yes         |
 | `progress_handler`               | 📅                          | no                                    | no                                      | no           | no                                      | no                      | yes         |
 | busy handler / timeout           | 📅 handler                  | `timeout` option                      | `timeout` option                        | no           | `configure("busyTimeout")`              | no                      | yes, both   |
@@ -366,6 +366,87 @@ verified so far.
     SQLite does not specify whether the callback runs before or after the row is
     written. Do not build ordering assumptions on it; use `preupdate_hook`,
     which is defined to run before.
+
+### The WAL hook returns a value, and it is not a veto
+
+`sqlite3_wal_hook`'s callback returns an int, which reads like a veto and is not
+one. SQLite invokes it _after_ the commit has taken place and the write lock is
+released. A non-`SQLITE_OK` return does not undo anything: it propagates so that
+the statement which provoked the commit reports an error, "though the commit
+will have still occurred", and returning `SQLITE_ROW`, `SQLITE_DONE` or any
+value that is not a valid error code is undefined behaviour. This library
+therefore always returns `SQLITE_OK`, whatever a listener does, and the `wal`
+event is a **void contract**: your return value is ignored, exactly as for
+`change`, `preupdate`, `postcommit` and `rollback`.
+
+### WAL mode, checkpointing, and what attaching would otherwise cost you
+
+Row and commit events are **identical** in WAL mode and in rollback-journal mode
+— same event types, same order, same batching (verified on SQLite 3.45.1). The
+only difference is that `wal` events exist in WAL mode and never fire outside
+it.
+
+Registering a WAL hook is not free, and the cost is not obvious. SQLite
+implements **automatic checkpointing by installing its own WAL hook**:
+`sqlite3_wal_autocheckpoint()` is a wrapper around `sqlite3_wal_hook()`. A
+connection may have only one, so registering ours displaces SQLite's and
+auto-checkpointing stops — with no error, no exception, and a write-ahead log
+that then grows without bound. Measured on SQLite 3.45.1 over 4000 commits of a
+2 KB row: the WAL settles at 4.1 MB untouched, and reaches 33.3 MB and climbing
+with a naive hook installed.
+
+So this library does not leave it displaced. At attach it reads the threshold
+actually in force and replicates what it took over: a PASSIVE checkpoint from
+inside the hook once the frame count reaches that threshold, which is precisely
+what SQLite's own hook does. The default is that **attaching changes nothing
+except that events now arrive**. If you want the job yourself, say so
+explicitly:
+
+```ts
+withEvents(db, listener, LIB, { checkpoint: "caller" });
+```
+
+and **you are then responsible for periodic checkpoints or your WAL grows
+without bound**. To change the threshold rather than the ownership, pass
+`walCheckpointThreshold` — do not use the pragma, for the reason below.
+
+**`PRAGMA wal_autocheckpoint` is not usable while attached.** Setting it
+re-registers SQLite's hook, which removes ours, and `wal` events stop. This
+library detects that at the next commit and reports it through
+`onListenerError`; it does **not** silently reinstall itself, because you asked
+for your checkpointing back and taking it away again would leave you fighting a
+library you cannot see. Re-attach when you want events again. Reading the pragma
+is no better: while our hook is installed it returns `0`, because from SQLite's
+point of view auto-checkpointing is off — we are doing it.
+
+### A second connection is invisible
+
+The hooks are per-connection. A write made on any other connection to the same
+file — another `Database` in this process, or another process entirely — fires
+**nothing at all** here, and this is verified rather than assumed: a second
+connection inserting a row produced no events on ours, while a subsequent read
+on ours returned the new row. Data changed, the change stream said nothing, and
+the next query saw it.
+
+If more than one writer touches the database, these events are not a complete
+description of what changed, and invalidation built only on them will serve
+stale results. There is no fix inside this library: SQLite has no cross-process
+change notification. Either funnel writes through the connection you attached
+to, or treat the events as a fast path over a slower source of truth.
+
+### Not verified here
+
+Stated as open questions rather than as claims, because they have not been
+tested in this repository:
+
+- Whether writes to SQLite's internal system tables (`sqlite_sequence` and
+  friends) are reported. `sqlite3_update_hook` is documented as not firing for
+  them; untested here.
+- Whether hooks fire for writes to an `ATTACH`-ed schema. The events carry a
+  schema name, which suggests they do, but "suggests" is why this is in this
+  list.
+- Whether row changes made by triggers, including recursive triggers, are
+  reported, and at what `depth`.
 
 ### The dispose boundary
 

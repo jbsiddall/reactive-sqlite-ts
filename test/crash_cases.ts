@@ -971,6 +971,37 @@ export const CASES: Record<string, CrashCase> = {
     },
   },
 
+  "wal-hook-lifetime": {
+    code: 0,
+    match: "survived",
+    why:
+      "The WAL hook is a fourth callback with its own library handle, and it checkpoints from inside itself. Drive a real checkpoint, then dispose while the connection is live, then close: a lifetime bug here frees a callback SQLite still holds.",
+    run() {
+      const dir = Deno.makeTempDirSync({ prefix: "reactive-sqlite-wal-" });
+      const path = `${dir}/lifetime.db`;
+      const db = new Database(path);
+      db.exec("PRAGMA journal_mode=WAL");
+      db.exec("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)");
+      let wals = 0;
+      const sub = withEvents(
+        db,
+        (e) => {
+          if (e.type === "wal") wals++;
+        },
+        LIB,
+        { walCheckpointThreshold: 8 },
+      );
+      const ins = db.prepare("INSERT INTO t VALUES (?, ?)");
+      const filler = "x".repeat(2000);
+      for (let i = 0; i < 400; i++) ins.run(i, filler);
+      ins.finalize();
+      sub.dispose();
+      db.exec("INSERT INTO t VALUES (9999, 'after dispose')");
+      db.close();
+      console.log(wals > 0 ? "survived" : "FAIL no wal events");
+    },
+  },
+
   "property-no-permutation-crashes": {
     code: 0,
     match: "survived",

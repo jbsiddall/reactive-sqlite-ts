@@ -39,6 +39,10 @@ let lastBatch = 0;
 withEvents(db, (e: DbEvent) => {
   // per-row noise; the batched events are the interesting ones
   if (e.type === "change" || e.type === "preupdate") return undefined;
+  if (e.type === "wal") {
+    console.log(`   [wal] ${e.db}, ${e.frames} frames`);
+    return undefined;
+  }
   const rows = e.changes.length > 5
     ? `${e.changes.length} rows`
     : e.changes.map((c) => `${c.op} ${c.table}#${c.rowid}`).join(", ") ||

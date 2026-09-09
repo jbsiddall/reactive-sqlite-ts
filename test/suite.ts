@@ -122,7 +122,7 @@ function record(db: Db, options = {}) {
       // preupdate is deliberately not recorded here: these scenarios are about
       // the commit lifecycle, and the preupdate scenarios below collect their
       // own events.
-      if (e.type === "preupdate") return;
+      if (e.type === "preupdate" || e.type === "wal") return;
       log.push(
         e.type === "change"
           ? { type: "change", n: 1 }
@@ -192,6 +192,45 @@ const TX_VARIANTS = ["default", "deferred", "immediate", "exclusive"] as const;
 const msg = (e: unknown): string => e instanceof Error ? e.message : String(e);
 
 const name_ = (e: unknown): string => e instanceof Error ? e.name : typeof e;
+
+const WAL_DIR = Deno.makeTempDirSync({ prefix: "reactive-sqlite-wal-" });
+
+const removeDb = (path: string) => {
+  for (const suffix of ["", "-wal", "-shm"]) {
+    try {
+      Deno.removeSync(path + suffix);
+    } catch { /* already gone */ }
+  }
+};
+
+/** A real file, because WAL mode needs one. */
+const walDb = (name: string): { db: Db; path: string } => {
+  const path = `${WAL_DIR}/${name}.db`;
+  removeDb(path);
+  const db = new Database(path);
+  db.exec("PRAGMA journal_mode=WAL");
+  db.exec("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)");
+  return { db, path };
+};
+
+const walBytes = (path: string): number => {
+  try {
+    return Deno.statSync(`${path}-wal`).size;
+  } catch {
+    return 0;
+  }
+};
+
+/** Enough commits of enough bytes to cross the default 1000-frame threshold. */
+const fill = (db: Db, n: number) => {
+  const ins = db.prepare("INSERT INTO t VALUES (?, ?)");
+  const filler = "x".repeat(2000);
+  try {
+    for (let i = 0; i < n; i++) ins.run(i, filler);
+  } finally {
+    ins.finalize();
+  }
+};
 
 const liveHandle = (db: Db): Deno.PointerObject => {
   const h = db.unsafeHandle;
@@ -1304,8 +1343,9 @@ const SEMANTIC: Record<string, () => void> = {
       },
       commit: () => false,
       rollback: () => {},
+      wal: () => {},
       fail: () => {},
-    });
+    }, { walCheckpointThreshold: null });
     db.exec("INSERT INTO t VALUES (1, 'a')");
     db.exec("INSERT INTO t VALUES (2, 'b')");
     check("  both rows handed over", handed, 2);
@@ -1329,8 +1369,9 @@ const SEMANTIC: Record<string, () => void> = {
       preupdate: () => {},
       commit: () => false,
       rollback: () => {},
+      wal: () => {},
       fail: () => {},
-    });
+    }, { walCheckpointThreshold: null });
     at.detach(true);
     detachedThenClosed.close();
     check("  close() after detach()", true, true);
@@ -1346,12 +1387,158 @@ const SEMANTIC: Record<string, () => void> = {
       preupdate: () => {},
       commit: () => false,
       rollback: () => {},
+      wal: () => {},
       fail: () => {},
-    });
+    }, { walCheckpointThreshold: null });
     at.detach(true);
     at.detach(true);
     check("  survived a second detach", true, true);
     db.close();
+  },
+
+  "a WAL commit emits a wal event with the database and frame count"() {
+    const { db, path } = walDb("wal-event");
+    const seen: Array<{ db: string; frames: number }> = [];
+    withEvents(db, (e) => {
+      if (e.type === "wal") seen.push({ db: e.db, frames: e.frames });
+    }, LIB);
+    db.exec("INSERT INTO t VALUES (1, 'a')");
+    db.exec("INSERT INTO t VALUES (2, 'b')");
+    check("  one per commit", seen.length, 2);
+    check("  the schema name", seen.map((w) => w.db), ["main", "main"]);
+    check(
+      "  frames climb",
+      (seen[1]?.frames ?? 0) > (seen[0]?.frames ?? 0),
+      true,
+    );
+    db.close();
+    removeDb(path);
+  },
+
+  "no wal event in rollback-journal mode"() {
+    const db = memory();
+    let wals = 0;
+    withEvents(db, (e) => {
+      if (e.type === "wal") wals++;
+    }, LIB);
+    db.exec("INSERT INTO t VALUES (1, 'a')");
+    check("  none", wals, 0);
+    db.close();
+  },
+
+  "attaching preserves auto-checkpointing"() {
+    // The bar: after installing our hook the WAL must behave as it did before,
+    // except that events now arrive. Our hook displaces SQLite's, which IS
+    // auto-checkpointing, so without replicating it the file grows unbounded.
+    const control = walDb("wal-control");
+    fill(control.db, 1500);
+    const controlSize = walBytes(control.path);
+    control.db.close();
+    removeDb(control.path);
+
+    const ours = walDb("wal-preserve");
+    withEvents(ours.db, () => {}, LIB);
+    fill(ours.db, 1500);
+    const oursSize = walBytes(ours.path);
+    ours.db.close();
+    removeDb(ours.path);
+
+    check("  the control checkpointed", controlSize > 0, true);
+    check(
+      "  and so did we, within a checkpoint's worth",
+      oursSize <= controlSize * 2,
+      true,
+    );
+  },
+
+  "checkpoint: 'caller' hands the job over, and the WAL grows"() {
+    const ours = walDb("wal-caller");
+    withEvents(ours.db, () => {}, LIB, { checkpoint: "caller" });
+    fill(ours.db, 1500);
+    const size = walBytes(ours.path);
+    ours.db.close();
+    removeDb(ours.path);
+
+    const control = walDb("wal-caller-control");
+    fill(control.db, 1500);
+    const controlSize = walBytes(control.path);
+    control.db.close();
+    removeDb(control.path);
+    check("  nobody checkpointed", size > controlSize * 2, true);
+  },
+
+  "PRAGMA wal_autocheckpoint while attached is detected and reported"() {
+    const { db, path } = walDb("wal-displaced");
+    const errs: string[] = [];
+    let wals = 0;
+    withEvents(
+      db,
+      (e) => {
+        if (e.type === "wal") wals++;
+      },
+      LIB,
+      { onListenerError: (e) => errs.push(msg(e)) },
+    );
+    db.exec("INSERT INTO t VALUES (1, 'a')");
+    const before = wals;
+    db.exec("PRAGMA wal_autocheckpoint=1000");
+    db.exec("INSERT INTO t VALUES (2, 'b')");
+    check("  events stopped", wals, before);
+    check(
+      "  and we said so",
+      errs.some((e) => e.includes("removes ours")),
+      true,
+    );
+    db.close();
+    removeDb(path);
+  },
+
+  "a thenable from a wal listener fails closed, and a return warns once"() {
+    // The shared dispatch already does this. Asserted here anyway, because
+    // "the shared path handles it" is the assumption that stops being true
+    // when another callback path is added.
+    const veto = walDb("wal-thenable");
+    const warnedAbout = captureWarnings();
+    try {
+      withEvents(
+        veto.db,
+        (e) => e.type === "wal" ? Promise.resolve(false) : undefined,
+        LIB,
+      );
+      veto.db.exec("INSERT INTO t VALUES (1, 'a')");
+    } finally {
+      warnedAbout.stop();
+    }
+    // wal is a void contract, so "fails closed" means the thenable can never
+    // be mistaken for a verdict: it is warned about and the commit stands.
+    check(
+      "  the thenable was warned about, not obeyed",
+      warnedAbout.lines.some((l) => l.includes('from a "wal" event')),
+      true,
+    );
+    check("  the commit still landed", rows(veto.db), 1);
+    veto.db.close();
+    removeDb(veto.path);
+
+    const warned = captureWarnings();
+    const chatty = walDb("wal-warn");
+    try {
+      const walListener = (e: DbEvent) => e.type === "wal" ? 1 : undefined;
+      withEvents(chatty.db, walListener, LIB);
+      for (let i = 0; i < 3; i++) {
+        chatty.db.exec(`INSERT INTO t VALUES (${i}, 'a')`);
+      }
+    } finally {
+      warned.stop();
+    }
+    check("  warned once for three commits", warned.lines.length, 1);
+    check(
+      "  named the listener",
+      warned.lines[0]?.includes("walListener"),
+      true,
+    );
+    chatty.db.close();
+    removeDb(chatty.path);
   },
 
   "an opcode outside the documented three is delivered as 'unknown'"() {

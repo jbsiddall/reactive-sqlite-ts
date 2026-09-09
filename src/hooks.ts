@@ -100,7 +100,7 @@
  *   check).
  */
 import type { Database } from "@db/sqlite";
-import type { Backend, RawChange, RawPreUpdate } from "./backend.ts";
+import type { Backend, RawChange, RawPreUpdate, RawWal } from "./backend.ts";
 import { SQLITE_DELETE, SQLITE_INSERT, SQLITE_UPDATE } from "./backend.ts";
 import { openFfiBackend, probeFfi } from "./backend_ffi.ts";
 
@@ -267,11 +267,37 @@ export type DbEvent =
    * own veto, or a close with a transaction still open. Must not touch the
    * connection.
    */
-  | ({ type: "rollback" } & Batch);
+  | ({ type: "rollback" } & Batch)
+  /**
+   * A commit landed in the write-ahead log. Only in WAL mode, and only when
+   * the library has {@linkcode Capabilities.wal}. Cannot veto: SQLite has
+   * already committed, and a non-OK return would only make the provoking
+   * statement report an error.
+   */
+  | { type: "wal"; db: string; frames: number };
 
 export type Listener = (e: DbEvent) => unknown;
 
 export type EventOptions = {
+  /**
+   * Who checkpoints the write-ahead log.
+   *
+   * Registering a WAL hook DISPLACES SQLite's own, and SQLite's own is what
+   * implements auto-checkpointing — so attaching would otherwise stop a WAL
+   * growing without bound, silently, on a caller who only asked for events.
+   *
+   * `"preserve"` (the default) replicates what was displaced: the threshold in
+   * force at attach time, checkpointed PASSIVE from inside the hook, exactly
+   * as SQLite did it. `"caller"` hands the job over — choose it and **you are
+   * responsible for periodic checkpoints or your WAL grows without bound**.
+   */
+  checkpoint?: "preserve" | "caller";
+  /**
+   * Frames after which to checkpoint, overriding whatever is in force at
+   * attach. Set it here rather than with `PRAGMA wal_autocheckpoint`, which
+   * would remove our hook and end WAL events.
+   */
+  walCheckpointThreshold?: number;
   /**
    * Rows retained per transaction before the batch is reported as
    * `coverage: "truncated"`.
@@ -309,6 +335,8 @@ export type Capabilities = {
   readonly preupdate: boolean;
   /** Why `preupdate` is false — a dlopen error, or the `preupdate: "off"` option. */
   readonly preupdateUnavailable?: string;
+  /** sqlite3_wal_hook: WAL commit events. False on a build made with SQLITE_OMIT_WAL. */
+  readonly wal: boolean;
 };
 
 /** A single listener's registration. `dispose()` is idempotent. */
@@ -658,10 +686,45 @@ function attach(
     return b;
   };
 
+  let walDisplaced = false;
+  /**
+   * `PRAGMA wal_autocheckpoint` reads 0 while our hook is installed, so any
+   * other value means something re-registered SQLite's — which removes ours
+   * and ends WAL events. Reported, never repaired: the caller asked for their
+   * checkpointing back and taking it away again would leave them fighting a
+   * library they cannot see. Re-attaching is their call.
+   *
+   * Read here rather than in the hook: the hook may not touch the connection.
+   */
+  const checkWalHook = () => {
+    if (walDisplaced || !capabilities.wal || reg.closed || reg.detached) return;
+    let live: number | undefined;
+    try {
+      live = rawPrepare("PRAGMA wal_autocheckpoint").get<
+        { wal_autocheckpoint: number }
+      >()?.wal_autocheckpoint;
+    } catch {
+      return; // the connection is not answering; not our news to break
+    }
+    if (live === undefined || live === 0) return;
+    walDisplaced = true;
+    errors.push({
+      error: new SqliteHooksError(
+        `PRAGMA wal_autocheckpoint was set to ${live} on this connection, which re-registers SQLite's own WAL hook and removes ours: no further wal events will arrive. Set the threshold with the walCheckpointThreshold option instead, and re-attach to get events back.`,
+      ),
+      event: { type: "change", change: NO_ROW },
+    });
+  };
+
   const drain = () => {
+    let drained = false;
     for (let b = committed.shift(); b !== undefined; b = committed.shift()) {
+      drained = true;
       dispatch({ type: "postcommit", ...b });
     }
+    // Once per commit, not per statement: a pragma read is ~1.4us against a
+    // commit's ~105us, but there is no reason to pay it on a bare SELECT.
+    if (drained) checkWalHook();
   };
 
   const describe = (e: unknown) => e instanceof Error ? e.message : String(e);
@@ -818,6 +881,24 @@ function attach(
    * enforces the seam's "must never throw" contract on this side: a listener
    * error is recorded and reported from JS, never unwound through C.
    */
+  // Read BEFORE the hook is installed: once ours is registered the pragma
+  // reports 0, because SQLite considers auto-checkpointing off — we are doing
+  // it. This ordering is load-bearing, not convenience.
+  const walThreshold = (): number | null => {
+    if (!capabilities.wal || options.checkpoint === "caller") return null;
+    const asked = options.walCheckpointThreshold;
+    if (asked !== undefined) return asked;
+    try {
+      const row = rawPrepare("PRAGMA wal_autocheckpoint").get<
+        { wal_autocheckpoint: number }
+      >();
+      return row?.wal_autocheckpoint ?? null;
+    } catch {
+      return null;
+    }
+  };
+  const checkpointThreshold = walThreshold();
+
   const attachment = backend.attach({
     update: (read: () => RawChange) =>
       inFfi(undefined, () => {
@@ -921,6 +1002,12 @@ function attach(
         return false;
       }),
 
+    wal: (read: () => RawWal) =>
+      inFfi(undefined, () => {
+        const raw = read();
+        dispatch({ type: "wal", db: raw.db, frames: raw.frames });
+      }),
+
     // The seam's other direction: an error raised BELOW it, before any handler
     // ran. Recorded like any listener error rather than crossing back into C.
     fail: (error: unknown) =>
@@ -939,7 +1026,7 @@ function attach(
         // exactly as invisible here as it is on the commit path.
         dispatch({ type: "rollback", ...b });
       }),
-  });
+  }, { walCheckpointThreshold: checkpointThreshold });
 
   let torn = false;
   reg.teardown = () => {
