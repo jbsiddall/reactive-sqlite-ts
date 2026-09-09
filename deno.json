@@ -63,7 +63,8 @@
     "noImplicitOverride": true,
     "noFallthroughCasesInSwitch": true,
     "noImplicitReturns": true,
-    "noUncheckedIndexedAccess": true
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true
   },
   "imports": {
     "@db/sqlite": "jsr:@db/sqlite@^0.12.0",
