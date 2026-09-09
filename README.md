@@ -91,19 +91,21 @@ and lets the rest of the transaction commit.
 What SQLite itself allows, and what is built. "Veto" means the C callback's
 return value can change what the database does.
 
-| Event                    | C hook                     | Pre | Post | Veto                    | Status      | Notes                                       |
-| ------------------------ | -------------------------- | --- | ---- | ----------------------- | ----------- | ------------------------------------------- |
-| Row insert/update/delete | `sqlite3_update_hook`      | no  | yes  | no (returns `void`)     | implemented | Blob writes invisible; see limits           |
-| Row change with old/new  | `sqlite3_preupdate_hook`   | yes | no   | no (returns `void`)     | in progress | Needs `SQLITE_ENABLE_PREUPDATE_HOOK`        |
-| Commit                   | `sqlite3_commit_hook`      | yes | no   | **yes** → rollback      | implemented | Scope is the whole transaction, not one row |
-| Rollback                 | `sqlite3_rollback_hook`    | no  | yes  | no                      | implemented |                                             |
-| Commit landed            | — (synthesised)            | no  | yes  | n/a, already happened   | implemented | No C hook: commit hook runs _before_ commit |
-| WAL frame written        | `sqlite3_wal_hook`         | no  | yes  | no; controls checkpoint | not built   |                                             |
-| Statement lifecycle      | `sqlite3_trace_v2`         | yes | yes  | no                      | not built   |                                             |
-| Statement progress       | `sqlite3_progress_handler` | —   | —    | **yes** → aborts stmt   | not built   | Fires during execution                      |
-| Lock contention          | `sqlite3_busy_handler`     | —   | —    | **yes** → retry or busy | not built   | Fires during execution                      |
+📅 = roadmap, not yet implemented.
 
-Only the rows marked _implemented_ can be called today.
+| Event                       | C hook                     | Pre | Post | Veto                       | Notes                                                    |
+| --------------------------- | -------------------------- | --- | ---- | -------------------------- | -------------------------------------------------------- |
+| Row insert/update/delete    | `sqlite3_update_hook`      | no  | yes  | no (returns `void`)        | Blob writes invisible; see limits                        |
+| Row change with old/new     | `sqlite3_preupdate_hook`   | yes | no   | no (returns `void`)        | Needs `SQLITE_ENABLE_PREUPDATE_HOOK`                     |
+| Commit                      | `sqlite3_commit_hook`      | yes | no   | **yes** → rollback         | Scope is the whole transaction, not one row              |
+| Rollback                    | `sqlite3_rollback_hook`    | no  | yes  | no                         |                                                          |
+| Commit landed               | — (synthesised)            | no  | yes  | n/a, already happened      | No C hook: commit hook runs _before_ commit              |
+| 📅 WAL frame written        | `sqlite3_wal_hook`         | no  | yes  | no; controls checkpoint    |                                                          |
+| 📅 Statement lifecycle      | `sqlite3_trace_v2`         | yes | yes  | no                         |                                                          |
+| 📅 Statement progress       | `sqlite3_progress_handler` | —   | —    | **yes** → aborts stmt      | Fires during execution                                   |
+| 📅 Lock contention          | `sqlite3_busy_handler`     | —   | —    | **yes** → retry or busy    | Fires during execution                                   |
+| 📅 Unknown collation needed | `sqlite3_collation_needed` | yes | no   | no; supplies the collation | Fires when a statement names an unregistered collation   |
+| 📅 Statement authorisation  | `sqlite3_set_authorizer`   | yes | no   | **yes** → `DENY`/`IGNORE`  | Prepare-time; table/column names only, no rows or values |
 
 ## Coverage
 
