@@ -1225,8 +1225,12 @@ const SEMANTIC: Record<string, () => void> = {
   },
 
   "an opcode outside the documented three is delivered as 'unknown'"() {
-    // SQLite cannot be made to emit one, so the mapping is driven directly;
-    // it is total, which is what makes dropping the event impossible.
+    // KNOWN COVERAGE GAP. The "unknown" branch is proven by opFor's totality
+    // and by raw opcodes verified through the real FFI in the next scenario —
+    // NOT by an actual unknown-opcode delivery. SQLite only ever sends the
+    // three, and forging one would mean displacing our own update hook, which
+    // is the failure the displacement assertion below exists to catch. If a
+    // backend seam ever makes callback injection possible, revisit this test.
     check(
       "  the documented three",
       [18, 23, 9].map(opFor),

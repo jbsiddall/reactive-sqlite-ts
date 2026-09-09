@@ -795,8 +795,8 @@ function attach(
   };
 
   const drain = () => {
-    while (committed.length) {
-      dispatch({ type: "postcommit", ...committed.shift()! });
+    for (let b = committed.shift(); b !== undefined; b = committed.shift()) {
+      dispatch({ type: "postcommit", ...b });
     }
   };
 
@@ -825,7 +825,8 @@ function attach(
         }) and ${taken.length} listener error(s) were raised: ${messages}`,
       );
     }
-    if (taken.length === 1) throw taken[0]!.error;
+    const [only] = taken;
+    if (taken.length === 1 && only !== undefined) throw only.error;
     throw new AggregateError(
       taken.map((t) => t.error),
       `${taken.length} listener errors during a SQLite event: ${messages}`,
@@ -836,7 +837,12 @@ function attach(
    * Body of an FFI callback. Anything escaping here would unwind through
    * SQLite's own C frames, so nothing is allowed to.
    */
-  /** Carried by an error report that has no row behind it; opcode -1 is no opcode. */
+  /**
+   * Carried by an error report that has no row behind it. This is the ONE
+   * place `opcode` does not hold something SQLite gave us: -1 is not an
+   * opcode SQLite ever sends, and here it means there was no row and no
+   * opcode at all.
+   */
   const NO_ROW: Change = {
     op: "unknown",
     opcode: -1,
@@ -954,11 +960,11 @@ function attach(
    * accessor said so with a non-zero rc.
    */
   const readValue = (
+    p: PreSymbols,
     dbh: Deno.PointerValue,
     i: number,
     side: "old" | "new",
   ): RowValue | undefined => {
-    const p = pre!;
     valueOut[0] = 0n;
     const rc = side === "old"
       ? p.sqlite3_preupdate_old(dbh, i, valueOutPtr)
@@ -1025,13 +1031,16 @@ function attach(
           const cached = columnCache.get(key(schema, table));
           // A stale cache (a column added since) is as bad as a missing one:
           // names would be silently misaligned. Length is the cheap check.
-          const named = cached !== undefined && cached.length === count;
+          const columns = cached !== undefined && cached.length === count
+            ? cached
+            : null;
+          const named = columns !== null;
           if (!named) schemaDirty = true;
 
           const values = (side: "old" | "new"): RowValue[] | null => {
             const out: RowValue[] = [];
             for (let i = 0; i < count; i++) {
-              const v = readValue(dbh, i, side);
+              const v = readValue(pre, dbh, i, side);
               if (v === undefined) return null;
               out.push(v);
             }
@@ -1044,7 +1053,7 @@ function attach(
           const toRow = (vals: RowValue[] | null): Row | null =>
             vals === null ? null : Object.freeze(
               Object.fromEntries(
-                vals.map((v, i) => [named ? cached![i]! : String(i), v]),
+                vals.map((v, i) => [columns?.[i] ?? String(i), v]),
               ),
             );
 
@@ -1057,7 +1066,7 @@ function attach(
             oldRowid: iKey1,
             newRowid: iKey2,
             rowidChanged: op === "update" && iKey1 !== iKey2,
-            columns: named ? cached! : [],
+            columns: columns ?? [],
             named,
             old: toRow(oldValues),
             new: toRow(newValues),
