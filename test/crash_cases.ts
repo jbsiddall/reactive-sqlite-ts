@@ -1131,6 +1131,88 @@ export const CASES: Record<string, CrashCase> = {
     },
   },
 
+  "collation-use-after-dispose": {
+    code: 0,
+    match: "survived",
+    why:
+      "A comparator is an UnsafeCallback SQLite keeps a pointer to for as long as the sequence is registered, so freeing it at detach without first removing the sequence is a use-after-free the next comparison walks into. Reproduced as exit 139 by leaving the sequence registered.",
+    run() {
+      const db = new Database(":memory:");
+      db.exec("CREATE TABLE t(v TEXT)");
+      for (let i = 0; i < 200; i++) {
+        db.exec("INSERT INTO t(v) VALUES (?)", [`v${i % 37}`]);
+      }
+      let sorted = 0;
+      const sub = withEvents(
+        db,
+        (e) => {
+          if (e.type === "collation") {
+            e.provide((a, b) => a < b ? 1 : a > b ? -1 : 0);
+          }
+        },
+        LIB,
+        { collation: true, onListenerError: () => {} },
+      );
+      // Enough rows that the sorter really runs the comparator.
+      sorted =
+        db.prepare("SELECT v FROM t ORDER BY v COLLATE REV").all().length;
+      sub.dispose();
+      // The sequence is gone with the subscription; this must fail cleanly
+      // rather than call into freed memory.
+      let refused = false;
+      for (let i = 0; i < 20; i++) {
+        try {
+          db.prepare("SELECT v FROM t ORDER BY v COLLATE REV").all();
+        } catch (e) {
+          refused = message(e).includes("no such collation sequence");
+        }
+      }
+      // And the connection is still a working connection.
+      const n = db.prepare("SELECT count(*) AS n FROM t").get<{ n: number }>()
+        ?.n;
+      db.close();
+      console.log(
+        sorted === 200 && refused && n === 200
+          ? "survived"
+          : `FAIL sorted=${sorted} refused=${refused} n=${n}`,
+      );
+    },
+  },
+
+  "collation-reregistered-under-one-name": {
+    code: 0,
+    match: "survived",
+    why:
+      "Registering twice under one name makes SQLite drop the first comparator; freeing ours in the wrong order, or not at all, is the same use-after-free from the other direction.",
+    run() {
+      const db = new Database(":memory:");
+      db.exec("CREATE TABLE t(v TEXT)");
+      for (let i = 0; i < 100; i++) {
+        db.exec("INSERT INTO t(v) VALUES (?)", [`v${i}`]);
+      }
+      let rounds = 0;
+      // A fresh subscription each time, so the same name is registered,
+      // removed and registered again against one live connection.
+      for (let i = 0; i < 25; i++) {
+        const sub = withEvents(
+          db,
+          (e) => {
+            if (e.type === "collation") {
+              e.provide((a, b) => a < b ? 1 : a > b ? -1 : 0);
+            }
+          },
+          LIB,
+          { collation: true, onListenerError: () => {} },
+        );
+        const rows = db.prepare("SELECT v FROM t ORDER BY v COLLATE REV").all();
+        if (rows.length === 100) rounds++;
+        sub.dispose();
+      }
+      db.close();
+      console.log(rounds === 25 ? "survived" : `FAIL rounds=${rounds}`);
+    },
+  },
+
   "property-no-permutation-crashes": {
     code: 0,
     match: "survived",

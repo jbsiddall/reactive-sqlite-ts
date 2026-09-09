@@ -32,6 +32,8 @@ export type {
   BatchCoverage,
   Capabilities,
   Change,
+  CollationEncoding,
+  CollationEvent,
   DbEvent,
   EventOptions,
   Listener,

@@ -141,21 +141,19 @@ DELETE. You get `op: "update"` — our honest reading of what the write really w
 What SQLite itself allows, and what is built. "Veto" means the C callback's
 return value can change what the database does.
 
-📅 = roadmap, not yet implemented.
-
-| Event                       | C hook                     | Pre | Post | Veto                          | Notes                                                  |
-| --------------------------- | -------------------------- | --- | ---- | ----------------------------- | ------------------------------------------------------ |
-| Row insert/update/delete    | `sqlite3_update_hook`      | —   | —    | no (returns `void`)           | SQLite documents the timing as undefined; see limits   |
-| Row change with old/new     | `sqlite3_preupdate_hook`   | yes | no   | no (returns `void`)           | Needs `SQLITE_ENABLE_PREUPDATE_HOOK`                   |
-| Commit                      | `sqlite3_commit_hook`      | yes | no   | **yes** → rollback            | Scope is the whole transaction, not one row            |
-| Rollback                    | `sqlite3_rollback_hook`    | no  | yes  | no                            |                                                        |
-| Commit landed               | — (synthesised)            | no  | yes  | n/a, already happened         | No C hook: commit hook runs _before_ commit            |
-| WAL commit written          | `sqlite3_wal_hook`         | no  | yes  | **no** — see note below       | Displaces auto-checkpointing; we replicate it          |
-| Statement lifecycle         | `sqlite3_trace_v2`         | yes | yes  | no — return value ignored     | `row` fires per result row and measured ~3x; opt in    |
-| Statement progress          | `sqlite3_progress_handler` | —   | —    | **yes** → `abort()` only      | Return value ignored; `abort()` interrupts, see below  |
-| Lock contention             | `sqlite3_busy_handler`     | —   | —    | **yes** → `retry()` only      | Return value ignored; `retry()` BLOCKS the thread      |
-| 📅 Unknown collation needed | `sqlite3_collation_needed` | yes | no   | no; supplies the collation    | Fires when a statement names an unregistered collation |
-| Statement authorisation     | `sqlite3_set_authorizer`   | yes | no   | **yes** → `deny()`/`ignore()` | Compile-time; +49%; `ignore()` NULLs a column silently |
+| Event                    | C hook                     | Pre | Post | Veto                          | Notes                                                  |
+| ------------------------ | -------------------------- | --- | ---- | ----------------------------- | ------------------------------------------------------ |
+| Row insert/update/delete | `sqlite3_update_hook`      | —   | —    | no (returns `void`)           | SQLite documents the timing as undefined; see limits   |
+| Row change with old/new  | `sqlite3_preupdate_hook`   | yes | no   | no (returns `void`)           | Needs `SQLITE_ENABLE_PREUPDATE_HOOK`                   |
+| Commit                   | `sqlite3_commit_hook`      | yes | no   | **yes** → rollback            | Scope is the whole transaction, not one row            |
+| Rollback                 | `sqlite3_rollback_hook`    | no  | yes  | no                            |                                                        |
+| Commit landed            | — (synthesised)            | no  | yes  | n/a, already happened         | No C hook: commit hook runs _before_ commit            |
+| WAL commit written       | `sqlite3_wal_hook`         | no  | yes  | **no** — see note below       | Displaces auto-checkpointing; we replicate it          |
+| Statement lifecycle      | `sqlite3_trace_v2`         | yes | yes  | no — return value ignored     | `row` fires per result row and measured ~3x; opt in    |
+| Statement progress       | `sqlite3_progress_handler` | —   | —    | **yes** → `abort()` only      | Return value ignored; `abort()` interrupts, see below  |
+| Lock contention          | `sqlite3_busy_handler`     | —   | —    | **yes** → `retry()` only      | Return value ignored; `retry()` BLOCKS the thread      |
+| Unknown collation needed | `sqlite3_collation_needed` | yes | no   | no; supplies the collation    | Every comparison then crosses into JS; see cost below  |
+| Statement authorisation  | `sqlite3_set_authorizer`   | yes | no   | **yes** → `deny()`/`ignore()` | Compile-time; +49%; `ignore()` NULLs a column silently |
 
 ## This library versus the other SQLite bindings
 
@@ -165,9 +163,6 @@ a hook layer on top of [`@db/sqlite`](https://jsr.io/@db/sqlite), so wherever a
 row below says _via `@db/sqlite`_ the feature is the driver's, available to you
 because you are still holding the driver's `Database`, and unaffected by
 anything here.
-
-Legend: 📅 roadmap in this library, not implemented — same convention as the
-capability table above.
 
 Versions checked on 2026-09-09, against each project's own documentation, type
 definitions or source: better-sqlite3 13.0.3 (npm, 2026-08-05) · `node:sqlite`
@@ -203,7 +198,7 @@ wa-sqlite has had no npm release since January 2024.
 | `trace_v2` / profile             | yes                         | `verbose` option logs each SQL string | `diagnostics_channel` `sqlite.db.query` | no           | yes — `trace` and `profile` events      | no                      | yes         |
 | `progress_handler`               | yes                         | no                                    | no                                      | no           | no                                      | no                      | yes         |
 | busy handler / timeout           | yes — handler               | `timeout` option                      | `timeout` option                        | no           | `configure("busyTimeout")`              | no                      | yes, both   |
-| `collation_needed`               | 📅                          | no                                    | no                                      | no           | no                                      | no                      | yes         |
+| `collation_needed`               | yes, and can supply one     | no                                    | no                                      | no           | no                                      | no                      | yes         |
 | authorizer                       | yes                         | no                                    | yes — `setAuthorizer`                   | no           | no                                      | no                      | yes         |
 | session / changesets / patchsets | no                          | no                                    | yes — `createSession`, `applyChangeset` | no           | no                                      | no                      | yes         |
 
@@ -330,8 +325,12 @@ verified so far.
 5. **Some deletes are not reported.** The truncate optimisation (`DELETE FROM t`
    with no `WHERE`) removes rows without invoking the hook per row.
 6. **A hook must not use the connection that invoked it.** Undefined behaviour
-   in SQLite; the library rejects it rather than corrupting state. Defer that
-   work until after the commit.
+   in SQLite. Defer that work until after the commit. The library rejects the
+   common routes — it replaces the methods on the driver's `Database`,
+   `Statement` and `SQLBlob` — but that is a guardrail, not a barrier: a
+   `Statement` built directly, `stmt.iter()`, a `for..of` over a statement,
+   `db.function()` and the driver's public `unsafeHandle` all reach SQLite
+   without passing it. **The rule holds whether or not you get an error.**
 7. **A veto surfaces as SQLite's generic "constraint failed".** That is all
    SQLite reports; your own reason is attached alongside it.
 8. **One hook of each kind per connection.** Multiple listeners are multiplexed
@@ -483,6 +482,111 @@ Note also that SQLite re-prepares a statement after a schema change, from inside
 `sqlite3_step`, so authorize events can arrive during what your code experiences
 as a read rather than a compile.
 
+### Supplying a collating sequence from JavaScript
+
+`collation: true` delivers an event when a statement names a collating sequence
+this connection does not have. With no handler at all — the default, and what
+SQLite does — the statement fails with `no such collation sequence: NAME`, the
+connection stays usable, and an open transaction still commits.
+
+```ts
+withEvents(
+  db,
+  (e) => {
+    if (e.type !== "collation") return;
+    if (e.name !== "NOCASE_INTL") return; // anything else still fails cleanly
+    const c = new Intl.Collator("tr", { sensitivity: "accent" });
+    e.provide((a, b) => c.compare(a, b));
+  },
+  LIB,
+  { collation: true },
+);
+```
+
+`provide()` registers the comparator under exactly the name SQLite asked for,
+and the statement that triggered the event **then proceeds and sorts
+correctly**: SQLite retries the lookup as soon as the callback returns. There is
+no default and nothing is registered for you — the same rule as `progress`,
+because the cost below is yours to accept rather than ours to assume.
+
+`@db/sqlite` has no collation API, so this library owns the registration itself
+rather than delegating it. That is a real decision, and what it rejected:
+
+- **A general `createCollation()` on the subscription**, callable at any time.
+  Rejected because it is a collation API rather than a hook, and because its
+  lifetime would then be the subscription's while its usefulness is the
+  connection's — a caller could register a sequence, dispose, and be left with a
+  connection whose statements suddenly fail. Bound to the event, registration
+  only happens inside a window where SQLite has asked and the attachment is
+  provably live.
+- **Returning the comparator from the listener.** Rejected for the same reason
+  `deny()` and `retry()` are calls rather than return values: several listeners
+  share one event, and a return value cannot say which one decided, nor report a
+  second decision.
+- **Registering something by default** — an `Intl.Collator`, say. Rejected: it
+  would put every caller who only wanted events onto the cost below.
+
+SQLite asks **once per statement** and then gives up, so there is no retry loop
+to defend against, and a `provide()` kept and called after the event has
+returned installs a sequence that decides nothing about the statement that
+wanted it. That is reported through `onListenerError` rather than looking like
+success. A second `provide()` in one event is reported too, and the first
+stands. Only the SIGN of the comparator's return value is read; returning
+anything that is not a finite number treats the two values as equal, which is
+not an ordering, and is reported rather than passed to C.
+
+The sequence lives as long as the subscription. The last `dispose()` removes it,
+and statements that referenced it then fail with `no such collation sequence`.
+That is not tidiness: a comparator is a JavaScript callback SQLite holds a raw
+pointer to, and freeing it while the sequence is still registered is a
+use-after-free the next comparison walks into — reproduced as `SIGSEGV`, and
+kept reproduced by two cases in the crash matrix.
+
+Declaring a column `COLLATE NAME` resolves the name at `CREATE TABLE` time, so a
+sequence supplied through this hook cannot be used in DDL: attach first, or
+write `ORDER BY v COLLATE NAME` at the query.
+
+#### The cost of a JavaScript collation
+
+**Every comparison SQLite makes crosses into JavaScript.** Measured on this
+library, one comparison costs **1.1–1.35 µs**. For scale, a `busy` retry — the
+most expensive thing else in this README — costs about 3.4 µs, and it happens
+once per lock contention rather than once per comparison.
+
+The number of comparisons in a sort tracks **n log n**, and that was _measured,
+not derived_: across three orders of magnitude the ratio of actual comparisons
+to n·log₂n stayed within a band of **0.849 to 0.959**. So the cost of an
+`ORDER BY` over a collated column is roughly `1.2 µs × n log₂ n`, and you can
+work out your own case from that.
+
+No multiplier against the built-in collations is quoted here on purpose. The
+ratio moves by an order of magnitude with n, and it moves because SQLite's own
+comparison gets _relatively_ cheaper, not because ours gets dearer — publishing
+it would tell you something false about this library while looking precise. The
+per-comparison cost and the measured count are the honest pair.
+
+**Sorting is not the only thing that compares, and this is where it catches
+people.** Declaring a collation costs nothing on its own: a column declared
+`COLLATE NAME` and never sorted, grouped or constrained produced **zero**
+comparator calls. But the moment the column is indexed or constrained, every
+write pays:
+
+| What                                     | Measured                                                   |
+| ---------------------------------------- | ---------------------------------------------------------- |
+| `INSERT` into a `UNIQUE` collated column | **7.5x** slower; about **13 comparisons per row inserted** |
+| `SELECT DISTINCT` over a collated column | **15x** the crossings of the plain column                  |
+| `GROUP BY` a collated column             | **29x**                                                    |
+| `IN` with 5 elements over 20 000 rows    | **58 709** comparator calls                                |
+
+Those are paid forever, by callers who never write an `ORDER BY` at all, and
+nothing at the call site distinguishes the column that costs from the one that
+does not.
+
+So: a JavaScript collation is for **correctness on small result sets** — a
+locale-aware ordering over a few hundred rows you are about to render. It is not
+something to reach for on a large `ORDER BY`, and it is not something to attach
+to an indexed or constrained column without deciding to.
+
 ### Lock contention, and why `retry` blocks
 
 `busy: true` delivers an event when another connection holds a lock this
@@ -538,7 +642,8 @@ A listener must not touch the connection from a `busy` event. SQLite alone among
 the hooks permits this, and this library refuses it anyway: one exception would
 make "no hook may touch the connection" hold for four callbacks and stop at the
 fifth, and from a busy listener it can deadlock with no way to bound it. The
-refusal says so.
+refusal says so. As everywhere, the refusal covers the driver methods this
+library replaces rather than every route into SQLite — see hard limit 6.
 
 #### If something else takes the busy handler
 

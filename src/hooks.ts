@@ -72,12 +72,26 @@
  * driver and pass that same path here. `libPath` is deliberately required and
  * has no fallback, because a guessed default is exactly how you get the crash.
  *
- * ## Why the guards exist
+ * ## Why the guards exist, and how far they reach
  *
  * Everything reachable from this module runs against a raw pointer, so the
  * failure mode for a mistake is a silent SIGSEGV rather than an exception. The
- * rules below are enforced with thrown {@linkcode SqliteHooksError}s; each one
- * stands for a crash or a corruption that was reproduced first.
+ * rules below are the rules; each one stands for a crash or a corruption that
+ * was reproduced first.
+ *
+ * **The guards are a guardrail against the mistake a listener makes by
+ * accident, not a barrier against what a determined caller can do.** They work
+ * by replacing methods on the driver's `Database`, `Statement` and `SQLBlob`,
+ * so they cover the routes those objects offer and nothing else. `db.function()`,
+ * `stmt.iter()`, a `for..of` over a statement, and a `Statement` constructed
+ * directly all reach SQLite without passing one — verified, from inside a live
+ * `change` hook. A barrier was never on the table: `db.unsafeHandle` and
+ * `stmt.unsafeHandle` are public, documented getters on the driver, and this
+ * library depends on the first of them itself.
+ *
+ * Read the rules as the contract. The thrown {@linkcode SqliteHooksError}s
+ * catch the common way of breaking it, and breaking it another way is still
+ * undefined behaviour with no error to tell you so.
  *
  * - A listener must not touch the connection from `change`, `precommit` or
  *   `rollback`. SQLite documents that its hooks must not use the connection
@@ -102,7 +116,10 @@
 import type { Database } from "@db/sqlite";
 import type {
   Backend,
+  CollationEncoding,
+  Comparator,
   RawChange,
+  RawCollation,
   RawPreUpdate,
   RawTrace,
   RawWal,
@@ -118,6 +135,8 @@ import {
   SQLITE_UPDATE,
 } from "./backend.ts";
 import { openFfiBackend, probeFfi } from "./backend_ffi.ts";
+
+export type { CollationEncoding } from "./backend.ts";
 
 /** One row touched by a statement, as reported by sqlite3_update_hook. */
 export type Change = {
@@ -322,7 +341,14 @@ export type DbEvent =
    * produces many. Doing nothing ALLOWS, which is the only default that does
    * not break every query.
    */
-  | AuthorizeEvent;
+  | AuthorizeEvent
+  /**
+   * A statement named a collating sequence this connection does not have, and
+   * SQLite is asking for it before giving up. Delivered only when
+   * {@linkcode EventOptions.collation} is on. Doing nothing lets the statement
+   * fail cleanly, which is exactly what happens with no handler at all.
+   */
+  | CollationEvent;
 
 /**
  * The actions SQLite names today. `"unknown"` is part of the union because
@@ -483,6 +509,49 @@ export type ProgressEvent = {
   abort: () => void;
 };
 
+export type CollationEvent = {
+  type: "collation";
+  /**
+   * The sequence the statement named, exactly as written. SQLite compares
+   * collation names case-insensitively, so this is the spelling in the SQL,
+   * not a normalised form.
+   */
+  name: string;
+  /**
+   * Which text encoding SQLite would have preferred. Informational: whatever
+   * it says, {@linkcode CollationEvent.provide} registers a UTF-8 sequence and
+   * SQLite converts. It is here because the callback is given it and hiding it
+   * would be a decision, not a simplification.
+   */
+  encoding: CollationEncoding;
+  /**
+   * Register `compare` under this exact name, for this connection.
+   *
+   * The statement that triggered the event then proceeds and sorts correctly:
+   * SQLite retries the lookup as soon as the callback returns. Doing nothing
+   * is a decision too — the statement fails with "no such collation sequence",
+   * the connection stays usable, and an open transaction still commits.
+   *
+   * **SQLite asks once per statement and does not ask again**, so a comparator
+   * kept and called later registers a sequence that decides nothing about the
+   * statement that wanted it; that is reported as a listener error. Calling
+   * it twice in one event is reported too, and the first call stands.
+   *
+   * `compare` is called from inside SQLite's sorter, once per comparison, and
+   * a JS crossing per comparison is what it costs — see the note on
+   * {@linkcode EventOptions.collation} before reaching for this on anything
+   * large. It must be a real ordering: consistent, and antisymmetric. Only the
+   * SIGN of the number is read. Returning anything that is not a finite
+   * number treats the two values as EQUAL, which is not an ordering, and is
+   * reported as a listener error rather than passed to C.
+   *
+   * The sequence lives as long as the subscription, not the connection: the
+   * last `dispose()` removes it, and statements that referenced it then fail
+   * with "no such collation sequence" rather than calling into freed memory.
+   */
+  provide: (compare: (a: string, b: string) => number) => void;
+};
+
 /** What every trace event carries. */
 export type Traced = {
   /** Rendered per {@linkcode EventOptions.sql}. Never expanded by default. */
@@ -539,6 +608,20 @@ export type EventOptions = {
    */
   authorize?: boolean;
   busy?: boolean;
+  /**
+   * Deliver {@linkcode CollationEvent} when a statement names a collating
+   * sequence this connection does not have. Off by default: with no handler
+   * SQLite fails the statement with "no such collation sequence", which is the
+   * behaviour every existing caller already has.
+   *
+   * Registering the callback itself is free — it is asked only on a failed
+   * lookup, and a connection whose collations all resolve never sees one.
+   * What is not free is the sequence you supply. See
+   * **The cost of a JavaScript collation** in the README before you attach one
+   * to a column: every comparison SQLite makes crosses into JavaScript, and
+   * ORDER BY is not the only thing that compares.
+   */
+  collation?: boolean;
   progress?: number;
   trace?: true | readonly TraceEvent[];
   /**
@@ -609,6 +692,13 @@ export type Capabilities = {
   readonly busy: boolean;
   /** sqlite3_set_authorizer: compile-time authorization checks. */
   readonly authorize: boolean;
+  /**
+   * sqlite3_collation_needed and sqlite3_create_collation: being told that a
+   * statement named a collating sequence this connection does not have, and
+   * being able to supply one. One flag for both, because either alone is a
+   * capability that cannot be acted on.
+   */
+  readonly collation: boolean;
   /**
    * sqlite3_normalized_sql, needed for `sql: "normalized"`. Off in stock
    * distribution builds, which do not set SQLITE_ENABLE_NORMALIZE.
@@ -833,7 +923,7 @@ function subscription(
       if (disposed) return; // idempotent by design
       if (reg.inListener) {
         throw new SqliteHooksError(
-          "dispose() cannot be called from inside a listener — closing a callback that is on the stack segfaults. Defer it with queueMicrotask().",
+          "dispose() cannot be called from inside a listener — closing a callback that is on the stack segfaults. Defer it with queueMicrotask(). (This is a separate check from the one that refuses the connection inside a hook: it tracks whether a LISTENER is running, so it fires for a postcommit listener too, where using the connection is allowed.)",
         );
       }
       disposed = true;
@@ -1299,6 +1389,13 @@ function attach(
       "this libsqlite3 does not export sqlite3_busy_handler, so busy events cannot be delivered",
     );
   }
+  const wantCollation = options.collation ?? false;
+  if (wantCollation && !capabilities.collation) {
+    backend.close();
+    throw new SqliteHooksError(
+      "this libsqlite3 does not export sqlite3_collation_needed and sqlite3_create_collation, so collation events cannot be delivered",
+    );
+  }
   const progressOps = options.progress ?? null;
   if (progressOps !== null && !capabilities.progress) {
     backend.close();
@@ -1629,6 +1726,64 @@ function attach(
         errors.push({ error, event: { type: "change", change: NO_ROW } });
       }),
 
+    collation: (
+      read: () => RawCollation,
+      register: (compare: Comparator) => void,
+    ) =>
+      inFfi(undefined, () => {
+        const raw = read();
+        let supplied = false;
+        let live = true;
+        const provide = (compare: (a: string, b: string) => number) => {
+          const caller = running;
+          const who = caller !== null && caller.name !== ""
+            ? `listener ${caller.name}`
+            : "a listener";
+          if (typeof compare !== "function") {
+            errors.push({
+              error: new SqliteHooksError(
+                `${who} called provide() with a ${typeof compare} rather than a comparison function; no collating sequence was installed for "${raw.name}"`,
+              ),
+              event: { type: "change", change: NO_ROW },
+            });
+            return;
+          }
+          if (!live) {
+            // SQLite asks once per statement. Registering now would install a
+            // sequence the statement that wanted it will never see, and the
+            // caller would have no way to tell that from success.
+            errors.push({
+              error: new SqliteHooksError(
+                `${who} kept provide() from a collation event and called it after that event had returned; SQLite asks for "${raw.name}" once per statement and had already given up, so nothing was installed. Call it synchronously.`,
+              ),
+              event: { type: "change", change: NO_ROW },
+            });
+            return;
+          }
+          if (supplied) {
+            errors.push({
+              error: new SqliteHooksError(
+                `${who} called provide() twice for "${raw.name}"; the first collating sequence stands.`,
+              ),
+              event: { type: "change", change: NO_ROW },
+            });
+            return;
+          }
+          supplied = true;
+          register(compare);
+        };
+        try {
+          dispatch({
+            type: "collation",
+            name: raw.name,
+            encoding: raw.encoding,
+            provide,
+          });
+        } finally {
+          live = false;
+        }
+      }),
+
     rollback: () =>
       inFfi(undefined, () => {
         // A commit that failed *after* our hook approved it rolls back; drop
@@ -1647,6 +1802,7 @@ function attach(
     progressOps,
     busy: wantBusy,
     authorize: wantAuthorize,
+    collation: wantCollation,
   });
 
   if (wantAuthorize) {
@@ -1704,7 +1860,7 @@ function attach(
     }
     if (reg.inHook) {
       throw new SqliteHooksError(
-        `${what} was called from inside a hook listener. SQLite forbids using the connection from within its hooks — and a busy listener, which SQLite alone would permit, is refused too rather than making the rule hold for four callbacks and stop at the sixth. From a busy listener it can also deadlock, and there is no way to bound that. Do it from postcommit, or defer with queueMicrotask().`,
+        `${what} was called from inside a hook listener. SQLite forbids using the connection from within its hooks — and a busy listener, which SQLite alone would permit, is refused too rather than making the rule hold for four callbacks and stop at the sixth. From a busy listener it can also deadlock, and there is no way to bound that. Do it from postcommit, or defer with queueMicrotask(). Note that this refusal covers the driver methods this library replaces, not every route into SQLite: the rule holds whether or not something threw.`,
       );
     }
   };
@@ -1831,7 +1987,7 @@ function attach(
     if (reg.closed) return; // the driver's close() is a no-op too
     if (reg.inListener) {
       throw new SqliteHooksError(
-        "db.close() cannot be called from inside a listener. Defer it with queueMicrotask().",
+        "db.close() cannot be called from inside a listener. Defer it with queueMicrotask(). (Tracked separately from the in-hook refusal: this one fires for any listener, postcommit included, because freeing the sqlite3* under a callback on the stack is unsafe wherever the listener ran.)",
       );
     }
     drain();

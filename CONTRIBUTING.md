@@ -53,12 +53,13 @@ carries every hook symbol this project uses except `sqlite3_normalized_sql`. The
 time of writing, 23 flags, roughly a minute, nothing but `cc` needed) and has
 all of them. The build output is gitignored and never committed.
 
-| Capability      | Gated on                       | Tests                                                               | Green against                                                                        |
-| --------------- | ------------------------------ | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
-| `preupdate`     | `SQLITE_ENABLE_PREUPDATE_HOOK` | every `preupdate:` scenario, the validation suite, `withValidation` | **system 3.45.1** and **vendored 3.53.4** — both have it                             |
-| `wal`           | not `SQLITE_OMIT_WAL`          | every `wal` scenario, `wal-hook-lifetime`                           | **system 3.45.1** and **vendored 3.53.4**                                            |
-| `trace`         | not `SQLITE_OMIT_TRACE`        | every `trace:` scenario, `trace-close-ordering`                     | **system 3.45.1** and **vendored 3.53.4**                                            |
-| `normalizedSql` | `SQLITE_ENABLE_NORMALIZE`      | `trace: normalized is refused rather than downgraded when absent`   | **vendored 3.53.4** for the present branch; **system 3.45.1** for the refusal branch |
+| Capability      | Gated on                                                           | Tests                                                                                               | Green against                                                                        |
+| --------------- | ------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `preupdate`     | `SQLITE_ENABLE_PREUPDATE_HOOK`                                     | every `preupdate:` scenario, the validation suite, `withValidation`                                 | **system 3.45.1** and **vendored 3.53.4** — both have it                             |
+| `wal`           | not `SQLITE_OMIT_WAL`                                              | every `wal` scenario, `wal-hook-lifetime`                                                           | **system 3.45.1** and **vendored 3.53.4**                                            |
+| `trace`         | not `SQLITE_OMIT_TRACE`                                            | every `trace:` scenario, `trace-close-ordering`                                                     | **system 3.45.1** and **vendored 3.53.4**                                            |
+| `normalizedSql` | `SQLITE_ENABLE_NORMALIZE`                                          | `trace: normalized is refused rather than downgraded when absent`                                   | **vendored 3.53.4** for the present branch; **system 3.45.1** for the refusal branch |
+| `collation`     | `sqlite3_collation_needed` and `sqlite3_create_collation` exported | every `collation:` scenario, `collation-use-after-dispose`, `collation-reregistered-under-one-name` | **system 3.45.1** and **vendored 3.53.4**                                            |
 
 The gated test prints a visible `SKIP` line naming the library when it takes the
 absent branch, so a run that quietly proved nothing is not mistakable for a run
@@ -81,10 +82,14 @@ evidence on its own, because the busy-work in that test was a JavaScript loop
 and a JavaScript loop cannot advance the VM.
 
 What CAN nest is a callback and a listener that re-enters SQLite: that is what
-`reg.inHook` and `guard()` exist to reject, and it is unaffected by the above.
-If a future hook fires from somewhere other than the bytecode engine — a
-background thread, or an unlock-notify callback — this reasoning does not
-transfer and the set must be re-examined.
+`reg.inHook` and `guard()` exist to DISCOURAGE, and it is unaffected by the
+above. Discourage, not reject — `guard()` reaches only the driver methods this
+library replaces, and `inFfi` catches a re-entry that gets past it by dropping
+the nested event and reporting it, rather than preventing the re-entry. See
+**How far the guard actually reaches** below. If a future hook fires from
+somewhere other than the bytecode engine — a background thread, or an
+unlock-notify callback — this reasoning does not transfer and the set must be
+re-examined.
 
 **That condition has already been met once, by `sqlite3_busy_handler`.** It
 fires during lock acquisition rather than from a suspended engine mid-row, and
@@ -94,18 +99,27 @@ covered by the argument above, and it was decided rather than derived. **We
 refuse it anyway.** Allowing the one exception would make "no hook may touch the
 connection" — the assumption behind `inFfi`, `reg.inHook`, `guard()` and the
 re-entrancy fix — hold for four callbacks and stop at the fifth, which is the
-defect shape this project has closed seven times. The practical argument stands
-alone too: the failure it prevents is a deadlock, and there is no way to bound
-one. The refusal message explains this, so it reads as a limitation rather than
-a bug.
+defect shape this project has closed seven times. (The assumption is a rule
+about listeners; `guard()` is only the part of it that is mechanically enforced,
+and it does not cover every route. That is a separate matter from which callback
+the rule applies to, and it does not weaken this decision.) The practical
+argument stands alone too: the failure it prevents is a deadlock, and there is
+no way to bound one. The refusal message explains this, so it reads as a
+limitation rather than a bug.
 
 Measured, with a real 2 ms dwell inside our callbacks so a lock attempt could
 occur if one could: 3 of our callbacks, 4 busy invocations, zero overlap. (An
 earlier probe reported zero from a flag that was set and cleared on the same
 line, which meant nothing; this is the corrected run.) The reverse direction —
 one of ours firing while a busy handler is on the stack — is reachable only
-through the listener's own re-entrant call, which is exactly what the refusal
-above prevents.
+through the listener's own re-entrant call.
+
+**OPEN.** That used to conclude "which is exactly what the refusal above
+prevents". It does not. The refusal covers the driver methods this library
+replaces, and a re-entrant call that does not go through one of them is not
+refused — so the reverse direction is UNPROVEN rather than closed. Nothing is
+known to have gone wrong; what is gone is the proof. See **How far the guard
+actually reaches** below, and the open question there.
 
 `set_authorizer` fires at prepare time and should be checked against this same
 question rather than assumed to match either group.
@@ -185,6 +199,81 @@ reachable here have them. The honest fixture for those is the prebuilt library
 `@db/sqlite` downloads when `DENO_SQLITE_PATH` is unset, which carries a much
 smaller symbol set. Not wired up.
 
+### How far the guard actually reaches
+
+`guard()` is the mechanically-enforced part of the rule "no listener may touch
+the connection". The rule is wider than the mechanism, and this section says
+exactly where the two part company, because for the whole life of the guard the
+prose asserted the wider claim and nothing recorded the narrower truth.
+
+**What it covers.** `guard()` runs on replaced methods only, and the
+replacements are installed on the objects this library can reach:
+
+- `Database`: `exec`, `run` (via `DB_METHODS`), plus `prepare`, `transaction`
+  and `openBlob`, each patched individually. `close` is intercepted too, for
+  callback lifetime rather than for the guard.
+- `SQLBlob`: `writeSync`, `readSync`, `close`, wrapped on the object returned by
+  the patched `db.openBlob`.
+- `Statement`: `run`, `get`, `all`, `values`, `value` — **but only on statements
+  created through the patched `db.prepare` after `withEvents` was called.** The
+  driver installs these as OWN properties on each `Statement`, shadowing the
+  prototype, so there is no prototype to patch and no way to reach a statement
+  that already exists.
+
+**What it does not cover.** Verified from inside a live `change` listener, each
+of these reached SQLite with no refusal: `new Statement(db, sql).get()`,
+`stmt.iter()`, `for..of stmt`, `stmt.finalize()`, `stmt.columnNames()`, and
+`db.function()`. `db.backup()` was refused — by SQLite itself, not by us, which
+is not the same thing and must not be counted as coverage. `db.sql` (tagged
+template) IS refused, because it delegates to the patched `this.prepare`.
+
+So: **`guard()` is a guardrail against the mistake a listener makes by accident,
+not a barrier against what a determined caller can do.** A barrier was never
+available. `unsafeHandle` is public, is JSDoc'd as public, and this library
+depends on it itself; anything that can reach the raw `sqlite3*` can re-enter
+SQLite without passing a single one of our replacements. `inFfi` is the second
+line: a re-entry that gets past the guard has its nested event dropped and
+reported, which contains the damage rather than preventing the call.
+
+#### The attach-order hole
+
+A `Statement` prepared BEFORE `withEvents` keeps unpatched own-property methods
+for as long as it exists, and calling `stmt.get()` on it from inside a hook
+returns a row (`{"c":2}` in the case that was run) instead of being refused. The
+same statement prepared one line later is refused.
+
+This is not a "known limitation", and writing it down as one would understate
+it. What it costs is this: **the failure depends on when an object was
+constructed, not on what the code does, so two identical-looking call sites
+behave differently and nothing at the point of use distinguishes them.** A
+reader looking at the call cannot tell which one they have. This is the
+project's signature defect — a guarantee that holds at one level and stops
+holding at another — in its purest form yet, and it is in our own guard.
+
+The mechanism, so it is not re-derived: statement patches are installed inside
+the patched `db.prepare`, because the driver writes `run`/`get`/`all`/`values`/
+`value` as own properties on each `Statement` when there are no bind parameters,
+shadowing the prototype. Those patches are recorded with `undoable = false`, so
+they also outlive `detach()` — the asymmetry runs in both directions.
+
+**OPEN, carried forward:** whether the unwrapped case can be made DETECTABLE
+even where it cannot be REFUSED. Nothing here proposes widening the patch; that
+is a separate change and is not made by the commit that wrote this section.
+
+#### The record of the divergence (2026-09-09)
+
+Against the driver `@db/sqlite` as vendored here, and both libraries in the
+capability ledger above: the prose was broader than the mechanism for the entire
+life of the guard, and nobody noticed, because on every case anyone actually
+tried the two agreed. The disagreement needed a route that no test and no
+example took.
+
+**A rule documented wider than it is enforced is a latent version of this
+project's signature defect.** It costs nothing while the two agree. The day
+someone tightens the code to match the prose, or writes code that relies on the
+prose being true, is the day it bites — and at that point the prose is the
+evidence they were entitled to rely on.
+
 ## Changes to the FFI or native layer need out-of-process crash tests
 
 Anything that touches `Deno.dlopen`, an `UnsafeCallback`, a borrowed `sqlite3*`,
@@ -193,9 +282,13 @@ or the lifetime of any of those must come with a case in the crash matrix
 
 The rule exists because the failure mode here is not a thrown exception. Calling
 into a freed callback, handing a handle to the wrong library, or closing a
-connection from inside a hook takes the whole process down with `SIGSEGV`. An
-in-process test cannot observe that: the runner dies with it, and depending on
-how the harness reports, a segfault can be indistinguishable from a pass.
+connection from inside a LISTENER takes the whole process down with `SIGSEGV`.
+(That last one is checked by `reg.inListener`, which is a different mechanism
+from the in-hook `guard()`: it tracks whether any listener is running, so it
+fires from a `postcommit` listener too, where using the connection is otherwise
+allowed.) An in-process test cannot observe that: the runner dies with it, and
+depending on how the harness reports, a segfault can be indistinguishable from a
+pass.
 
 So each crash case runs as its own child process, and the suite asserts on the
 child's **exit code** and output:

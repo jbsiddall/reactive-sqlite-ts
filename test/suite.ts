@@ -38,6 +38,7 @@ type DbEvent = import("../src/hooks.ts").DbEvent;
 type PreUpdate = import("../src/hooks.ts").PreUpdate;
 type RowValue = import("../src/hooks.ts").RowValue;
 type Change = import("../src/hooks.ts").Change;
+type CollationEvent = import("../src/hooks.ts").CollationEvent;
 type Db = InstanceType<typeof Database>;
 
 let passed = 0;
@@ -147,7 +148,8 @@ function record(db: Db, options = {}) {
         e.type === "preupdate" || e.type === "wal" ||
         e.type === "statement" || e.type === "profile" || e.type === "row" ||
         e.type === "progress" || e.type === "busy" ||
-        e.type === "authorize"
+        e.type === "authorize" ||
+        e.type === "collation"
       ) return;
       log.push(
         e.type === "change"
@@ -1392,6 +1394,7 @@ const SEMANTIC: Record<string, () => void> = {
       progress: () => false,
       busy: () => false,
       authorize: () => 0,
+      collation: () => {},
       fail: () => {},
     }, {
       walCheckpointThreshold: null,
@@ -1400,6 +1403,7 @@ const SEMANTIC: Record<string, () => void> = {
       progressOps: null,
       busy: false,
       authorize: false,
+      collation: false,
     });
     db.exec("INSERT INTO t VALUES (1, 'a')");
     db.exec("INSERT INTO t VALUES (2, 'b')");
@@ -1429,6 +1433,7 @@ const SEMANTIC: Record<string, () => void> = {
       progress: () => false,
       busy: () => false,
       authorize: () => 0,
+      collation: () => {},
       fail: () => {},
     }, {
       walCheckpointThreshold: null,
@@ -1437,6 +1442,7 @@ const SEMANTIC: Record<string, () => void> = {
       progressOps: null,
       busy: false,
       authorize: false,
+      collation: false,
     });
     at.detach(true);
     detachedThenClosed.close();
@@ -1458,6 +1464,7 @@ const SEMANTIC: Record<string, () => void> = {
       progress: () => false,
       busy: () => false,
       authorize: () => 0,
+      collation: () => {},
       fail: () => {},
     }, {
       walCheckpointThreshold: null,
@@ -1466,6 +1473,7 @@ const SEMANTIC: Record<string, () => void> = {
       progressOps: null,
       busy: false,
       authorize: false,
+      collation: false,
     });
     at.detach(true);
     at.detach(true);
@@ -2478,6 +2486,377 @@ const SEMANTIC: Record<string, () => void> = {
       [0, 34, 99, -1].map(actionFor),
       ["unknown", "unknown", "unknown", "unknown"],
     );
+  },
+
+  "collation: providing a sequence from inside the event sorts the statement"() {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE t(v TEXT)");
+    db.exec("INSERT INTO t(v) VALUES ('a'),('b'),('c')");
+    const asked: Array<{ name: string; encoding: string }> = [];
+    let comparisons = 0;
+    withEvents(
+      db,
+      (e) => {
+        if (e.type !== "collation") return undefined;
+        asked.push({ name: e.name, encoding: e.encoding });
+        e.provide((a, b) => {
+          comparisons++;
+          return a < b ? 1 : a > b ? -1 : 0;
+        });
+        return undefined;
+      },
+      LIB,
+      { collation: true },
+    );
+    const rows = db.prepare("SELECT v FROM t ORDER BY v COLLATE REV").all<
+      { v: string }
+    >()
+      .map((r) => r.v);
+    check("  the statement proceeded, correctly sorted", rows, ["c", "b", "a"]);
+    check("  asked once, by name", asked, [{ name: "REV", encoding: "utf8" }]);
+    check("  and the comparator was actually called", comparisons > 0, true);
+    db.close();
+  },
+
+  "collation: the name is asked for once per statement, not once per lookup"() {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE t(v TEXT)");
+    db.exec("INSERT INTO t(v) VALUES ('a'),('b'),('c')");
+    let asked = 0;
+    withEvents(
+      db,
+      (e) => {
+        if (e.type === "collation") asked++;
+        return undefined;
+      },
+      LIB,
+      { collation: true, onListenerError: () => {} },
+    );
+    // Never provided: SQLite asks, gives up, and does not loop.
+    try {
+      db.prepare("SELECT v FROM t ORDER BY v COLLATE REV").all();
+    } catch { /* expected below */ }
+    check("  one ask for one statement", asked, 1);
+    db.close();
+  },
+
+  "collation: doing nothing fails the statement cleanly and commits anyway"() {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE t(v TEXT)");
+    db.exec("CREATE TABLE plain(x INTEGER)");
+    withEvents(db, () => undefined, LIB, { collation: true });
+    db.exec("BEGIN");
+    db.exec("INSERT INTO plain VALUES (42)");
+    let threw = "";
+    try {
+      db.prepare("SELECT v FROM t ORDER BY v COLLATE REV").all();
+    } catch (e) {
+      threw = msg(e);
+    }
+    check(
+      "  the statement failed with SQLite's own message",
+      threw.includes("no such collation sequence"),
+      true,
+    );
+    db.exec("COMMIT");
+    check(
+      "  the connection is still usable and the commit landed",
+      db.prepare("SELECT x FROM plain").get<{ x: number }>()?.x,
+      42,
+    );
+    db.close();
+  },
+
+  "collation: off by default, so nothing is asked and nothing changes"() {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE t(v TEXT)");
+    let asked = 0;
+    withEvents(db, (e) => {
+      if (e.type === "collation") asked++;
+      return undefined;
+    }, LIB);
+    let threw = "";
+    try {
+      db.prepare("SELECT v FROM t ORDER BY v COLLATE REV").all();
+    } catch (e) {
+      threw = msg(e);
+    }
+    check("  no event", asked, 0);
+    check(
+      "  and the statement fails exactly as it would with no hooks",
+      threw.includes("no such collation sequence"),
+      true,
+    );
+    db.close();
+  },
+
+  "collation: a stashed provide() installs nothing and is reported"() {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE t(v TEXT)");
+    db.exec("INSERT INTO t(v) VALUES ('a'),('b')");
+    const errs: string[] = [];
+    const stashed: Array<(a: string, b: string) => number> = [];
+    let stash: CollationEvent["provide"] | null = null;
+    withEvents(
+      db,
+      (e) => {
+        if (e.type === "collation" && stash === null) stash = e.provide;
+        return undefined;
+      },
+      LIB,
+      { collation: true, onListenerError: (e) => errs.push(msg(e)) },
+    );
+    try {
+      db.prepare("SELECT v FROM t ORDER BY v COLLATE REV").all();
+    } catch { /* the statement was always going to fail */ }
+    stashed.push((a, b) => a < b ? 1 : a > b ? -1 : 0);
+    stash!(stashed[0]!);
+    db.exec("SELECT 1");
+    check(
+      "  the late call was reported",
+      errs.some((e) => e.includes("had already given up")),
+      true,
+    );
+    let threw = "";
+    try {
+      db.prepare("SELECT v FROM t ORDER BY v COLLATE REV").all();
+    } catch (e) {
+      threw = msg(e);
+    }
+    check(
+      "  and installed nothing: the next statement still fails",
+      threw.includes("no such collation sequence"),
+      true,
+    );
+    db.close();
+  },
+
+  "collation: the first provide() stands and a second is reported"() {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE t(v TEXT)");
+    db.exec("INSERT INTO t(v) VALUES ('a'),('b'),('c')");
+    const errs: string[] = [];
+    withEvents(
+      db,
+      (e) => {
+        if (e.type !== "collation") return undefined;
+        e.provide((a, b) => a < b ? 1 : a > b ? -1 : 0); // reverse: wins
+        e.provide((a, b) => a < b ? -1 : a > b ? 1 : 0); // forward: ignored
+        return undefined;
+      },
+      LIB,
+      { collation: true, onListenerError: (e) => errs.push(msg(e)) },
+    );
+    const rows = db.prepare("SELECT v FROM t ORDER BY v COLLATE REV").all<
+      { v: string }
+    >()
+      .map((r) => r.v);
+    check("  the first comparator ordered the rows", rows, ["c", "b", "a"]);
+    check(
+      "  and the second call was reported",
+      errs.some((e) => e.includes("the first collating sequence stands")),
+      true,
+    );
+    db.close();
+  },
+
+  "collation: provide() with something that is not a function is refused"() {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE t(v TEXT)");
+    db.exec("INSERT INTO t(v) VALUES ('a'),('b')");
+    const errs: string[] = [];
+    withEvents(
+      db,
+      (e) => {
+        if (e.type !== "collation") return undefined;
+        // The shape a caller reaches for when they meant Intl.Collator.compare.
+        // Routed through `unknown` so the wrong type reaches provide() at
+        // runtime without an assertion pretending it is the right one.
+        const provide: unknown = e.provide;
+        if (typeof provide === "function") provide(new Intl.Collator("en"));
+        return undefined;
+      },
+      LIB,
+      { collation: true, onListenerError: (e) => errs.push(msg(e)) },
+    );
+    let threw = "";
+    try {
+      db.prepare("SELECT v FROM t ORDER BY v COLLATE REV").all();
+    } catch (e) {
+      threw = msg(e);
+    }
+    // The failing prepare threw from the driver, so nothing of ours unwound to
+    // flush; a later statement is what delivers the pending listener error.
+    db.exec("SELECT 1");
+    check(
+      "  reported rather than installed",
+      errs.some((e) => e.includes("rather than a comparison function")),
+      true,
+    );
+    check(
+      "  and the statement failed rather than sorting by nothing",
+      threw.includes("no such collation sequence"),
+      true,
+    );
+    db.close();
+  },
+
+  "collation: a comparator that throws is reported, not unwound through C"() {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE t(v TEXT)");
+    db.exec("INSERT INTO t(v) VALUES ('a'),('b'),('c')");
+    const errs: string[] = [];
+    withEvents(
+      db,
+      (e) => {
+        if (e.type !== "collation") return undefined;
+        e.provide(() => {
+          throw new Error("from the comparator");
+        });
+        return undefined;
+      },
+      LIB,
+      { collation: true, onListenerError: (e) => errs.push(msg(e)) },
+    );
+    const rows = db.prepare("SELECT v FROM t ORDER BY v COLLATE REV").all<
+      { v: string }
+    >()
+      .map((r) => r.v);
+    check("  the statement still returned every row", rows.length, 3);
+    check(
+      "  and the throw was reported",
+      errs.some((e) => e.includes("from the comparator")),
+      true,
+    );
+    check(
+      "  the connection survives",
+      db.prepare("SELECT count(*) AS n FROM t").get<{ n: number }>()?.n,
+      3,
+    );
+    db.close();
+  },
+
+  "collation: a comparator returning a non-number is reported, not passed to C"() {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE t(v TEXT)");
+    db.exec("INSERT INTO t(v) VALUES ('a'),('b'),('c')");
+    const errs: string[] = [];
+    withEvents(
+      db,
+      (e) => {
+        if (e.type !== "collation") return undefined;
+        e.provide(() => NaN);
+        return undefined;
+      },
+      LIB,
+      { collation: true, onListenerError: (e) => errs.push(msg(e)) },
+    );
+    const rows = db.prepare("SELECT v FROM t ORDER BY v COLLATE REV").all<
+      { v: string }
+    >();
+    check("  every row still came back", rows.length, 3);
+    check(
+      "  and 'not an ordering' was said out loud",
+      errs.some((e) => e.includes("which is not an ordering")),
+      true,
+    );
+    db.close();
+  },
+
+  "collation: registering produces no events of its own"() {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE t(v TEXT)");
+    db.exec("INSERT INTO t(v) VALUES ('a'),('b')");
+    const seen: string[] = [];
+    withEvents(
+      db,
+      (e) => {
+        seen.push(e.type);
+        if (e.type === "collation") {
+          e.provide((a, b) => a < b ? 1 : a > b ? -1 : 0);
+        }
+        return undefined;
+      },
+      LIB,
+      { collation: true },
+    );
+    db.prepare("SELECT v FROM t ORDER BY v COLLATE REV").all();
+    check(
+      "  one collation event and nothing else",
+      seen,
+      ["collation"],
+    );
+    db.close();
+  },
+
+  "collation: dispose() removes the sequence rather than leaving it dangling"() {
+    // Freeing the comparator while SQLite still pointed at it would be a
+    // segfault, so detach removes the sequence first. The proof that removal
+    // is what happened is the message, not the absence of a crash.
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE t(v TEXT)");
+    db.exec("INSERT INTO t(v) VALUES ('a'),('b'),('c')");
+    const sub = withEvents(
+      db,
+      (e) => {
+        if (e.type === "collation") {
+          e.provide((a, b) => a < b ? 1 : a > b ? -1 : 0);
+        }
+        return undefined;
+      },
+      LIB,
+      { collation: true },
+    );
+    const before = db.prepare("SELECT v FROM t ORDER BY v COLLATE REV").all<
+      { v: string }
+    >()
+      .map((r) => r.v);
+    check("  sorted while attached", before, ["c", "b", "a"]);
+    sub.dispose();
+    let threw = "";
+    try {
+      db.prepare("SELECT v FROM t ORDER BY v COLLATE REV").all();
+    } catch (e) {
+      threw = msg(e);
+    }
+    check(
+      "  gone after dispose, and said so",
+      threw.includes("no such collation sequence"),
+      true,
+    );
+    check(
+      "  the connection is otherwise untouched",
+      db.prepare("SELECT count(*) AS n FROM t").get<{ n: number }>()?.n,
+      3,
+    );
+    db.close();
+  },
+
+  "collation: capabilities report it, and asking without it is refused"() {
+    check("  this library has it", probeCapabilities(LIB).collation, true);
+  },
+
+  "collation: a name SQLite could not resolve is reported as written"() {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE t(v TEXT)");
+    db.exec("INSERT INTO t(v) VALUES ('a')");
+    const names: string[] = [];
+    withEvents(
+      db,
+      (e) => {
+        if (e.type === "collation") names.push(e.name);
+        return undefined;
+      },
+      LIB,
+      { collation: true, onListenerError: () => {} },
+    );
+    try {
+      db.prepare('SELECT v FROM t ORDER BY v COLLATE "MiXeD Case"').all();
+    } catch { /* no sequence was supplied */ }
+    check("  the spelling in the SQL, not a normalised form", names, [
+      "MiXeD Case",
+    ]);
+    db.close();
   },
 
   "an opcode outside the documented three is delivered as 'unknown'"() {

@@ -10,6 +10,8 @@ import type {
   AttachOptions,
   Backend,
   BackendHandlers,
+  CollationEncoding,
+  Comparator,
   RawPreUpdate,
   RawTrace,
   TraceSql,
@@ -140,6 +142,42 @@ const AUTH_SYMBOLS = {
   },
 } as const;
 
+/**
+ * Both halves of the collation story, in ONE handle: a build that can ask for a
+ * missing collation but not let us supply one would be a capability that
+ * cannot be acted on, so they stand or fall together.
+ */
+const COLLATION_SYMBOLS = {
+  sqlite3_collation_needed: {
+    parameters: ["pointer", "pointer", "function"],
+    result: "i32",
+  },
+  sqlite3_create_collation: {
+    parameters: ["pointer", "buffer", "i32", "pointer", "function"],
+    result: "i32",
+  },
+} as const;
+
+/** eTextRep, as sqlite3_collation_needed reports what the statement wanted. */
+const UTF8 = 1, UTF16LE = 2, UTF16BE = 3, UTF16 = 4;
+
+const encodingFor = (eTextRep: number): CollationEncoding =>
+  eTextRep === UTF8
+    ? "utf8"
+    : eTextRep === UTF16LE
+    ? "utf16le"
+    : eTextRep === UTF16BE
+    ? "utf16be"
+    : eTextRep === UTF16
+    ? "utf16"
+    : "unknown";
+
+/** The C signature of a collating function. */
+const COMPARATOR_SIG = {
+  parameters: ["pointer", "i32", "pointer", "i32", "pointer"],
+  result: "i32",
+} as const;
+
 /** Needs SQLITE_ENABLE_NORMALIZE, which stock distribution builds do not set. */
 const NORMALIZE_SYMBOLS = {
   sqlite3_normalized_sql: { parameters: ["pointer"], result: "pointer" },
@@ -157,6 +195,7 @@ type NormalizeLib = Deno.DynamicLibrary<typeof NORMALIZE_SYMBOLS>;
 type ProgressLib = Deno.DynamicLibrary<typeof PROGRESS_SYMBOLS>;
 type BusyLib = Deno.DynamicLibrary<typeof BUSY_SYMBOLS>;
 type AuthLib = Deno.DynamicLibrary<typeof AUTH_SYMBOLS>;
+type CollationLib = Deno.DynamicLibrary<typeof COLLATION_SYMBOLS>;
 type PreSymbols = Deno.DynamicLibrary<typeof PREUPDATE_SYMBOLS>["symbols"];
 
 /** SQLITE_NULL etc., as returned by sqlite3_value_type. */
@@ -171,6 +210,7 @@ type Opened = {
   progress: ProgressLib | null;
   busy: BusyLib | null;
   auth: AuthLib | null;
+  collation: CollationLib | null;
   unavailable: string;
 };
 
@@ -202,6 +242,7 @@ const capabilitiesOf = (opened: Opened): Capabilities =>
       progress: opened.progress !== null,
       busy: opened.busy !== null,
       authorize: opened.auth !== null,
+      collation: opened.collation !== null,
     }
     : {
       hooks: true,
@@ -213,6 +254,7 @@ const capabilitiesOf = (opened: Opened): Capabilities =>
       progress: opened.progress !== null,
       busy: opened.busy !== null,
       authorize: opened.auth !== null,
+      collation: opened.collation !== null,
     };
 
 /**
@@ -252,6 +294,7 @@ function openLibrary(
         progress: openOptional(libPath, PROGRESS_SYMBOLS),
         busy: openOptional(libPath, BUSY_SYMBOLS),
         auth: openOptional(libPath, AUTH_SYMBOLS),
+        collation: openOptional(libPath, COLLATION_SYMBOLS),
         unavailable: "",
       };
     } catch (cause) {
@@ -287,6 +330,7 @@ function openLibrary(
     progress: openOptional(libPath, PROGRESS_SYMBOLS),
     busy: openOptional(libPath, BUSY_SYMBOLS),
     auth: openOptional(libPath, AUTH_SYMBOLS),
+    collation: openOptional(libPath, COLLATION_SYMBOLS),
     unavailable,
   };
 }
@@ -307,6 +351,7 @@ export function probeFfi(libPath: string): Capabilities {
     opened.progress?.close();
     opened.busy?.close();
     opened.auth?.close();
+    opened.collation?.close();
   }
 }
 
@@ -317,7 +362,8 @@ export function openFfiBackend(
   want: NonNullable<EventOptions["preupdate"]>,
 ): Backend {
   const opened = openLibrary(libPath, want);
-  const { lib, pre, wal, trace, normalize, progress, busy, auth } = opened;
+  const { lib, pre, wal, trace, normalize, progress, busy, auth, collation } =
+    opened;
   const capabilities = capabilitiesOf(opened);
   const version = readC(lib.symbols.sqlite3_libversion());
 
@@ -510,6 +556,7 @@ export function openFfiBackend(
         progress?.close();
         busy?.close();
         auth?.close();
+        collation?.close();
       }),
     attach(handlers: BackendHandlers, options: AttachOptions): Attachment {
       const preupdateCb = pre
@@ -699,6 +746,99 @@ export function openFfiBackend(
         () => safely(handlers, () => handlers.rollback()),
       );
 
+      /**
+       * One live comparator per name. Keyed by name because that is what
+       * SQLite keys by: registering twice under one name replaces the
+       * sequence, so keeping both callbacks would keep one that can never be
+       * called and must still be freed.
+       */
+      const collations = new Map<
+        string,
+        Deno.UnsafeCallback<typeof COMPARATOR_SIG>
+      >();
+      const nameBytes = new TextEncoder();
+
+      /**
+       * Read one side of a comparison. The bytes are SQLite's, valid only for
+       * the duration of this call, so they are decoded — copied — before any
+       * JS the caller wrote can run.
+       */
+      const collText = (n: number, p: Deno.PointerValue): string =>
+        n <= 0 || p === null
+          ? ""
+          : decoder.decode(new Deno.UnsafePointerView(p).getArrayBuffer(n));
+
+      const registerCollation = (name: string, compare: Comparator): void => {
+        // After detach the sqlite3* may be gone and the handles closed; a
+        // registration here would touch freed memory rather than fail.
+        if (released || !collation) return;
+        const cb = new Deno.UnsafeCallback(
+          COMPARATOR_SIG,
+          (_arg, nA, pA, nB, pB) => {
+            let sign = 0;
+            safely(handlers, () => {
+              const r = compare(collText(nA, pA), collText(nB, pB));
+              // A sign, never the caller's number: SQLite only reads the sign,
+              // and a NaN or a bigint reaching C is undefined behaviour.
+              // Anything that is not an ordering is reported as EQUAL and
+              // recorded, because there is no way to fail a comparison.
+              sign = typeof r === "number" && Number.isFinite(r)
+                ? (r < 0 ? -1 : r > 0 ? 1 : 0)
+                : 0;
+              if (typeof r !== "number" || !Number.isFinite(r)) {
+                throw new SqliteHooksError(
+                  `the collating function for "${name}" returned ${
+                    typeof r === "number" ? String(r) : typeof r
+                  } rather than a number; the two values were treated as equal, which is not an ordering`,
+                );
+              }
+            });
+            return sign;
+          },
+        );
+        cb.unref();
+        const rc = collation.symbols.sqlite3_create_collation(
+          handle,
+          nameBytes.encode(`${name}\0`),
+          UTF8,
+          null,
+          cb.pointer,
+        );
+        if (rc !== 0) {
+          // Nothing took the pointer, so nothing can call it.
+          cb.close();
+          safely(handlers, () => {
+            throw new SqliteHooksError(
+              `sqlite3_create_collation("${name}") returned ${rc}; no collating sequence was installed`,
+            );
+          });
+          return;
+        }
+        // Only now is the old one unreachable: SQLite has swapped the pointer.
+        collations.get(name)?.close();
+        collations.set(name, cb);
+      };
+
+      const collationCb = collation && options.collation
+        ? new Deno.UnsafeCallback(
+          {
+            parameters: ["pointer", "pointer", "i32", "pointer"],
+            result: "void",
+          } as const,
+          (_arg, _dbh, eTextRep, zName) => {
+            safely(handlers, () => {
+              // sqlite3_collation_needed (not ..._needed16) always names the
+              // sequence in UTF-8, whatever encoding the statement wanted.
+              const name = readC(zName);
+              handlers.collation(
+                () => ({ name, encoding: encodingFor(eTextRep) }),
+                (compare) => registerCollation(name, compare),
+              );
+            });
+          },
+        )
+        : null;
+
       // A forgotten dispose() should not wedge the process open at exit; these
       // are only ever called synchronously from FFI on this thread.
       update.unref();
@@ -710,6 +850,7 @@ export function openFfiBackend(
       progressCb?.unref();
       busyCb?.unref();
       authCb?.unref();
+      collationCb?.unref();
 
       if (pre && preupdateCb) {
         pre.sqlite3_preupdate_hook(handle, preupdateCb.pointer, null);
@@ -733,6 +874,13 @@ export function openFfiBackend(
       }
       if (auth && authCb) {
         auth.symbols.sqlite3_set_authorizer(handle, authCb.pointer, null);
+      }
+      if (collation && collationCb) {
+        collation.symbols.sqlite3_collation_needed(
+          handle,
+          null,
+          collationCb.pointer,
+        );
       }
       if (progress && progressCb && options.progressOps !== null) {
         progress.symbols.sqlite3_progress_handler(
@@ -774,6 +922,28 @@ export function openFfiBackend(
               if (authCb) {
                 auth?.symbols.sqlite3_set_authorizer(handle, null, null);
               }
+              if (collationCb) {
+                collation?.symbols.sqlite3_collation_needed(
+                  handle,
+                  null,
+                  null,
+                );
+              }
+              // Every sequence a listener supplied goes with us. A comparator
+              // is JS this attachment owns, so leaving the sequence registered
+              // would leave SQLite pointing at a callback nothing can free.
+              // Verified safe on a live connection: SQLite expires the
+              // statements that referenced it, and they fail with "no such
+              // collation sequence" rather than dangling.
+              for (const name of collations.keys()) {
+                collation?.symbols.sqlite3_create_collation(
+                  handle,
+                  nameBytes.encode(`${name}\0`),
+                  UTF8,
+                  null,
+                  null,
+                );
+              }
             }
             update.close();
             commit.close();
@@ -784,6 +954,10 @@ export function openFfiBackend(
             progressCb?.close();
             busyCb?.close();
             authCb?.close();
+            // After the removals above, and only then: while the connection
+            // was alive SQLite still held these pointers.
+            for (const cb of collations.values()) cb.close();
+            collations.clear();
             lib.close();
             wal?.close();
             trace?.close();
@@ -791,6 +965,7 @@ export function openFfiBackend(
             progress?.close();
             busy?.close();
             auth?.close();
+            collation?.close();
           }),
       };
     },

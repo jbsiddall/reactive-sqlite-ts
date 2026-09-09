@@ -56,6 +56,34 @@ export type RawWal = {
   frames: number;
 };
 
+/**
+ * Which text encoding SQLite wanted the missing collation in. Informational
+ * only: a backend registers UTF-8 whatever this says, because SQLite converts
+ * to whichever encoding a registered sequence declares.
+ */
+export type CollationEncoding =
+  | "utf8"
+  | "utf16le"
+  | "utf16be"
+  | "utf16"
+  | "unknown";
+
+/** One sqlite3_collation_needed callback: a name SQLite could not resolve. */
+export type RawCollation = {
+  name: string;
+  encoding: CollationEncoding;
+};
+
+/**
+ * Compares two collated text values. Called from inside SQLite's sorter, so
+ * the same no-throw rule as {@linkcode BackendHandlers} applies: a backend
+ * wraps it and reports a throw rather than unwinding through C.
+ *
+ * The return value is a sign, not a magnitude, and a backend must reduce it to
+ * -1, 0 or 1 rather than pass a listener's number through.
+ */
+export type Comparator = (a: string, b: string) => number;
+
 /** One row from the update hook, already read out of SQLite's memory. */
 export type RawChange = {
   opcode: number;
@@ -131,6 +159,19 @@ export type BackendHandlers = {
    * must never turn an internal failure into `true`.
    */
   progress(): boolean;
+  /**
+   * A statement named a collating sequence this connection does not have.
+   * `register` installs one under exactly the requested name and is valid
+   * ONLY while this call is on the stack — SQLite retries the lookup as soon
+   * as it returns, and asks once per statement, so a comparator supplied late
+   * decides nothing. Calling it more than once replaces the previous
+   * registration; deciding whether that is an error is the caller's policy,
+   * not the backend's.
+   */
+  collation(
+    read: () => RawCollation,
+    register: (compare: Comparator) => void,
+  ): void;
   rollback(): void;
   /**
    * The backend itself failed — reading a row, say — before any handler above
@@ -153,6 +194,8 @@ export type AttachOptions = {
   busy: boolean;
   /** Whether to install an authorizer at all. */
   authorize: boolean;
+  /** Whether to install a collation-needed callback at all. */
+  collation: boolean;
   /**
    * Frames after which the backend checkpoints from inside the WAL hook,
    * replicating what SQLite's own hook did before ours displaced it. `null`
