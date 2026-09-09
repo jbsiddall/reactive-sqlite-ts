@@ -23,7 +23,7 @@ import { CASES } from "./crash_cases.ts";
 import { PROPERTIES, PROPERTY_RUNS, PROPERTY_SEED } from "./properties.ts";
 
 const LIB = resolveLibPath();
-const { Database } = await import("@db/sqlite");
+const { Database, Statement } = await import("@db/sqlite");
 const {
   actionFor,
   opFor,
@@ -2942,6 +2942,133 @@ const SEMANTIC: Record<string, () => void> = {
       "  every write reached our hook",
       seen.map((c) => `${c.op} ${c.db}.${c.table} ${c.rowid}`),
       ["insert main.t 1", "insert main.t 2", "update main.t 1"],
+    );
+    db.close();
+  },
+
+  "reentrancy: for..of on a statement prepared BEFORE attach is refused"() {
+    // The headline attach-order case. `iter` is on the prototype and is never
+    // shadowed by an own property, so the refusal reaches a statement this
+    // library never saw being made.
+    const db = memory();
+    db.exec("INSERT INTO t VALUES (1,'a'),(2,'b')");
+    const before = db.prepare("SELECT v FROM t");
+    let refusal = "";
+    let rowsSeen = 0;
+    withEvents(
+      db,
+      (e) => {
+        if (e.type !== "change") return undefined;
+        try {
+          for (const _ of before) rowsSeen++;
+        } catch (err) {
+          refusal = msg(err);
+        }
+        return undefined;
+      },
+      LIB,
+      { onListenerError: () => {} },
+    );
+    db.exec("INSERT INTO t VALUES (3,'c')");
+    check(
+      "  it refused",
+      refusal.startsWith("statement.iter() was called"),
+      true,
+    );
+    check("  and no row was stepped", rowsSeen, 0);
+    // The gate: the same iteration outside a listener must be untouched, or a
+    // refusal that fires everywhere would look exactly like this one.
+    check("  outside a hook it still iterates", [...before].length, 3);
+    db.close();
+  },
+
+  "reentrancy: stmt.iter() is refused from inside a listener"() {
+    const db = memory();
+    db.exec("INSERT INTO t VALUES (1,'a')");
+    const before = db.prepare("SELECT v FROM t");
+    let refusal = "";
+    withEvents(
+      db,
+      (e) => {
+        if (e.type !== "change") return undefined;
+        try {
+          before.iter().next();
+        } catch (err) {
+          refusal = msg(err);
+        }
+        return undefined;
+      },
+      LIB,
+      { onListenerError: () => {} },
+    );
+    db.exec("INSERT INTO t VALUES (2,'b')");
+    check(
+      "  named itself",
+      refusal.startsWith("statement.iter() was called from inside a hook"),
+      true,
+    );
+    db.close();
+  },
+
+  "reentrancy: preparing through new Statement() inside a hook is reported"() {
+    // It cannot be refused — the constructor touches only unsafeHandle before
+    // sqlite3_prepare_v2, and unsafeHandle is the documented escape hatch. So
+    // the contract is detection, and this test is what holds that down: if the
+    // driver stops reading unsafeConcurrency, detection stops silently, and
+    // this test is the thing that says so.
+    const db = memory();
+    db.exec("INSERT INTO t VALUES (1,'a')");
+    const errs: string[] = [];
+    let got: unknown = "not run";
+    withEvents(
+      db,
+      (e) => {
+        if (e.type !== "change") return undefined;
+        const stmt = new Statement(db, "SELECT count(*) AS c FROM t");
+        got = stmt.get();
+        stmt.finalize();
+        return undefined;
+      },
+      LIB,
+      { onListenerError: (err) => errs.push(msg(err)) },
+    );
+    db.exec("INSERT INTO t VALUES (2,'b')");
+    check("  the read was NOT refused", got !== "not run", true);
+    check(
+      "  but it was reported",
+      errs.some((e) =>
+        e.startsWith("a statement was prepared on this connection")
+      ),
+      true,
+    );
+    db.close();
+  },
+
+  "reentrancy: preparing outside a hook reports nothing"() {
+    // The negative control for the case above. Without it, a detector that
+    // fired on every prepare would pass that test and mean nothing.
+    const db = memory();
+    const errs: string[] = [];
+    withEvents(db, () => {}, LIB, {
+      onListenerError: (err) => errs.push(msg(err)),
+    });
+    const stmt = new Statement(db, "SELECT count(*) AS c FROM t");
+    stmt.get();
+    stmt.finalize();
+    db.exec("INSERT INTO t VALUES (1,'a')");
+    check("  nothing was reported", errs, []);
+    check("  and unsafeConcurrency still reads", db.unsafeConcurrency, false);
+    db.close();
+  },
+
+  "reentrancy: dispose() restores unsafeConcurrency as a plain property"() {
+    const db = memory();
+    const sub = withEvents(db, () => {}, LIB);
+    sub.dispose();
+    check(
+      "  own data property again",
+      Object.getOwnPropertyDescriptor(db, "unsafeConcurrency")?.value,
+      false,
     );
     db.close();
   },

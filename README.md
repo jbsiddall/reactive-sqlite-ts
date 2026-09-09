@@ -325,12 +325,17 @@ verified so far.
 5. **Some deletes are not reported.** The truncate optimisation (`DELETE FROM t`
    with no `WHERE`) removes rows without invoking the hook per row.
 6. **A hook must not use the connection that invoked it.** Undefined behaviour
-   in SQLite. Defer that work until after the commit. The library rejects the
-   common routes — it replaces the methods on the driver's `Database`,
-   `Statement` and `SQLBlob` — but that is a guardrail, not a barrier: a
-   `Statement` built directly, `stmt.iter()`, a `for..of` over a statement,
-   `db.function()` and the driver's public `unsafeHandle` all reach SQLite
-   without passing it. **The rule holds whether or not you get an error.**
+   in SQLite. Defer that work until after the commit. The library refuses
+   everything that STEPS a statement from inside a listener — the methods on the
+   driver's `Database`, `Statement` and `SQLBlob`, and `iter()`/`for..of` on any
+   statement at all, including ones you prepared before subscribing. It is still
+   a guardrail rather than a barrier, and two routes are left: the
+   `run`/`get`/`all`/`values`/`value` installed directly on a statement you
+   prepared before subscribing, and the driver's public `unsafeHandle`. The
+   first is reported through `onListenerError` when the statement is built
+   inside a listener, since it cannot be refused there without taking
+   `unsafeHandle` away from everyone. The second is the escape hatch and is
+   meant to be one. **The rule holds whether or not you get an error.**
 7. **A veto surfaces as SQLite's generic "constraint failed".** That is all
    SQLite reports; your own reason is attached alongside it.
 8. **One hook of each kind per connection.** Multiple listeners are multiplexed

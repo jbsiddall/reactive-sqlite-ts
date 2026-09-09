@@ -485,6 +485,61 @@ export const CASES: Record<string, CrashCase> = {
     },
   },
 
+  "iterate-unwrapped-statement-in-change": {
+    code: 1,
+    match: "statement.iter() was called from inside a hook listener",
+    why:
+      "for..of steps the statement mid-hook and hands the listener uncommitted state; the statement was prepared before withEvents, so only the prototype patch can reach it.",
+    run() {
+      const db = fresh();
+      db.exec("INSERT INTO t VALUES (1, 'a')");
+      const before = db.prepare("SELECT v FROM t");
+      on(db, "change", () => {
+        for (const _row of before) { /* must not get here */ }
+      });
+      db.exec("INSERT INTO t VALUES (2, 'b')");
+    },
+  },
+
+  "iterate-outside-hooks-is-untouched": {
+    code: 0,
+    match: "iterated 3",
+    why:
+      "The negative control for the case above: a refusal that fired everywhere would pass that test and mean nothing.",
+    run() {
+      const db = fresh();
+      db.exec("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')");
+      on(db, "change", () => {});
+      const stmt = db.prepare("SELECT v FROM t");
+      let n = 0;
+      for (const _row of stmt) n++;
+      console.log("iterated", n);
+      stmt.finalize();
+      db.close();
+    },
+  },
+
+  "iter-patch-restored-after-dispose": {
+    code: 0,
+    match: "restored true",
+    why:
+      "The prototype patch is process-wide, so a leaked one would change every Statement in the process forever. Its own child, because nothing else in the run can be attached at the same time.",
+    run() {
+      const db = fresh();
+      const proto = Object.getPrototypeOf(db.prepare("SELECT 1"));
+      const original: unknown = Reflect.get(proto, "iter");
+      const sub = withEvents(db, () => {}, LIB);
+      const patched: unknown = Reflect.get(proto, "iter");
+      sub.dispose();
+      const after: unknown = Reflect.get(proto, "iter");
+      console.log(
+        "restored",
+        patched !== original && after === original,
+      );
+      db.close();
+    },
+  },
+
   "listener-writes-in-change": {
     code: 1,
     match: "from inside a hook listener",

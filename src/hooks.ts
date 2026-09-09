@@ -767,6 +767,88 @@ type Registration = {
  */
 const REGISTRATIONS = new WeakMap<Database, Registration>();
 
+/**
+ * The refusal every route into SQLite from inside a listener gets. Free
+ * function rather than a closure so the statement-prototype patch below —
+ * which is shared by every connection in the process and therefore cannot
+ * close over one registration — refuses in exactly the same words as the
+ * per-connection patches do.
+ */
+function refuseFromHook(reg: Registration, what: string): void {
+  if (reg.closed) {
+    throw new SqliteHooksError(
+      `${what} was called on a closed Database; its sqlite3 handle is freed and using it is undefined behaviour`,
+    );
+  }
+  if (reg.inHook) {
+    throw new SqliteHooksError(
+      `${what} was called from inside a hook listener. SQLite forbids using the connection from within its hooks — and a busy listener, which SQLite alone would permit, is refused too rather than making the rule hold for four callbacks and stop at the sixth. From a busy listener it can also deadlock, and there is no way to bound that. Do it from postcommit, or defer with queueMicrotask(). Note that this refusal covers the driver methods this library replaces, not every route into SQLite: the rule holds whether or not something threw.`,
+    );
+  }
+}
+
+/**
+ * `iter()` is patched on `Statement.prototype`, not on each statement.
+ *
+ * The rule being enforced is "nothing that STEPS a statement, from inside a
+ * hook" — not a list of blessed members. `iter()` is where that rule can be
+ * expressed once and reach every statement: unlike `run`/`get`/`all`/`values`/
+ * `value`, which the driver installs as OWN properties on each instance when
+ * the statement takes no bind parameters, `iter` is never shadowed. So the
+ * prototype covers statements this library never saw — including ones prepared
+ * BEFORE `withEvents` was called, which no per-instance patch can reach.
+ * `for..of` and `[Symbol.iterator]` come along for free: the driver's
+ * `[Symbol.iterator]` is `return this.iter()`, a dynamic lookup.
+ *
+ * The class is shared by every Database in the process, so the patch is
+ * installed once and reference-counted, and the wrapper asks the statement
+ * which connection it belongs to rather than assuming. A statement on an
+ * unregistered connection pays one WeakMap lookup per `iter()` CALL — not per
+ * row, because the guard runs before the generator is returned.
+ */
+let iterPatchDepth = 0;
+let patchedStatementProto: object | null = null;
+let originalIter: unknown = undefined;
+
+/** Install the prototype patch if it is not already there; returns its undo. */
+function patchStatementIter(proto: object): () => void {
+  if (patchedStatementProto === null) {
+    const original: unknown = Reflect.get(proto, "iter");
+    if (typeof original !== "function") return () => {};
+    patchedStatementProto = proto;
+    originalIter = original;
+    Reflect.set(
+      proto,
+      "iter",
+      function (this: { db?: unknown }, ...args: unknown[]) {
+        // `db` is the driver's own public field on every Statement, so the
+        // wrapper never has to guess which connection it is looking at.
+        const owner: unknown = this?.db;
+        const reg = isDatabase(owner) ? REGISTRATIONS.get(owner) : undefined;
+        if (reg !== undefined) refuseFromHook(reg, "statement.iter()");
+        return original.apply(this, args);
+      },
+    );
+  } else if (patchedStatementProto !== proto) {
+    // Two different Statement classes in one process means two copies of the
+    // driver, which the version check upstream of here already refuses. Leave
+    // the second prototype alone rather than patch it with the first's undo.
+    return () => {};
+  }
+  iterPatchDepth++;
+  let undone = false;
+  return () => {
+    if (undone) return;
+    undone = true;
+    if (--iterPatchDepth > 0) return;
+    if (patchedStatementProto !== null) {
+      Reflect.set(patchedStatementProto, "iter", originalIter);
+    }
+    patchedStatementProto = null;
+    originalIter = undefined;
+  };
+}
+
 function isDatabase(db: unknown): db is Database {
   if (db === null || typeof db !== "object") return false;
   return typeof Reflect.get(db, "prepare") === "function" &&
@@ -1852,18 +1934,7 @@ function attach(
     for (const u of undo) u();
   };
 
-  const guard = (what: string) => {
-    if (reg.closed) {
-      throw new SqliteHooksError(
-        `${what} was called on a closed Database; its sqlite3 handle is freed and using it is undefined behaviour`,
-      );
-    }
-    if (reg.inHook) {
-      throw new SqliteHooksError(
-        `${what} was called from inside a hook listener. SQLite forbids using the connection from within its hooks — and a busy listener, which SQLite alone would permit, is refused too rather than making the rule hold for four callbacks and stop at the sixth. From a busy listener it can also deadlock, and there is no way to bound that. Do it from postcommit, or defer with queueMicrotask(). Note that this refusal covers the driver methods this library replaces, not every route into SQLite: the rule holds whether or not something threw.`,
-      );
-    }
-  };
+  const guard = (what: string) => refuseFromHook(reg, what);
 
   const instrument = (fn: Patchable, what: string): Patchable =>
     function (this: unknown, ...args: never[]) {
@@ -1956,6 +2027,65 @@ function attach(
     wrap(stmt, STMT_METHODS, "statement.", false);
     return stmt;
   });
+
+  // Every statement, not just the ones we prepared: see patchStatementIter.
+  // The prototype comes from a statement rather than from an import, because
+  // this module never imports the driver at runtime — the caller's copy is the
+  // only correct one. Bracketed by ours() so an authorize listener does not see
+  // a statement it did not ask for.
+  try {
+    const probe = ours(() => rawPrepare("SELECT 1"));
+    try {
+      const proto: unknown = Object.getPrototypeOf(probe);
+      if (proto !== null && typeof proto === "object") {
+        undo.push(patchStatementIter(proto));
+      }
+    } finally {
+      probe.finalize();
+    }
+  } catch {
+    /* not worth failing attach over; the per-statement patches stand */
+  }
+
+  // `new Statement(db, sql)` prepares inside its constructor, and the only
+  // thing it touches on the Database BEFORE sqlite3_prepare_v2 runs is
+  // `unsafeHandle` — the documented public escape hatch, which this library
+  // uses itself. Guarding that would turn the hatch into a barrier, so
+  // construction cannot be REFUSED here. It CAN be detected: the constructor
+  // reads `unsafeConcurrency` exactly once, and nothing else in the driver
+  // reads it at all. Reporting rather than throwing is deliberate — throwing
+  // at that point would abandon a statement that is already prepared and not
+  // yet registered with the finalizer, and an unfinalized statement makes
+  // sqlite3_close fail. A signal after the fact beats silence.
+  if (Object.hasOwn(db, "unsafeConcurrency")) {
+    let concurrency: unknown = Reflect.get(db, "unsafeConcurrency");
+    Object.defineProperty(db, "unsafeConcurrency", {
+      configurable: true,
+      enumerable: true,
+      get: () => {
+        if (reg.inHook && !reg.closed) {
+          errors.push({
+            error: new SqliteHooksError(
+              "a statement was prepared on this connection from inside a hook listener, through a route this library does not replace — new Statement(db, sql), or the raw handle. It cannot be refused there without taking away unsafeHandle, so it is reported instead: stepping that statement uses the connection from within a SQLite callback, which is undefined behaviour. Prepare it outside the listener, or defer with queueMicrotask().",
+            ),
+            event: { type: "change", change: NO_ROW },
+          });
+        }
+        return concurrency;
+      },
+      set: (value: unknown) => {
+        concurrency = value;
+      },
+    });
+    undo.push(() => {
+      Object.defineProperty(db, "unsafeConcurrency", {
+        value: concurrency,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+    });
+  }
 
   // db.transaction() returns a closure that BEGINs and COMMITs internally, and
   // carries .default/.deferred/.immediate/.exclusive versions of itself.
