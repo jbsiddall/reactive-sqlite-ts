@@ -87,6 +87,7 @@
       "examples/",
       "tools/",
       "CONTRIBUTING.md",
+      "DOMAIN_KNOWLEDGE.md",
       "DRIVER_DEFECTS.md"
     ]
   }

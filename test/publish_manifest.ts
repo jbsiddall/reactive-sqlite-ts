@@ -35,6 +35,7 @@ const MUST_NOT_SHIP = [
   "examples/",
   ".github/",
   "CONTRIBUTING.md",
+  "DOMAIN_KNOWLEDGE.md",
   "DRIVER_DEFECTS.md",
 ];
 

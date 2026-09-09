@@ -3,6 +3,11 @@
 Issues and pull requests are welcome. The project is pre-1.0 and the API is
 still moving, so open an issue before a large change.
 
+This file is "how do I work here". How the external things this library sits on
+actually behave — the `@db/sqlite` driver's internals, SQLite's own behaviour,
+and the version and date each was observed against — is in
+[`DOMAIN_KNOWLEDGE.md`](./DOMAIN_KNOWLEDGE.md).
+
 ## Running the tests
 
 You need Deno 2.x and a `libsqlite3` on disk.
@@ -175,30 +180,10 @@ suppression cannot quietly widen later.
 
 ### Attribution hazards for a query-to-tables map
 
-Recorded here because the live-query path will need them, and all three are
-knowable now rather than after it is built:
-
-1. **Re-prepare arrives during a step.** SQLite re-prepares on `SQLITE_SCHEMA`
-   inside `sqlite3_step`, so authorize callbacks can arrive with no prepare
-   bracket open. Measured: after `ALTER TABLE`, re-running a prepared statement
-   produced 13 authorizer callbacks.
-2. **The library's own statements are in the stream** unless suppressed, and
-   they arrive from inside the drain. That is handled today; anything added
-   later that issues SQL must be bracketed the same way.
-3. **The schema argument is sometimes null.** `SELECT count(*) FROM t` reports
-   the table with an empty column name and a null schema. A key built from
-   authorize events cannot always be a full `(schema, table)` pair.
-
-4. **An observation made at prepare time is not a claim about execute time.**
-   The finding above was wrong in its first form for exactly this reason: a
-   probe that stopped at `prepare` reported a cleaner world than the one that
-   exists, confidently. A probe that exercises less than the real path will do
-   that every time.
-
-Also: collect around the `prepare`, not the whole call. Executing a write to a
-virtual table authorizes its shadow tables too, because FTS5 prepares its own
-statements against them, whereas preparing a read of it names only the virtual
-table.
+**Moved to [`DOMAIN_KNOWLEDGE.md`](./DOMAIN_KNOWLEDGE.md)** — "SQLite:
+attribution hazards for a query-to-tables map". Three things the live-query path
+will run into (re-prepare arriving during a step, our own statements in the
+stream, and the null schema argument), plus where to collect them.
 
 ### The one gap that remains
 
@@ -227,17 +212,18 @@ replacements are installed on the objects this library can reach:
   the patched `db.openBlob`.
 - `Statement`: `run`, `get`, `all`, `values`, `value` — **but only on statements
   created through the patched `db.prepare` after `withEvents` was called.** The
-  driver installs these as OWN properties on each `Statement` when the statement
-  takes no bind parameters, shadowing the prototype, so a per-instance patch is
-  the only place they can be reached and a statement that already exists cannot
-  be reached at all.
+  driver shadows those five with own properties when the statement takes no bind
+  parameters (`DOMAIN_KNOWLEDGE.md`, "Statement methods are own properties when
+  there are no bind parameters"), so a per-instance patch is the only place they
+  can be reached and a statement that already exists cannot be reached at all.
 - `Statement.prototype.iter` — and therefore `[Symbol.iterator]` and `for..of`,
-  because the driver's `[Symbol.iterator]` is `return this.iter()`. This one is
-  on the PROTOTYPE, so unlike the five above it reaches **every** statement,
-  including statements prepared before `withEvents` was called. `iter` is never
-  shadowed by an own property, which is why the rule can be expressed there once
-  instead of per instance. The patch is process-wide, so it is reference-counted
-  and restored when the last subscription goes.
+  because of how the driver defines `[Symbol.iterator]` and `iter`
+  (`DOMAIN_KNOWLEDGE.md`, "`Statement.prototype.iter` is the one stepping member
+  never shadowed"). This one is on the PROTOTYPE, so unlike the five above it
+  reaches **every** statement, including statements prepared before `withEvents`
+  was called, which is why the rule can be expressed there once instead of per
+  instance. The patch is process-wide, so it is reference-counted and restored
+  when the last subscription goes.
 
 **What it does not cover.** Verified from inside a live `change` listener, each
 of these reached SQLite with no refusal: `new Statement(db, sql)` and the
@@ -288,9 +274,8 @@ project's signature defect — a guarantee that holds at one level and stops
 holding at another — in its purest form yet, and it is in our own guard.
 
 The mechanism, so it is not re-derived: statement patches are installed inside
-the patched `db.prepare`, because the driver writes `run`/`get`/`all`/`values`/
-`value` as own properties on each `Statement` when there are no bind parameters,
-shadowing the prototype. Those patches are recorded with `undoable = false`, so
+the patched `db.prepare`, because of the own-property shadowing recorded in
+`DOMAIN_KNOWLEDGE.md`. Those patches are recorded with `undoable = false`, so
 they also outlive `detach()` — the asymmetry runs in both directions.
 
 **That `undoable = false` is inherited, not fixed.** Undoing a per-instance
@@ -302,22 +287,22 @@ patch is reference-counted and restored when the last subscription goes, and
 
 #### Detection where refusal is not available
 
-`new Statement(db, sql)` prepares in its constructor. The only thing the
-constructor touches on the `Database` BEFORE `sqlite3_prepare_v2` runs is
-`unsafeHandle` — the documented public escape hatch, which this library uses
-itself. Guarding that would turn the hatch into a barrier and take away the
-thing that makes everything else here honest, so **construction cannot be
-refused.**
+`new Statement(db, sql)` prepares in its constructor, and the only thing that
+constructor touches on the `Database` before the prepare is `unsafeHandle` — the
+documented public escape hatch, which this library uses itself
+(`DOMAIN_KNOWLEDGE.md`, "What the `Statement` constructor touches on the
+`Database`, and in what order"). Guarding that would turn the hatch into a
+barrier and take away the thing that makes everything else here honest, so
+**construction cannot be refused.**
 
-It can be DETECTED. The constructor reads `unsafeConcurrency` exactly once, and
-nothing else in the driver reads it at all, so replacing that own data property
-with an accessor for the life of the subscription reports "a statement was
-prepared on this connection from inside a listener" through `onListenerError`.
-It is a report and not a throw for a reason that is not timidity: at the moment
-the accessor runs, the statement is already prepared and not yet registered with
-the finalizer, so throwing there would abandon it, and an unfinalized statement
-makes `sqlite3_close` fail. A signal after the fact beats silence; a signal that
-breaks `close()` does not.
+It can be DETECTED, through `unsafeConcurrency`: the constructor reads it and
+nothing else in the driver does, so replacing that own data property with an
+accessor for the life of the subscription reports "a statement was prepared on
+this connection from inside a listener" through `onListenerError`. It is a
+report and not a throw for a reason that is not timidity: the read happens after
+the prepare and before finalizer registration, so throwing there would abandon a
+prepared statement, and an unfinalized statement makes `sqlite3_close` fail. A
+signal after the fact beats silence; a signal that breaks `close()` does not.
 
 Detection through an accessor the driver happens to read is exactly the kind of
 thing that stops working silently, which is this project's signature defect
@@ -338,44 +323,17 @@ be worse than the gap. Uniform detection was chosen over conditional refusal.
 
 #### The record of the divergence (2026-09-09)
 
-Against the driver `@db/sqlite` as vendored here, and both libraries in the
-capability ledger above: the prose was broader than the mechanism for the entire
-life of the guard, and nobody noticed, because on every case anyone actually
-tried the two agreed. The disagreement needed a route that no test and no
-example took.
+**Moved to [`DOMAIN_KNOWLEDGE.md`](./DOMAIN_KNOWLEDGE.md)** — what it cost that
+the prose was broader than the mechanism for the whole life of the guard, and
+why a rule documented wider than it is enforced is a latent version of this
+project's signature defect.
 
-**A rule documented wider than it is enforced is a latent version of this
-project's signature defect.** It costs nothing while the two agree. The day
-someone tightens the code to match the prose, or writes code that relies on the
-prose being true, is the day it bites — and at that point the prose is the
-evidence they were entitled to rely on.
+### What a verification failure actually looks like here
 
-### What a verification failure actually looks like here (2026-09-09)
-
-Four instances in one chunk, and **in all four the failure was SILENT SUCCESS
-AGAINST THE WRONG TARGET, never an error**: a probe run against a different
-library than the suite uses; a generator producing degenerate keys; an INSERT
-prepared but never stepped; an authorizer asked at prepare time and not at
-execute. Each one reported a cleaner world, confidently.
-
-**That is this project's signature defect with the observer inside it — our
-tools stop holding at a boundary they do not announce.** The fifth instance will
-not look like the first four, so the question to ask of any measurement is "what
-target did this actually run against?", not "did it throw?".
-
-**The gate applies to anything that produces a number or a fact we reason from**
-— a version query, a capability check, a count, a one-line lookup — not only to
-the things called probes. Every such thing carries either a negative control
-that must read zero, or a case with a known answer that must come out right, and
-its numbers are not reportable until that gate passes.
-
-The rule as first phrased was narrower and did not save the person who wrote it.
-A version check was run without `DENO_SQLITE_PATH` an hour later; the driver
-silently downloaded its own prebuilt library and reported 3.46.0 against a suite
-running 3.45.1. Nothing errored. It was caught only because a download line
-appeared on stderr. A whole verification table could have gone out against the
-wrong library. Use `resolveLibPath()`, and treat "which library was this?" as
-part of the result rather than context.
+**Moved to [`DOMAIN_KNOWLEDGE.md`](./DOMAIN_KNOWLEDGE.md)** — the five
+instances, all of them silent success against the wrong target, and the gate
+every measurement has to pass before its numbers are reportable. Read it before
+you report a number.
 
 ## Changes to the FFI or native layer need out-of-process crash tests
 
