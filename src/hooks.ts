@@ -100,6 +100,9 @@
  *   check).
  */
 import type { Database } from "@db/sqlite";
+import type { Backend, RawChange, RawPreUpdate } from "./backend.ts";
+import { SQLITE_DELETE, SQLITE_INSERT, SQLITE_UPDATE } from "./backend.ts";
+import { openFfiBackend } from "./backend_ffi.ts";
 
 /** One row touched by a statement, as reported by sqlite3_update_hook. */
 export type Change = {
@@ -322,68 +325,10 @@ export class SqliteHooksError extends Error {
 }
 
 const OPS: Record<number, "insert" | "update" | "delete"> = {
-  18: "insert",
-  9: "delete",
-  23: "update",
+  [SQLITE_INSERT]: "insert",
+  [SQLITE_DELETE]: "delete",
+  [SQLITE_UPDATE]: "update",
 };
-const readC = (p: Deno.PointerValue) =>
-  p === null ? "" : new Deno.UnsafePointerView(p).getCString();
-
-const SYMBOLS = {
-  sqlite3_update_hook: {
-    parameters: ["pointer", "function", "pointer"],
-    result: "pointer",
-  },
-  sqlite3_commit_hook: {
-    parameters: ["pointer", "function", "pointer"],
-    result: "pointer",
-  },
-  sqlite3_rollback_hook: {
-    parameters: ["pointer", "function", "pointer"],
-    result: "pointer",
-  },
-  sqlite3_libversion: { parameters: [], result: "pointer" },
-} as const;
-
-/**
- * The optional half. Every one of these is compiled out unless the library was
- * built with SQLITE_ENABLE_PREUPDATE_HOOK, so they are dlopen'd separately and
- * their absence is a capability, not an error.
- *
- * The preupdate callback takes an extra `sqlite3*` that update_hook's does not
- * — a real signature difference, not a copy-paste slip.
- */
-const PREUPDATE_SYMBOLS = {
-  sqlite3_preupdate_hook: {
-    parameters: ["pointer", "function", "pointer"],
-    result: "pointer",
-  },
-  /** (db, column, out sqlite3_value**) -> rc; non-zero on the wrong side of the op. */
-  sqlite3_preupdate_old: {
-    parameters: ["pointer", "i32", "pointer"],
-    result: "i32",
-  },
-  sqlite3_preupdate_new: {
-    parameters: ["pointer", "i32", "pointer"],
-    result: "i32",
-  },
-  sqlite3_preupdate_count: { parameters: ["pointer"], result: "i32" },
-  sqlite3_preupdate_depth: { parameters: ["pointer"], result: "i32" },
-  /** The column index of an incremental blob write, or -1. */
-  sqlite3_preupdate_blobwrite: { parameters: ["pointer"], result: "i32" },
-  sqlite3_value_type: { parameters: ["pointer"], result: "i32" },
-  sqlite3_value_int64: { parameters: ["pointer"], result: "i64" },
-  sqlite3_value_double: { parameters: ["pointer"], result: "f64" },
-  sqlite3_value_text: { parameters: ["pointer"], result: "pointer" },
-  sqlite3_value_blob: { parameters: ["pointer"], result: "pointer" },
-  sqlite3_value_bytes: { parameters: ["pointer"], result: "i32" },
-} as const;
-
-type CoreLib = Deno.DynamicLibrary<typeof SYMBOLS>;
-type PreSymbols = Deno.DynamicLibrary<typeof PREUPDATE_SYMBOLS>["symbols"];
-
-/** SQLITE_NULL etc., as returned by sqlite3_value_type. */
-const VALUE_INTEGER = 1, VALUE_FLOAT = 2, VALUE_TEXT = 3, VALUE_BLOB = 4;
 
 /** Methods that can drive a commit and return synchronously. `iter` is deliberately excluded. */
 const DB_METHODS = ["exec", "run"] as const;
@@ -402,11 +347,8 @@ const DEFAULT_MAX_CHANGES = 100_000;
 
 type Registration = {
   libPath: string;
-  lib: CoreLib;
-  /** The preupdate API, when this library has it. */
-  pre: PreSymbols | null;
+  backend: Backend;
   capabilities: Capabilities;
-  handle: Deno.PointerValue;
   listeners: Set<Listener>;
   options: EventOptions;
   /** Inside one of the three FFI callbacks: the connection is off limits. */
@@ -439,81 +381,6 @@ function isDatabase(db: unknown): db is Database {
     "unsafeHandle" in db && "open" in db;
 }
 
-type OpenedLibrary = {
-  lib: CoreLib;
-  /** Null when the library has no preupdate API, or the caller turned it off. */
-  pre: PreSymbols | null;
-  capabilities: Capabilities;
-};
-
-/**
- * dlopen the library, taking the preupdate API if it is there.
- *
- * Two attempts, not one: a single dlopen of both symbol sets fails wholesale on
- * a library built without SQLITE_ENABLE_PREUPDATE_HOOK, which would turn a
- * missing *optional* feature into "your libsqlite3 is unusable".
- */
-function openLibrary(
-  libPath: string,
-  want: NonNullable<EventOptions["preupdate"]>,
-): OpenedLibrary {
-  if (typeof libPath !== "string" || libPath === "") {
-    throw new SqliteHooksError(
-      "libPath must be the path of the libsqlite3 @db/sqlite loaded (the value of DENO_SQLITE_PATH). It has no default.",
-    );
-  }
-  let unavailable = want === "off"
-    ? 'disabled by the preupdate: "off" option'
-    : "";
-  if (want !== "off") {
-    try {
-      const full = Deno.dlopen(
-        libPath,
-        {
-          ...SYMBOLS,
-          ...PREUPDATE_SYMBOLS,
-        } as const,
-      );
-      return {
-        lib: full,
-        pre: full.symbols,
-        capabilities: { hooks: true, preupdate: true },
-      };
-    } catch (cause) {
-      // Either the preupdate API is absent (the interesting case) or the whole
-      // library is wrong — the core dlopen below tells those two apart.
-      unavailable = `${libPath} does not export the sqlite3_preupdate_* API: ${
-        cause instanceof Error ? cause.message : String(cause)
-      }. It is a compile-time option (SQLITE_ENABLE_PREUPDATE_HOOK) and this build was made without it.`;
-    }
-  }
-  let lib: CoreLib;
-  try {
-    lib = Deno.dlopen(libPath, SYMBOLS);
-  } catch (cause) {
-    const why = cause instanceof Error ? cause.message : String(cause);
-    throw new SqliteHooksError(
-      `Cannot use ${libPath} as libsqlite3: ${why}. It must be a shared library exporting the sqlite3_* hook API, and the same file @db/sqlite loaded.`,
-      { cause },
-    );
-  }
-  if (want === "required") {
-    lib.close();
-    throw new SqliteHooksError(
-      `preupdate: "required" was asked for, but ${unavailable}`,
-    );
-  }
-  return {
-    lib,
-    pre: null,
-    capabilities: {
-      hooks: true,
-      preupdate: false,
-      preupdateUnavailable: unavailable,
-    },
-  };
-}
-
 /**
  * What `libPath` supports, without attaching to anything. Cheap: it dlopens and
  * immediately closes.
@@ -522,9 +389,9 @@ function openLibrary(
  * are available on this machine, rather than discovering the events never come.
  */
 export function probeCapabilities(libPath: string): Capabilities {
-  const opened = openLibrary(libPath, "auto");
-  opened.lib.close();
-  return opened.capabilities;
+  const backend = openFfiBackend(libPath, null, "auto");
+  backend.close();
+  return backend.capabilities;
 }
 
 /**
@@ -564,18 +431,21 @@ export function withEvents(
   const existing = REGISTRATIONS.get(db);
   if (existing) return join(existing, db, listener, libPath, options);
 
-  const opened = openLibrary(libPath, options.preupdate ?? "auto");
-  const lib = opened.lib;
+  const backend = openFfiBackend(
+    libPath,
+    db.unsafeHandle,
+    options.preupdate ?? "auto",
+  );
 
   // Cheap guard against the SIGSEGV above. Equal versions are not proof of the
   // same file, but they catch the realistic mistake — letting the driver fall
   // back to its downloaded library while we open a system one.
-  const ours = readC(lib.symbols.sqlite3_libversion());
+  const ours = backend.version;
   let theirs: string | undefined;
   try {
     theirs = db.prepare("SELECT sqlite_version() AS v").get<{ v: string }>()?.v;
   } catch (cause) {
-    lib.close();
+    backend.close();
     throw new SqliteHooksError(
       `Could not query the driver's SQLite version; the Database is not usable: ${
         cause instanceof Error ? cause.message : String(cause)
@@ -584,14 +454,14 @@ export function withEvents(
     );
   }
   if (ours !== theirs) {
-    lib.close();
+    backend.close();
     throw new SqliteHooksError(
       `SQLite library mismatch: hooks opened ${libPath} (${ours}) but the driver is running ${theirs}. ` +
         `Set DENO_SQLITE_PATH to ${libPath} BEFORE importing @db/sqlite, or the process will segfault.`,
     );
   }
 
-  const reg = attach(db, opened, libPath, options);
+  const reg = attach(db, backend, libPath, options);
   reg.listeners.add(listener);
   REGISTRATIONS.set(db, reg);
   return subscription(db, reg, listener);
@@ -708,17 +578,17 @@ function warnIgnoredReturn(l: Listener, type: DbEvent["type"]): void {
 
 function attach(
   db: Database,
-  opened: OpenedLibrary,
+  backend: Backend,
   libPath: string,
   options: EventOptions,
 ): Registration {
-  const { lib, pre, capabilities } = opened;
-  const handle = db.unsafeHandle;
+  const { capabilities } = backend;
+  const hasPreupdate = capabilities.preupdate;
   /** Captured before anything is patched: schema lookups must not re-enter our own wrappers. */
   const rawPrepare = db.prepare.bind(db);
   const maxChanges = options.maxChangesPerTransaction ?? DEFAULT_MAX_CHANGES;
   if (!(maxChanges > 0)) {
-    lib.close();
+    backend.close();
     throw new SqliteHooksError("maxChangesPerTransaction must be > 0");
   }
 
@@ -730,10 +600,8 @@ function attach(
 
   const reg: Registration = {
     libPath,
-    lib,
-    pre,
+    backend,
     capabilities,
-    handle,
     listeners: new Set<Listener>(),
     options,
     inHook: false,
@@ -915,7 +783,7 @@ function attach(
   };
 
   const primeSchema = () => {
-    if (!pre || reg.closed || reg.detached) return;
+    if (!hasPreupdate || reg.closed || reg.detached) return;
     schemaDirty = false;
     try {
       const schemas = ask<{ name: string }>("PRAGMA database_list")
@@ -945,200 +813,116 @@ function attach(
     }
   };
 
-  // One reusable out-param for the sqlite3_value** the accessors fill in.
-  // Reused deliberately: it is only ever read back on the next line, on this
-  // thread, inside the callback.
-  const valueOut = new BigUint64Array(1);
-  const valueOutPtr = Deno.UnsafePointer.of(valueOut);
-  const decoder = new TextDecoder();
-
-  /**
-   * Decode one column, eagerly. ONLY valid inside the preupdate callback: the
-   * `sqlite3_value*` dies when it returns, so nothing here may keep the
-   * pointer, and every byte is copied out before we hand anything to JS.
-   *
-   * `undefined` means "this side of the row does not exist for this op" — the
-   * accessor said so with a non-zero rc.
-   */
-  const readValue = (
-    p: PreSymbols,
-    dbh: Deno.PointerValue,
-    i: number,
-    side: "old" | "new",
-  ): RowValue | undefined => {
-    valueOut[0] = 0n;
-    const rc = side === "old"
-      ? p.sqlite3_preupdate_old(dbh, i, valueOutPtr)
-      : p.sqlite3_preupdate_new(dbh, i, valueOutPtr);
-    if (rc !== 0) return undefined;
-    const v = Deno.UnsafePointer.create(valueOut[0]);
-    if (v === null) return null;
-    switch (p.sqlite3_value_type(v)) {
-      case VALUE_INTEGER:
-        return p.sqlite3_value_int64(v);
-      case VALUE_FLOAT:
-        return p.sqlite3_value_double(v);
-      case VALUE_TEXT: {
-        // By byte length, not as a C string: SQLite text may contain NUL.
-        const n = p.sqlite3_value_bytes(v);
-        const ptr = p.sqlite3_value_text(v);
-        if (ptr === null || n <= 0) return "";
-        const bytes = new Uint8Array(n);
-        new Deno.UnsafePointerView(ptr).copyInto(bytes);
-        return decoder.decode(bytes);
-      }
-      case VALUE_BLOB: {
-        const n = p.sqlite3_value_bytes(v);
-        const ptr = p.sqlite3_value_blob(v);
-        if (ptr === null || n <= 0) return new Uint8Array(0);
-        const bytes = new Uint8Array(n);
-        new Deno.UnsafePointerView(ptr).copyInto(bytes);
-        return bytes;
-      }
-      default:
-        return null; // SQLITE_NULL
-    }
-  };
-
   const record = (change: Change) => {
     pendingCount++;
     if (pending.length < maxChanges) pending.push(change);
   };
 
-  const preupdateCb = pre
-    ? new Deno.UnsafeCallback(
-      {
-        // Note the second pointer: the preupdate callback is handed the
-        // sqlite3* that update_hook's callback is not, and the accessors need
-        // it.
-        parameters: [
-          "pointer",
-          "pointer",
-          "i32",
-          "pointer",
-          "pointer",
-          "i64",
-          "i64",
-        ],
-        result: "void",
-      } as const,
-      (_ctx, dbh, opcode, zDb, zTable, iKey1, iKey2) =>
-        inFfi(undefined, () => {
-          const op = opFor(opcode);
-          const schema = readC(zDb);
-          const table = readC(zTable);
-          const count = pre.sqlite3_preupdate_count(dbh);
-          const blobwrite = pre.sqlite3_preupdate_blobwrite(dbh);
-          const cached = columnCache.get(key(schema, table));
-          // A stale cache (a column added since) is as bad as a missing one:
-          // names would be silently misaligned. Length is the cheap check.
-          const columns = cached !== undefined && cached.length === count
-            ? cached
-            : null;
-          const named = columns !== null;
-          if (!named) schemaDirty = true;
-
-          const values = (side: "old" | "new"): RowValue[] | null => {
-            const out: RowValue[] = [];
-            for (let i = 0; i < count; i++) {
-              const v = readValue(pre, dbh, i, side);
-              if (v === undefined) return null;
-              out.push(v);
-            }
-            return out;
-          };
-          // Branch on the op rather than trusting the accessor: _old on an
-          // INSERT and _new on a DELETE return a non-zero rc, not a row.
-          const oldValues = op === "insert" ? null : values("old");
-          const newValues = op === "delete" ? null : values("new");
-          const toRow = (vals: RowValue[] | null): Row | null =>
-            vals === null ? null : Object.freeze(
-              Object.fromEntries(
-                vals.map((v, i) => [columns?.[i] ?? String(i), v]),
-              ),
-            );
-
-          dispatch({
-            type: "preupdate",
-            op,
-            opcode,
-            db: schema,
-            table,
-            oldRowid: iKey1,
-            newRowid: iKey2,
-            rowidChanged: op === "update" && iKey1 !== iKey2,
-            columns: columns ?? [],
-            named,
-            old: toRow(oldValues),
-            new: toRow(newValues),
-            oldValues: oldValues === null ? null : Object.freeze(oldValues),
-            newValues: newValues === null ? null : Object.freeze(newValues),
-            blobWriteColumn: blobwrite < 0 ? null : blobwrite,
-            depth: pre.sqlite3_preupdate_depth(dbh),
-          });
-
-          // sqlite3_update_hook never sees an incremental blob write, so
-          // without this the transaction would commit with an empty batch and
-          // `coverage: "unknown"`. preupdate does see it — as a DELETE with a
-          // blobwrite column — so report the row as the update it really is.
-          if (blobwrite >= 0) {
-            // `op` and `opcode` disagree here, and that disagreement is the
-            // only signal that we synthesised this event: SQLite delivered a
-            // DELETE opcode, and an incremental blob write really is an update.
-            const change: Change = {
-              op: "update",
-              opcode,
-              db: schema,
-              table,
-              rowid: iKey1,
-            };
-            record(change);
-            dispatch({ type: "change", change });
-          }
-        }),
-    )
-    : null;
-
-  const update = new Deno.UnsafeCallback(
-    {
-      parameters: ["pointer", "i32", "pointer", "pointer", "i64"],
-      result: "void",
-    } as const,
-    (_arg, op, zDb, zTable, rowid) =>
+  /**
+   * The handlers the backend calls. Each is wrapped in `inFfi`, which is what
+   * enforces the seam's "must never throw" contract on this side: a listener
+   * error is recorded and reported from JS, never unwound through C.
+   */
+  const attachment = backend.attach({
+    update: (raw: RawChange) =>
       inFfi(undefined, () => {
         const change: Change = {
-          op: opFor(op),
-          opcode: op,
-          db: readC(zDb),
-          table: readC(zTable),
-          rowid,
+          op: opFor(raw.opcode),
+          opcode: raw.opcode,
+          db: raw.db,
+          table: raw.table,
+          rowid: raw.rowid,
         };
         record(change);
         dispatch({ type: "change", change });
       }),
-  );
 
-  const commit = new Deno.UnsafeCallback(
-    { parameters: ["pointer"], result: "i32" } as const,
-    () =>
-      inFfi(1, () => {
+    preupdate: (raw: RawPreUpdate) =>
+      inFfi(undefined, () => {
+        const op = opFor(raw.opcode);
+        const cached = columnCache.get(key(raw.db, raw.table));
+        // A stale cache (a column added since) is as bad as a missing one:
+        // names would be silently misaligned. Length is the cheap check.
+        const columns =
+          cached !== undefined && cached.length === raw.columnCount
+            ? cached
+            : null;
+        const named = columns !== null;
+        if (!named) schemaDirty = true;
+        const toRow = (vals: readonly RowValue[] | null): Row | null =>
+          vals === null ? null : Object.freeze(
+            Object.fromEntries(
+              vals.map((v, i) => [columns?.[i] ?? String(i), v]),
+            ),
+          );
+
+        dispatch({
+          type: "preupdate",
+          op,
+          opcode: raw.opcode,
+          db: raw.db,
+          table: raw.table,
+          oldRowid: raw.oldRowid,
+          newRowid: raw.newRowid,
+          rowidChanged: op === "update" && raw.oldRowid !== raw.newRowid,
+          columns: columns ?? [],
+          named,
+          old: toRow(raw.oldValues),
+          new: toRow(raw.newValues),
+          oldValues: raw.oldValues === null
+            ? null
+            : Object.freeze(raw.oldValues),
+          newValues: raw.newValues === null
+            ? null
+            : Object.freeze(raw.newValues),
+          blobWriteColumn: raw.blobWriteColumn,
+          depth: raw.depth,
+        });
+
+        // sqlite3_update_hook never sees an incremental blob write, so without
+        // this the transaction would commit with an empty batch and
+        // `coverage: "unknown"`. preupdate does see it — as a DELETE with a
+        // blobwrite column — so report the row as the update it really is.
+        if (raw.blobWriteColumn !== null) {
+          // `op` and `opcode` disagree here, and that disagreement is the only
+          // signal that we synthesised this event: SQLite delivered a DELETE
+          // opcode, and an incremental blob write really is an update.
+          const change: Change = {
+            op: "update",
+            opcode: raw.opcode,
+            db: raw.db,
+            table: raw.table,
+            rowid: raw.oldRowid,
+          };
+          record(change);
+          dispatch({ type: "change", change });
+        }
+      }),
+
+    // Fail closed: an internal error here vetoes rather than letting a commit
+    // through unobserved.
+    commit: () =>
+      inFfi(true, () => {
         const snapshot: Batch = {
           changes: pending,
           changeCount: pendingCount,
           coverage: coverage(),
         };
-        // Non-zero converts the COMMIT into a ROLLBACK; rollback_hook fires
-        // next and reports `pending`, so leave it in place on veto.
-        if (dispatch({ type: "precommit", ...snapshot })) return 1;
+        // On veto the rollback hook fires next and reports `pending`, so leave
+        // it in place.
+        if (dispatch({ type: "precommit", ...snapshot })) return true;
         batch();
         committed.push(snapshot);
-        return 0;
+        return false;
       }),
-  );
 
-  const rollback = new Deno.UnsafeCallback(
-    { parameters: ["pointer"], result: "void" } as const,
-    () =>
+    // The seam's other direction: an error raised BELOW it, before any handler
+    // ran. Recorded like any listener error rather than crossing back into C.
+    fail: (error: unknown) => {
+      errors.push({ error, event: { type: "change", change: NO_ROW } });
+    },
+
+    rollback: () =>
       inFfi(undefined, () => {
         // A commit that failed *after* our hook approved it rolls back; drop
         // that batch so it never surfaces as a postcommit.
@@ -1149,39 +933,13 @@ function attach(
         // exactly as invisible here as it is on the commit path.
         dispatch({ type: "rollback", ...b });
       }),
-  );
-
-  // A forgotten dispose() should not wedge the process open at exit; these are
-  // only ever called synchronously from FFI on this thread.
-  update.unref();
-  commit.unref();
-  rollback.unref();
-  preupdateCb?.unref();
-
-  if (pre && preupdateCb) {
-    pre.sqlite3_preupdate_hook(handle, preupdateCb.pointer, null);
-  }
-  lib.symbols.sqlite3_update_hook(handle, update.pointer, null);
-  lib.symbols.sqlite3_commit_hook(handle, commit.pointer, null);
-  lib.symbols.sqlite3_rollback_hook(handle, rollback.pointer, null);
+  });
 
   let torn = false;
   reg.teardown = () => {
     if (torn) return;
     torn = true;
-    // Order matters: unregister while the connection is still alive, so SQLite
-    // can never call a callback we are about to free.
-    if (!reg.closed) {
-      lib.symbols.sqlite3_update_hook(handle, null, null);
-      lib.symbols.sqlite3_commit_hook(handle, null, null);
-      lib.symbols.sqlite3_rollback_hook(handle, null, null);
-      pre?.sqlite3_preupdate_hook(handle, null, null);
-    }
-    update.close();
-    commit.close();
-    rollback.close();
-    preupdateCb?.close();
-    lib.close();
+    attachment.detach(!reg.closed);
   };
   reg.flush = flush;
   reg.drain = drain;
@@ -1216,7 +974,7 @@ function attach(
       // itself may not touch the connection. Ordering matters: refill first,
       // then mark dirty if this statement is the kind that changes the schema,
       // so the refill lands after it rather than before.
-      if (depth === 0 && pre) {
+      if (depth === 0 && hasPreupdate) {
         if (schemaDirty && !reg.closed && !reg.detached) primeSchema();
         const sql = args[0];
         if (typeof sql === "string" && DDL.test(sql)) schemaDirty = true;
