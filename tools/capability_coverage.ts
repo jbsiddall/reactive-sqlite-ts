@@ -68,6 +68,21 @@
  * "not exercisable here" rather than drift, and the other six rows are
  * measured and reported instead of suppressed.
  *
+ * WHAT THAT COSTS, recorded here rather than only in the project record,
+ * because whoever tidies these controls will be reading this file and not
+ * that one: of the two library-dependent controls, `normalizedSql` is the
+ * only one expecting state 1, and it is exactly the row a normalize-enabled
+ * library makes not exercisable. On such a library every control that still
+ * APPLIES expects `none` — so the surviving controls would be satisfied just
+ * as well by a pipeline that had stopped reaching anything and classified
+ * every branch `none`. They are weak in that specific, nameable way, and a
+ * run that finds itself in that position says so in one line of its own
+ * output rather than leaving the reader to work it out. What holds the report
+ * up there is not those controls: it is the synthetic decision fixtures and
+ * the canary branch, which need no library at all. Do not trim either as
+ * redundant with the live controls. On the system 3.45.1 library they overlap;
+ * on a normalize-enabled one they are the entire foundation.
+ *
  *   deno task test:capability-coverage
  *
  * Needs a libsqlite3 (see //libsqlite3) plus --allow-run to re-run the suite.
@@ -167,6 +182,54 @@ const CONTROLS: ReadonlyMap<string, State> = new Map([
   ["normalizedSql", "absent"],
   ["progress", "none"],
 ]);
+
+/**
+ * How many rows this library cannot check, per SQLite version.
+ *
+ * A row is "not exercisable" when the state {@linkcode EXPECTED} records for it
+ * cannot be produced on the library in hand — today only `absent`, which needs
+ * a library that genuinely lacks the symbol. Such a row is reported and not
+ * counted as drift, which is right, and which is exactly why the COUNT has to
+ * be pinned: "not exercisable here" reads like a footnote on one row and reads
+ * like a footnote on six, and six is the state where this audit has stopped
+ * checking anything it recorded and still exits 0. A quiet per-row degradation
+ * needs a loud aggregate, or the loud failure it replaced was simply deleted.
+ *
+ * Pinned per SQLite VERSION rather than globally, because the number is a fact
+ * about the library and genuinely differs between the two here (MEASURED
+ * 2026-09-09: system 3.45.1 has none, vendored 3.53.4 has one — normalizedSql).
+ * A single global number would have to be the larger, and would then accept the
+ * degraded case everywhere.
+ *
+ * Version, not path: paths differ per machine and per CI runner, and a pin
+ * keyed on one would either fail everywhere or be loosened until it could not
+ * fail at all. Deriving the number from the capabilities instead would be
+ * circular — it would move silently with the very thing it is meant to catch.
+ *
+ * A library not listed here must have ZERO. That is the conservative
+ * direction: an unrecorded library may not quietly stop checking things. Add
+ * its measured number here when you introduce it, deliberately.
+ */
+const NOT_EXERCISABLE: ReadonlyMap<string, number> = new Map([
+  ["3.45.1", 0],
+  ["3.53.4", 1],
+]);
+
+/** The version string the library reports. Read through FFI, not through SQL. */
+function libVersion(path: string): string {
+  const lib = Deno.dlopen(path, {
+    sqlite3_libversion: { parameters: [], result: "pointer" },
+  });
+  try {
+    const ptr = lib.symbols.sqlite3_libversion();
+    if (ptr === null) {
+      throw new Error(`${path}: sqlite3_libversion returned NULL`);
+    }
+    return new Deno.UnsafePointerView(ptr).getCString();
+  } finally {
+    lib.close();
+  }
+}
 
 type State = "absent" | "simulated" | "none" | "unclassifiable";
 
@@ -649,6 +712,8 @@ async function main(): Promise<void> {
   // The controls, before anything else is trusted.
   const failures: string[] = [];
   let applicable = 0;
+  /** Applicable controls that can fail on something other than a `none`. */
+  let positive = 0;
   for (const [capability, expected] of CONTROLS) {
     const row = rows.find((r) => r.branch.capability === capability);
     if (row === undefined) {
@@ -662,18 +727,28 @@ async function main(): Promise<void> {
       continue;
     }
     applicable++;
+    if (expected !== "none") positive++;
     if (row.state !== expected) {
       failures.push(
         `control ${capability}: expected ${expected}, got ${row.state} (${row.because})`,
       );
     }
   }
-  if (failures.length === 0 && applicable === 0) {
-    // Every library-dependent control was skipped. The decision and pipeline
-    // controls still held, so the machinery is vouched for — but nothing here
-    // checked the classifier against this library, and saying so is the point.
+  if (failures.length === 0 && positive === 0) {
+    // THE WEAK-CONTROL CASE, and it must be readable from the output and not
+    // only from the project record. Every applicable library-dependent control
+    // here expects `none` — it passes when removing a refusal breaks nothing —
+    // so a pipeline that classified EVERY branch `none` would satisfy the lot.
+    // What makes that tolerable is entirely the synthetic decision fixtures and
+    // the canary above: they are the half that can fail when the pipeline is
+    // broken. Anyone trimming a "redundant" fixture is removing the
+    // load-bearing half, and this line is where they are told so.
     console.log(
-      "  no library-dependent control was exercisable on this library; the rows below rest on the decision and pipeline controls alone",
+      `  WEAK CONTROLS: ${
+        applicable === 0
+          ? "no library-dependent control was exercisable here"
+          : "every applicable library-dependent control expects `none`"
+      } — a pipeline that classified every branch \`none\` would pass them. The rows below rest on the synthetic decision fixtures and the canary; do not trim those as redundant.`,
     );
   }
   if (failures.length > 0) {
@@ -706,6 +781,22 @@ async function main(): Promise<void> {
   console.log(
     `${rows.length} refusal branches; ${covered.length} exercised against a library that genuinely lacks the capability.`,
   );
+  // The aggregate behind the per-row "not exercisable" notes below. Printed
+  // whether or not --check is passed, because a reader of a plain run needs it
+  // as much as CI does.
+  const version = libVersion(libPath);
+  const unmeasured = rows.filter((r) =>
+    EXPECTED.get(r.branch.capability) === "absent" && !canBeAbsent(r.branch)
+  );
+  console.log(
+    `${unmeasured.length} of ${rows.length} rows are NOT EXERCISABLE on SQLite ${version}${
+      unmeasured.length === 0
+        ? ""
+        : ` (${
+          unmeasured.map((r) => r.branch.capability).join(", ")
+        }): this library can produce neither the state recorded for them nor any evidence against it`
+    }.`,
+  );
   if (!rows.some((r) => r.state === "simulated")) {
     // Worth saying out loud rather than leaving as an absent row: `simulated`
     // is a defined state that nothing here occupies. It is not that simulation
@@ -719,6 +810,22 @@ async function main(): Promise<void> {
   }
   if (!Deno.args.includes("--check")) return;
   const drift: string[] = [];
+
+  // The pinned count, checked before the per-row drift below. Per-row notes
+  // degrade quietly by design; the count is where that degradation is loud.
+  const pinned = NOT_EXERCISABLE.get(version);
+  if (pinned === undefined) {
+    if (unmeasured.length !== 0) {
+      drift.push(
+        `SQLite ${version} is not in NOT_EXERCISABLE, and an unrecorded library must check everything it records — ${unmeasured.length} rows are not exercisable on it. Measure the number and pin it deliberately.`,
+      );
+    }
+  } else if (unmeasured.length !== pinned) {
+    drift.push(
+      `not-exercisable rows on SQLite ${version}: NOT_EXERCISABLE pins ${pinned}, measured ${unmeasured.length}. This is a finding, not a longer footnote — more rows than recorded means the audit has stopped checking things and still exited 0.`,
+    );
+  }
+
   for (const row of rows) {
     const want = EXPECTED.get(row.branch.capability);
     if (want === undefined) {

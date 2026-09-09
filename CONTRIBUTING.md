@@ -136,11 +136,23 @@ SQLite over a config line.
 `--check` compares the measurement against the states recorded in the tool and
 fails on drift in either direction, so a branch that starts being exercised has
 to be recorded as such and one that stops has to be explained. The tool has two
-pinned controls — `normalizedSql` must classify as covered, `progress` as
-uncovered — and withholds the whole report if either is wrong, because a wrong
-control means every other row came out of the same broken machinery. Finding
-zero branches is also a failure: a table of no rows reads as "nothing
-uncovered".
+library-dependent controls — `normalizedSql` must classify as covered,
+`progress` as uncovered — and withholds the whole report if either is wrong,
+because a wrong control means every other row came out of the same broken
+machinery. Finding zero branches is also a failure: a table of no rows reads as
+"nothing uncovered".
+
+A control only counts when the library can actually elicit it. On a library
+built WITH `SQLITE_ENABLE_NORMALIZE` the `normalizedSql` control cannot apply —
+`covered` requires a genuine absence — so that row is reported as not
+exercisable there and only the `progress` control remains. Every control that
+still applies then expects `uncovered`, which a pipeline that had stopped
+reaching anything would satisfy just as well, so the run prints a line saying
+its live controls are weak and the report is resting on the library-independent
+ones: the synthetic decision fixtures and the canary branch. Neither is
+redundant with the live controls; on such a library they are all there is. The
+COUNT of not-exercisable rows is pinned per SQLite version and `--check` fails
+on drift, so rows cannot quietly become unmeasured while the tool still exits 0.
 
 ### Recommendation: the prebuilt column should not survive vendoring
 

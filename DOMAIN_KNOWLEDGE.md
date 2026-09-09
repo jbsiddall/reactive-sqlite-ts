@@ -665,9 +665,43 @@ On the vendored library the report now runs and says why the one row cannot be
 earned there — `absent` requires the library to genuinely lack the symbol — and
 the `progress` control still applies, so the run is not uncontrolled.
 
-**A measured negative worth stating:** no library reachable from this repository
-produces the `simulated` state. It is a defined outcome occupied by nothing
-measured. The only capability with a simulating option is `preupdate`, and
-nothing in the suite asks for `preupdate: "required"` under `preupdate: "off"`,
-so the branch is `none` rather than `simulated` on both libraries. The state is
-exercised only by synthetic evidence.
+**A measured negative worth stating, with its own conditions attached:**
+measured on 2026-09-09 against both libraries this repository can reach — the
+system libsqlite3 3.45.1 at `/usr/lib/x86_64-linux-gnu/libsqlite3.so.0` and the
+vendored 3.53.4 at `vendor/lib/linux-x86_64-gnu/libsqlite3.so` — NEITHER
+produces the `simulated` state for any of the seven branches. It is a defined
+outcome occupied by nothing measured. Exactly one of the seven branches has a
+simulating option at all (`preupdate`, faked by `preupdate: "off"`); the other
+six have none, so they can only ever come out `absent` or `none`. And nothing in
+the semantic suite asks for `preupdate: "required"` under `preupdate: "off"`, so
+even that one branch classifies `none` on both of those libraries rather than
+`simulated`. The state is exercised only by synthetic evidence, in
+`DECISION_FIXTURES`.
+
+The conditions are the finding, not decoration. A third library, or a suite that
+grows a `preupdate: "required"` case under `preupdate: "off"`, would move this
+without anything here being wrong at the time it was written — so re-measure
+before citing it, rather than inheriting the date and the version list from the
+heading above.
+
+**This is half of a decoupling, and the halves must not be treated as one solved
+problem.** Two separate things rested on the system library's missing
+`SQLITE_ENABLE_NORMALIZE`:
+
+| half                                   | state as of 2026-09-09                                                                                                                       |
+| -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| the coverage audit's positive control  | **discharged.** The machinery is now vouched for by the synthetic decision fixtures and the canary branch, neither of which needs a library. |
+| the README capability table's variance | **open.** `normalizedSql` is still the only row where the columns disagree, so the table's usefulness continues to rest on that one cell.    |
+
+Nothing done to the audit touched the table. The table half is a live question
+to be RE-MEASURED before the table is next regenerated, not inherited from this
+entry: if the columns come to agree everywhere, a table with no variance is not
+a table to accept quietly.
+
+**The not-exercisable count is pinned per library version**, in
+`NOT_EXERCISABLE` in `tools/capability_coverage.ts`: system 3.45.1 → 0, vendored
+3.53.4 → 1. `--check` fails when a library's measured count differs from its
+pin, and requires ZERO for a version that is not listed at all. More
+not-exercisable rows than recorded means the audit has quietly stopped checking
+things while still exiting 0, which is exactly the failure a count catches and a
+per-row footnote does not.
