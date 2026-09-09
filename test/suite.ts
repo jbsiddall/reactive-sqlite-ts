@@ -193,6 +193,12 @@ const msg = (e: unknown): string => e instanceof Error ? e.message : String(e);
 
 const name_ = (e: unknown): string => e instanceof Error ? e.name : typeof e;
 
+const liveHandle = (db: Db): Deno.PointerObject => {
+  const h = db.unsafeHandle;
+  if (h === null) throw new Error("the Database has no sqlite3 handle");
+  return h;
+};
+
 /** A checked read: in a test a wrong storage class is a failure, not a cast. */
 const text = (v: unknown): string => {
   if (typeof v === "string") return v;
@@ -1284,7 +1290,7 @@ const SEMANTIC: Record<string, () => void> = {
     // the accessors had run before the guard could say no.
     const db = new Database(":memory:");
     db.exec("CREATE TABLE t(id INTEGER PRIMARY KEY, v)");
-    const backend = openFfiBackend(LIB, db.unsafeHandle, "required");
+    const backend = openFfiBackend(LIB, liveHandle(db), "required");
     let handed = 0;
     let readRows = 0;
     let table = "";
@@ -1309,10 +1315,32 @@ const SEMANTIC: Record<string, () => void> = {
     db.close();
   },
 
+  "a backend is released once, whichever path gets there"() {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE t(id INTEGER PRIMARY KEY)");
+    const closedTwice = openFfiBackend(LIB, liveHandle(db), "auto");
+    closedTwice.close();
+    closedTwice.close();
+    check("  close() twice", true, true);
+
+    const detachedThenClosed = openFfiBackend(LIB, liveHandle(db), "auto");
+    const at = detachedThenClosed.attach({
+      update: () => {},
+      preupdate: () => {},
+      commit: () => false,
+      rollback: () => {},
+      fail: () => {},
+    });
+    at.detach(true);
+    detachedThenClosed.close();
+    check("  close() after detach()", true, true);
+    db.close();
+  },
+
   "detaching twice is safe"() {
     const db = new Database(":memory:");
     db.exec("CREATE TABLE t(id INTEGER PRIMARY KEY)");
-    const backend = openFfiBackend(LIB, db.unsafeHandle, "auto");
+    const backend = openFfiBackend(LIB, liveHandle(db), "auto");
     const at = backend.attach({
       update: () => {},
       preupdate: () => {},

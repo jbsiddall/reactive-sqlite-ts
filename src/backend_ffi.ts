@@ -13,6 +13,9 @@ import type {
 } from "./backend.ts";
 import { SQLITE_DELETE, SQLITE_INSERT } from "./backend.ts";
 import type { Capabilities, EventOptions, RowValue } from "./hooks.ts";
+// A runtime cycle with hooks.ts, safe because neither reference is evaluated
+// at module-evaluation time. If a third module ever appears, this class moves
+// into it; it is not worth a module of its own.
 import { SqliteHooksError } from "./hooks.ts";
 
 const readC = (p: Deno.PointerValue) =>
@@ -145,18 +148,38 @@ function openLibrary(
 }
 
 /**
- * Open `libPath` and bind it to one connection. `handle` may be null when the
- * caller only wants {@linkcode Backend.capabilities} and will never attach.
+ * What `libPath` supports. Opens, reads and closes; it never yields a Backend,
+ * so there is no such thing as a backend with nothing to attach to.
  */
+export function probeFfi(libPath: string): Capabilities {
+  const opened = openLibrary(libPath, "auto");
+  try {
+    return capabilitiesOf(opened);
+  } finally {
+    opened.lib.close();
+  }
+}
+
+/** Open `libPath` and bind it to one live connection. */
 export function openFfiBackend(
   libPath: string,
-  handle: Deno.PointerValue,
+  handle: Deno.PointerObject,
   want: NonNullable<EventOptions["preupdate"]>,
 ): Backend {
   const opened = openLibrary(libPath, want);
   const { lib, pre } = opened;
   const capabilities = capabilitiesOf(opened);
   const version = readC(lib.symbols.sqlite3_libversion());
+
+  // close() and detach() both end here. One flag, because closing a library or
+  // a callback twice aborts the process, and "close only if you never
+  // attached" is a rule that would otherwise live in a doc comment.
+  let released = false;
+  const release = (body: () => void) => {
+    if (released) return;
+    released = true;
+    body();
+  };
 
   // One reusable out-param for the sqlite3_value** the accessors fill in.
   // Reused deliberately: it is only ever read back on the next line, on this
@@ -267,7 +290,7 @@ export function openFfiBackend(
   return {
     capabilities,
     version,
-    close: () => lib.close(),
+    close: () => release(() => lib.close()),
     attach(handlers: BackendHandlers): Attachment {
       const preupdateCb = pre
         ? new Deno.UnsafeCallback(
@@ -344,25 +367,23 @@ export function openFfiBackend(
       lib.symbols.sqlite3_commit_hook(handle, commit.pointer, null);
       lib.symbols.sqlite3_rollback_hook(handle, rollback.pointer, null);
 
-      let detached = false;
       return {
-        detach(live: boolean) {
-          if (detached) return; // double-closing a callback or the library aborts
-          detached = true;
-          // Order matters: unregister while the connection is still alive, so
-          // SQLite can never call a callback we are about to free.
-          if (live) {
-            lib.symbols.sqlite3_update_hook(handle, null, null);
-            lib.symbols.sqlite3_commit_hook(handle, null, null);
-            lib.symbols.sqlite3_rollback_hook(handle, null, null);
-            pre?.sqlite3_preupdate_hook(handle, null, null);
-          }
-          update.close();
-          commit.close();
-          rollback.close();
-          preupdateCb?.close();
-          lib.close();
-        },
+        detach: (live: boolean) =>
+          release(() => {
+            // Order matters: unregister while the connection is still alive,
+            // so SQLite can never call a callback we are about to free.
+            if (live) {
+              lib.symbols.sqlite3_update_hook(handle, null, null);
+              lib.symbols.sqlite3_commit_hook(handle, null, null);
+              lib.symbols.sqlite3_rollback_hook(handle, null, null);
+              pre?.sqlite3_preupdate_hook(handle, null, null);
+            }
+            update.close();
+            commit.close();
+            rollback.close();
+            preupdateCb?.close();
+            lib.close();
+          }),
       };
     },
   };

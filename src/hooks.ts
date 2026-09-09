@@ -102,7 +102,7 @@
 import type { Database } from "@db/sqlite";
 import type { Backend, RawChange, RawPreUpdate } from "./backend.ts";
 import { SQLITE_DELETE, SQLITE_INSERT, SQLITE_UPDATE } from "./backend.ts";
-import { openFfiBackend } from "./backend_ffi.ts";
+import { openFfiBackend, probeFfi } from "./backend_ffi.ts";
 
 /** One row touched by a statement, as reported by sqlite3_update_hook. */
 export type Change = {
@@ -389,9 +389,7 @@ function isDatabase(db: unknown): db is Database {
  * are available on this machine, rather than discovering the events never come.
  */
 export function probeCapabilities(libPath: string): Capabilities {
-  const backend = openFfiBackend(libPath, null, "auto");
-  backend.close();
-  return backend.capabilities;
+  return probeFfi(libPath);
 }
 
 /**
@@ -424,18 +422,15 @@ export function withEvents(
       "the Database is already closed; its sqlite3 handle has been freed",
     );
   }
-  if (db.unsafeHandle === null) {
+  const handle = db.unsafeHandle;
+  if (handle === null) {
     throw new SqliteHooksError("the Database has no sqlite3 handle");
   }
 
   const existing = REGISTRATIONS.get(db);
   if (existing) return join(existing, db, listener, libPath, options);
 
-  const backend = openFfiBackend(
-    libPath,
-    db.unsafeHandle,
-    options.preupdate ?? "auto",
-  );
+  const backend = openFfiBackend(libPath, handle, options.preupdate ?? "auto");
 
   // Cheap guard against the SIGSEGV above. Equal versions are not proof of the
   // same file, but they catch the realistic mistake — letting the driver fall
