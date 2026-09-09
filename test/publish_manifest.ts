@@ -294,6 +294,52 @@ for (const fixture of CONTROL_FIXTURES) {
   );
 }
 
+/**
+ * Why this check cannot run here, or `null` if it can.
+ *
+ * In a git WORKTREE `.git` is a file, not a directory, and
+ * `deno publish --dry-run` therefore includes it in the published set. The
+ * result is a red that reads exactly like a real drift — "WIDENED by 1: .git"
+ * — in the one environment we use for independent verification. That is worse
+ * than no check: the person who hits it learns that this gate produces
+ * spurious reds, and that lesson outlives the explanation and is what waves a
+ * real drift through one day.
+ *
+ * So it refuses and says so, rather than reporting something that is not
+ * happening. A refusal that names what it does not know costs a few lines; a
+ * misleading red costs the credibility of every future run.
+ */
+function cannotRunHere(
+  gitEntry: { exists: boolean; isFile: boolean },
+): string | null {
+  if (!gitEntry.exists) return null;
+  if (!gitEntry.isFile) return null;
+  return "this check cannot run from a git worktree: `.git` is a FILE there rather than a directory, so `deno publish --dry-run` includes it and the published set reads as WIDENED by 1 when nothing has changed. Run it from a real checkout.";
+}
+
+const ENVIRONMENT_FIXTURES: readonly {
+  readonly name: string;
+  readonly entry: { exists: boolean; isFile: boolean };
+  /** Empty means the fixture must be ACCEPTED — the check may run. */
+  readonly expect: string;
+}[] = [
+  {
+    name: "a real checkout, where .git is a directory, RUNS the check",
+    entry: { exists: true, isFile: false },
+    expect: "",
+  },
+  {
+    name: "no .git at all is not a worktree and RUNS the check",
+    entry: { exists: false, isFile: false },
+    expect: "",
+  },
+  {
+    name: "a worktree, where .git is a file, is refused and told why",
+    entry: { exists: true, isFile: true },
+    expect: "git worktree",
+  },
+];
+
 const GRAPH_FIXTURES: readonly {
   readonly name: string;
   readonly shipped: readonly string[];
@@ -339,6 +385,48 @@ for (const fixture of GRAPH_FIXTURES) {
         ),
     );
   }
+}
+
+console.log("\nenvironment controls");
+for (const fixture of ENVIRONMENT_FIXTURES) {
+  const why = cannotRunHere(fixture.entry);
+  if (fixture.expect === "") {
+    record(
+      why === null ? ok(`control: ${fixture.name}`) : bad(
+        `control: ${fixture.name}`,
+        `refused a place it can run: ${why}`,
+      ),
+    );
+  } else {
+    record(
+      why !== null && why.includes(fixture.expect)
+        ? ok(`control: ${fixture.name}`)
+        : bad(
+          `control: ${fixture.name}`,
+          why === null
+            ? "ran anyway"
+            : `refused without saying ${fixture.expect}: ${why}`,
+        ),
+    );
+  }
+}
+
+// The refusal itself. Before the publish run, not after: the point is not to
+// explain a wrong answer, it is not to produce one.
+const gitEntry = ((): { exists: boolean; isFile: boolean } => {
+  try {
+    return { exists: true, isFile: Deno.statSync(`${root}/.git`).isFile };
+  } catch {
+    return { exists: false, isFile: false };
+  }
+})();
+const refusal = cannotRunHere(gitEntry);
+if (refusal !== null) {
+  console.error(`\nREFUSED: ${refusal}`);
+  console.log(
+    `\n${passed} passed, ${failed} failed — CHECK DID NOT RUN`,
+  );
+  Deno.exit(2);
 }
 
 console.log("\nthe published set");

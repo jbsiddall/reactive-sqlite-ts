@@ -743,6 +743,22 @@ quietly does nothing is worse than none. And the `unload` backstop, which names
 an exit path added later that forgot to route through `leave`, can only PRINT:
 Deno does not let an `unload` handler change the exit code.
 
+### `deno publish --dry-run` ships `.git` from a worktree (2026-09-09, Deno 2.9.6)
+
+**MEASURED.** In a git worktree, `.git` is a FILE (a one-line `gitdir:` pointer)
+rather than a directory, and `deno publish --dry-run` includes it in the file
+list. `test/publish_manifest.ts` therefore reported `WIDENED by 1:
+.git` from a
+detached worktree — 20 passed, 1 failed — while the same commit in a real
+checkout reported 21 passed, 0 failed.
+
+The failure mode is not the extra file, it is the sentence: a red that reads
+exactly like a real drift, in the one environment used for independent
+verification. So the check now REFUSES from a worktree and says why, exiting 2
+rather than 1. A refusal that names what it does not know is cheap; a misleading
+red teaches people that this gate produces spurious reds, and that lesson
+outlives the explanation.
+
 ### `deno publish --dry-run` refuses a graph it cannot ship (2026-09-09, Deno 2.9.6)
 
 **MEASURED.** Adding `src/format.ts` to `publish.exclude` in `deno.json`, while
