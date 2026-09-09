@@ -95,6 +95,11 @@ jobs:
       # load the same SQLite. If this passes and a later suite still segfaults,
       # the bug is ours; if this fails, the environment is wrong. Either way no
       # suite can "pass" by quietly not exercising FFI at all.
+      #
+      # The driver is imported by its bare specifier and resolved through the
+      # repository's own import map, so this step tests the version the suites
+      # test. Restating a version here once let it drift a minor behind the map
+      # without anything noticing.
       - name: FFI/driver agreement smoke test
         run: |
           set -euo pipefail
@@ -107,7 +112,7 @@ jobs:
           const ptr = ffi.symbols.sqlite3_libversion();
           if (ptr === null) throw new Error("sqlite3_libversion returned NULL");
           const viaFfi = new Deno.UnsafePointerView(ptr).getCString();
-          const { Database } = await import("jsr:@db/sqlite@0.12");
+          const { Database } = await import("@db/sqlite");
           const db = new Database(":memory:");
           const viaDriver =
             db.prepare("select sqlite_version() as v").get<{ v: string }>()!.v;
@@ -120,7 +125,7 @@ jobs:
             );
           }
           TS
-          deno run --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write --allow-net "$RUNNER_TEMP/smoke.ts"
+          deno run -c "$GITHUB_WORKSPACE/deno.json" --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write --allow-net "$RUNNER_TEMP/smoke.ts"
 
       - name: Tests
         run: deno task test

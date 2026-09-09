@@ -603,3 +603,48 @@ AGREE with a broken implementation, and it will not announce itself when it
 does.** It is the first of the five where the faulty check was ours by
 construction rather than inherited from a tool. A known-answer gate is only as
 good as the known answer.
+
+## The Deno toolchain: import maps and FFI at import time (2026-09-09, Deno 2.9.6)
+
+### A bare specifier needs `-c`, and `-c` is enough — the file need not be in the repo
+
+A script anywhere on disk resolves `@db/sqlite` **only** when `deno` is given
+the config that carries the import map. Measured with a one-line script in a
+scratch directory outside the repository:
+
+| invocation                              | result                                   |
+| --------------------------------------- | ---------------------------------------- |
+| `deno run <script>` (no `-c`)           | fails: `@db/sqlite` is not a dependency  |
+| `deno run -c <repo>/deno.json <script>` | resolves, and `deno info` shows `0.13.0` |
+
+`deno check` behaves the same way. Neither the script's directory nor the
+current working directory matters; only the `-c` path does. So a CI step that
+generates a script into a temp directory can still import the driver by its bare
+specifier, and therefore never has to restate a version that can drift from the
+map. Restating one is exactly how the FFI/driver smoke test came to pin
+`jsr:@db/sqlite@0.12` while `deno.json` pinned `0.13.0` — a minor apart, with
+nothing in the repository able to notice.
+
+**Control seen to fail:** pointing the config at a directory with no `deno.json`
+makes the same step exit non-zero rather than silently falling back to an
+unmapped resolution.
+
+### `vendor/probe.ts`, `vendor/select.ts` and `tools/capability_table.ts` do NOT dlopen at import time
+
+**A measured negative.** Each was imported under
+`deno run --allow-read
+--allow-env` with `--allow-ffi` and `--unstable-ffi` both
+withheld; all three imported and ran to completion. The dlopens are inside
+functions, reached only when a probe is actually called.
+
+**Control seen to fail:** a module whose top level calls `Deno.dlopen` on
+`libsqlite3.so.0` dies under the identical flags with
+`NotCapable: Requires ffi
+access ... run again with the --allow-ffi flag`, and
+succeeds once `--allow-ffi` is added. The harness can therefore tell the two
+cases apart, so the negative is a finding rather than an untested path.
+
+Consequence for tooling: a structural, no-library check can live in
+`tools/capability_table.ts` itself and reuse the same `ROWS` object the
+generator uses, instead of that list being moved to a third module purely to
+keep FFI out of the check.
