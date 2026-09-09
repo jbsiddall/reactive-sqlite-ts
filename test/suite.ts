@@ -124,7 +124,8 @@ function record(db: Db, options = {}) {
       // own events.
       if (
         e.type === "preupdate" || e.type === "wal" ||
-        e.type === "statement" || e.type === "profile" || e.type === "row"
+        e.type === "statement" || e.type === "profile" || e.type === "row" ||
+        e.type === "progress"
       ) return;
       log.push(
         e.type === "change"
@@ -234,6 +235,11 @@ const fill = (db: Db, n: number) => {
     ins.finalize();
   }
 };
+
+/** A statement long enough that a progress handler can actually reach it. */
+const HEAVY_ROWS = 300_000;
+const HEAVY =
+  `WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<${HEAVY_ROWS}) SELECT count(*) c FROM c`;
 
 const liveHandle = (db: Db): Deno.PointerObject => {
   const h = db.unsafeHandle;
@@ -1348,8 +1354,14 @@ const SEMANTIC: Record<string, () => void> = {
       rollback: () => {},
       wal: () => {},
       trace: () => {},
+      progress: () => false,
       fail: () => {},
-    }, { walCheckpointThreshold: null, trace: [], traceSql: "statement" });
+    }, {
+      walCheckpointThreshold: null,
+      trace: [],
+      traceSql: "statement",
+      progressOps: null,
+    });
     db.exec("INSERT INTO t VALUES (1, 'a')");
     db.exec("INSERT INTO t VALUES (2, 'b')");
     check("  both rows handed over", handed, 2);
@@ -1375,8 +1387,14 @@ const SEMANTIC: Record<string, () => void> = {
       rollback: () => {},
       wal: () => {},
       trace: () => {},
+      progress: () => false,
       fail: () => {},
-    }, { walCheckpointThreshold: null, trace: [], traceSql: "statement" });
+    }, {
+      walCheckpointThreshold: null,
+      trace: [],
+      traceSql: "statement",
+      progressOps: null,
+    });
     at.detach(true);
     detachedThenClosed.close();
     check("  close() after detach()", true, true);
@@ -1394,8 +1412,14 @@ const SEMANTIC: Record<string, () => void> = {
       rollback: () => {},
       wal: () => {},
       trace: () => {},
+      progress: () => false,
       fail: () => {},
-    }, { walCheckpointThreshold: null, trace: [], traceSql: "statement" });
+    }, {
+      walCheckpointThreshold: null,
+      trace: [],
+      traceSql: "statement",
+      progressOps: null,
+    });
     at.detach(true);
     at.detach(true);
     check("  survived a second detach", true, true);
@@ -1743,6 +1767,220 @@ const SEMANTIC: Record<string, () => void> = {
       true,
     );
     check("  and nothing was vetoed", rows(db), 3);
+    db.close();
+  },
+
+  "progress: abort() interrupts a long statement"() {
+    const db = memory();
+    const reported: string[] = [];
+    let ticks = 0;
+    const aborter = (e: DbEvent) => {
+      if (e.type === "progress") {
+        ticks++;
+        if (ticks > 2) e.abort();
+      }
+      return undefined;
+    };
+    withEvents(db, aborter, LIB, {
+      progress: 100,
+      onListenerError: (e) => reported.push(msg(e)),
+    });
+    let threw = "";
+    try {
+      db.prepare(HEAVY).get();
+    } catch (e) {
+      threw = msg(e);
+    }
+    check("  the statement was interrupted", threw, "interrupted");
+    check("  and it ticked first", ticks > 2, true);
+    check(
+      "  and the abort was reported, naming the listener",
+      reported.some((e) => e.includes("aborter") && e.includes("abort()")),
+      true,
+    );
+    db.close();
+  },
+
+  "progress: abort() inside a transaction discards the whole transaction"() {
+    const db = memory();
+    let armed = false;
+    withEvents(
+      db,
+      (e) => {
+        if (e.type === "progress" && armed) e.abort();
+      },
+      LIB,
+      { progress: 100, onListenerError: () => {} },
+    );
+    db.exec("BEGIN");
+    db.exec("INSERT INTO t VALUES (1, 'before the abort')");
+    armed = true;
+    try {
+      // A WRITE: aborting a read inside a transaction leaves it intact, but
+      // aborting a write takes the whole transaction with it.
+      db.exec(
+        `INSERT INTO t(v) SELECT 'x' || i FROM (WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<${HEAVY_ROWS}) SELECT i FROM c)`,
+      );
+    } catch { /* interrupted */ }
+    armed = false;
+    let commit = "";
+    try {
+      db.exec("COMMIT");
+    } catch (e) {
+      commit = msg(e);
+    }
+    check(
+      "  the transaction is already gone",
+      commit.includes("no transaction is active"),
+      true,
+    );
+    check("  and the pre-abort row went with it", rows(db), 0);
+    check("  the connection still works", rows(db) === 0, true);
+    db.close();
+  },
+
+  "progress: a statement that finishes first cannot be aborted"() {
+    // nOps is a granularity, not a deadline.
+    const db = memory();
+    db.exec("INSERT INTO t VALUES (1, 'a')");
+    withEvents(
+      db,
+      (e) => {
+        if (e.type === "progress") e.abort();
+      },
+      LIB,
+      { progress: 1_000_000, onListenerError: () => {} },
+    );
+    let value = -1;
+    let threw = "";
+    try {
+      value = db.prepare("SELECT count(*) c FROM t").get<{ c: number }>()?.c ??
+        -1;
+    } catch (e) {
+      threw = msg(e);
+    }
+    check("  it completed", threw, "");
+    check("  with the right answer", value, 1);
+    db.close();
+  },
+
+  "progress: a stashed abort() interrupts nothing and is reported"() {
+    const db = memory();
+    const errs: string[] = [];
+    const stashed: Array<() => void> = [];
+    const stasher = (e: DbEvent) => {
+      if (e.type === "progress" && stashed.length === 0) stashed.push(e.abort);
+      return undefined;
+    };
+    withEvents(db, stasher, LIB, {
+      progress: 1000,
+      onListenerError: (e) => errs.push(msg(e)),
+    });
+    let value = 0;
+    let threw = "";
+    try {
+      value = db.prepare(HEAVY).get<{ c: number }>()?.c ?? 0;
+    } catch (e) {
+      threw = msg(e);
+    }
+    check("  the statement completed", threw, "");
+    check("  with the right answer", value, HEAVY_ROWS);
+    const late = stashed[0];
+    check("  we captured one", late !== undefined, true);
+    late?.();
+    db.exec("SELECT 1"); // a boundary, so queued listener errors are flushed
+    check(
+      "  and calling it late is reported, not swallowed",
+      errs.some((e) => e.includes("interrupted nothing")),
+      true,
+    );
+    db.close();
+  },
+
+  "progress: nothing but a live abort() can interrupt"() {
+    // A thenable, a truthy return and a throw must all leave the query alone.
+    // Only precommit has a verdict; here even an exception must not interrupt,
+    // because the failure mode is a discarded transaction.
+    for (
+      const [label, listener] of [
+        ["a thenable", () => Promise.resolve(true)],
+        ["a truthy value", () => 1],
+        ["a throw", () => {
+          throw new Error("from the progress listener");
+        }],
+      ] as const
+    ) {
+      const db = memory();
+      const errs: string[] = [];
+      const warned = captureWarnings();
+      let value = 0;
+      let threw = "";
+      try {
+        withEvents(
+          db,
+          (e) => e.type === "progress" ? listener() : undefined,
+          LIB,
+          {
+            progress: 100,
+            onListenerError: (e) => errs.push(msg(e)),
+          },
+        );
+        value = db.prepare(HEAVY).get<{ c: number }>()?.c ?? 0;
+      } catch (e) {
+        threw = msg(e);
+      } finally {
+        warned.stop();
+      }
+      check(`  ${label}: the query completed`, threw, "");
+      check(`  ${label}: with the right answer`, value, HEAVY_ROWS);
+      db.close();
+    }
+  },
+
+  "progress: a returning listener warns once, by name"() {
+    const db = memory();
+    const warned = captureWarnings();
+    try {
+      const ticker = (e: DbEvent) => e.type === "progress" ? 1 : undefined;
+      withEvents(db, ticker, LIB, { progress: 100 });
+      db.prepare(HEAVY).get();
+    } finally {
+      warned.stop();
+    }
+    check("  warned once", warned.lines.length, 1);
+    check("  named the listener", warned.lines[0]?.includes("ticker"), true);
+    db.close();
+  },
+
+  "progress: ticks arrive from inside prepare(), not only from step()"() {
+    // Since SQLite 3.41.0 the handler can fire while prepare() analyses a
+    // complex query. We instrument prepare(), so that dispatch happens from
+    // inside our own wrapper — a path no other hook has.
+    const db = memory();
+    let duringPrepare = 0;
+    let preparing = false;
+    withEvents(
+      db,
+      (e) => {
+        if (e.type === "progress" && preparing) duringPrepare++;
+      },
+      LIB,
+      { progress: 1 },
+    );
+    preparing = true;
+    const stmt = db.prepare(HEAVY);
+    preparing = false;
+    stmt.finalize();
+    const version = db.prepare("SELECT sqlite_version() v").get<{ v: string }>()
+      ?.v ?? "?";
+    if (duringPrepare > 0) {
+      check("  prepare() ticked", duringPrepare > 0, true);
+    } else {
+      console.log(
+        `  SKIP  progress during prepare() — SQLite ${version} did not tick while preparing`,
+      );
+    }
+    check("  and nothing crashed", true, true);
     db.close();
   },
 

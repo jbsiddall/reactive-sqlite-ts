@@ -152,7 +152,7 @@ return value can change what the database does.
 | Commit landed               | — (synthesised)            | no  | yes  | n/a, already happened      | No C hook: commit hook runs _before_ commit              |
 | WAL commit written          | `sqlite3_wal_hook`         | no  | yes  | **no** — see note below    | Displaces auto-checkpointing; we replicate it            |
 | Statement lifecycle         | `sqlite3_trace_v2`         | yes | yes  | no — return value ignored  | `row` fires per result row and measured ~3x; opt in      |
-| 📅 Statement progress       | `sqlite3_progress_handler` | —   | —    | **yes** → aborts stmt      | Fires during execution                                   |
+| Statement progress          | `sqlite3_progress_handler` | —   | —    | **yes** → `abort()` only   | Return value ignored; `abort()` interrupts, see below    |
 | 📅 Lock contention          | `sqlite3_busy_handler`     | —   | —    | **yes** → retry or busy    | Fires during execution                                   |
 | 📅 Unknown collation needed | `sqlite3_collation_needed` | yes | no   | no; supplies the collation | Fires when a statement names an unregistered collation   |
 | 📅 Statement authorisation  | `sqlite3_set_authorizer`   | yes | no   | **yes** → `DENY`/`IGNORE`  | Prepare-time; table/column names only, no rows or values |
@@ -201,7 +201,7 @@ wa-sqlite has had no npm release since January 2024.
 | post-commit (synthesised)        | yes                         | no                                    | no                                      | no           | no                                      | no                      | no          |
 | `wal_hook`                       | yes                         | no                                    | no                                      | no           | no                                      | no                      | no          |
 | `trace_v2` / profile             | yes                         | `verbose` option logs each SQL string | `diagnostics_channel` `sqlite.db.query` | no           | yes — `trace` and `profile` events      | no                      | yes         |
-| `progress_handler`               | 📅                          | no                                    | no                                      | no           | no                                      | no                      | yes         |
+| `progress_handler`               | yes                         | no                                    | no                                      | no           | no                                      | no                      | yes         |
 | busy handler / timeout           | 📅 handler                  | `timeout` option                      | `timeout` option                        | no           | `configure("busyTimeout")`              | no                      | yes, both   |
 | `collation_needed`               | 📅                          | no                                    | no                                      | no           | no                                      | no                      | yes         |
 | authorizer                       | 📅                          | no                                    | yes — `setAuthorizer`                   | no           | no                                      | no                      | yes         |
@@ -378,6 +378,71 @@ value that is not a valid error code is undefined behaviour. This library
 therefore always returns `SQLITE_OK`, whatever a listener does, and the `wal`
 event is a **void contract**: your return value is ignored, exactly as for
 `change`, `preupdate`, `postcommit` and `rollback`.
+
+### Progress ticks, and what an abort actually costs
+
+`progress` asks for a callback roughly every N virtual-machine instructions
+during a long statement, which is how you build a cancel button:
+
+```ts
+withEvents(
+  db,
+  (e) => {
+    if (e.type === "progress" && userClickedCancel) e.abort();
+  },
+  LIB,
+  { progress: 1000 },
+);
+```
+
+There is deliberately **no default** for `progress`. An unregistered handler
+costs nothing, a badly chosen one costs every query in the process, and the
+number that matters is what your listener does per tick, not what the callback
+costs to reach. Measured on a 50 ms statement, with a callback that does
+nothing:
+
+| `progress` | overhead  | ticks per run |
+| ---------- | --------- | ------------- |
+| `1000`     | free      | 5,100         |
+| `100`      | **+12%**  | 51,000        |
+| `10`       | **+123%** | 510,000       |
+
+**`abort()` is the only thing that interrupts.** The event's return value is
+ignored, like every event's except `precommit`. That is deliberate: a progress
+listener written `async () => { ... }` returns a Promise, a Promise is truthy,
+and a library that passed the return value through to SQLite would abort every
+query in the process. Returning a thenable, returning a truthy value and
+throwing all leave the statement running — a thrown error is reported, but an
+exception is not consent to abort.
+
+#### Aborting inside a transaction discards the transaction
+
+This is the part to know before you offer anyone a cancel button. `abort()` does
+not cancel a statement — inside an explicit transaction it **discards every
+uncommitted change back to `BEGIN`**. The next `COMMIT` fails with "cannot
+commit - no transaction is active", the rows you wrote before the abort are
+gone, and the connection keeps working, so nothing looks broken. Aborting a
+plain read leaves the transaction intact; aborting a **write** takes the
+transaction with it.
+
+`abort()` is also **best effort**, because `progress` is a granularity and not a
+deadline. A statement that finishes before the next tick cannot be interrupted
+at all: aborting a `SELECT count(*)` over 50,000 rows returned the correct
+answer with no error.
+
+It is honoured only during the tick it was handed to, and only when called
+synchronously from the listener. Keeping it and calling it later interrupts
+nothing and is reported through `onListenerError` rather than silently doing
+nothing.
+
+#### If something else takes the progress handler
+
+A connection has one progress handler and installing ours replaces any other.
+Unlike the WAL and trace hooks there is **no way to detect being replaced**:
+`sqlite3_progress_handler` returns `void`, there is no pragma, and "was that
+statement long enough to tick" is exactly what only the handler can answer — so
+any detector would be a wall-clock guess about instruction counts, which would
+report displacement that had not happened. Documented rather than guessed at.
 
 ### Tracing, and what ends up in your logs
 

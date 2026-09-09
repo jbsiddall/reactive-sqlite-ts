@@ -106,6 +106,14 @@ const TRACE_SYMBOLS = {
   sqlite3_free: { parameters: ["pointer"], result: "void" },
 } as const;
 
+/** Absent only from a build made with SQLITE_OMIT_PROGRESS_CALLBACK. */
+const PROGRESS_SYMBOLS = {
+  sqlite3_progress_handler: {
+    parameters: ["pointer", "i32", "function", "pointer"],
+    result: "void",
+  },
+} as const;
+
 /** Needs SQLITE_ENABLE_NORMALIZE, which stock distribution builds do not set. */
 const NORMALIZE_SYMBOLS = {
   sqlite3_normalized_sql: { parameters: ["pointer"], result: "pointer" },
@@ -120,6 +128,7 @@ type CoreLib = Deno.DynamicLibrary<typeof SYMBOLS>;
 type WalLib = Deno.DynamicLibrary<typeof WAL_SYMBOLS>;
 type TraceLib = Deno.DynamicLibrary<typeof TRACE_SYMBOLS>;
 type NormalizeLib = Deno.DynamicLibrary<typeof NORMALIZE_SYMBOLS>;
+type ProgressLib = Deno.DynamicLibrary<typeof PROGRESS_SYMBOLS>;
 type PreSymbols = Deno.DynamicLibrary<typeof PREUPDATE_SYMBOLS>["symbols"];
 
 /** SQLITE_NULL etc., as returned by sqlite3_value_type. */
@@ -131,6 +140,7 @@ type Opened = {
   wal: WalLib | null;
   trace: TraceLib | null;
   normalize: NormalizeLib | null;
+  progress: ProgressLib | null;
   unavailable: string;
 };
 
@@ -159,6 +169,7 @@ const capabilitiesOf = (opened: Opened): Capabilities =>
       wal: opened.wal !== null,
       trace: opened.trace !== null,
       normalizedSql: opened.normalize !== null,
+      progress: opened.progress !== null,
     }
     : {
       hooks: true,
@@ -167,6 +178,7 @@ const capabilitiesOf = (opened: Opened): Capabilities =>
       wal: opened.wal !== null,
       trace: opened.trace !== null,
       normalizedSql: opened.normalize !== null,
+      progress: opened.progress !== null,
     };
 
 /**
@@ -203,6 +215,7 @@ function openLibrary(
         wal: openOptional(libPath, WAL_SYMBOLS),
         trace: openOptional(libPath, TRACE_SYMBOLS),
         normalize: openOptional(libPath, NORMALIZE_SYMBOLS),
+        progress: openOptional(libPath, PROGRESS_SYMBOLS),
         unavailable: "",
       };
     } catch (cause) {
@@ -235,6 +248,7 @@ function openLibrary(
     wal: openOptional(libPath, WAL_SYMBOLS),
     trace: openOptional(libPath, TRACE_SYMBOLS),
     normalize: openOptional(libPath, NORMALIZE_SYMBOLS),
+    progress: openOptional(libPath, PROGRESS_SYMBOLS),
     unavailable,
   };
 }
@@ -252,6 +266,7 @@ export function probeFfi(libPath: string): Capabilities {
     opened.wal?.close();
     opened.trace?.close();
     opened.normalize?.close();
+    opened.progress?.close();
   }
 }
 
@@ -262,7 +277,7 @@ export function openFfiBackend(
   want: NonNullable<EventOptions["preupdate"]>,
 ): Backend {
   const opened = openLibrary(libPath, want);
-  const { lib, pre, wal, trace, normalize } = opened;
+  const { lib, pre, wal, trace, normalize, progress } = opened;
   const capabilities = capabilitiesOf(opened);
   const version = readC(lib.symbols.sqlite3_libversion());
 
@@ -452,6 +467,7 @@ export function openFfiBackend(
         wal?.close();
         trace?.close();
         normalize?.close();
+        progress?.close();
       }),
     attach(handlers: BackendHandlers, options: AttachOptions): Attachment {
       const preupdateCb = pre
@@ -541,6 +557,21 @@ export function openFfiBackend(
         )
         : null;
 
+      const progressCb = progress && options.progressOps !== null
+        ? new Deno.UnsafeCallback(
+          { parameters: ["pointer"], result: "i32" } as const,
+          () => {
+            let interrupt = false;
+            safely(handlers, () => {
+              interrupt = handlers.progress();
+            });
+            // A failure below the seam leaves `interrupt` false: an internal
+            // error must not discard a caller's transaction.
+            return interrupt ? 1 : 0;
+          },
+        )
+        : null;
+
       const threshold = options.walCheckpointThreshold;
       const walCb = wal
         ? new Deno.UnsafeCallback(
@@ -586,6 +617,7 @@ export function openFfiBackend(
       preupdateCb?.unref();
       walCb?.unref();
       traceCb?.unref();
+      progressCb?.unref();
 
       if (pre && preupdateCb) {
         pre.sqlite3_preupdate_hook(handle, preupdateCb.pointer, null);
@@ -601,6 +633,14 @@ export function openFfiBackend(
           handle,
           traceMask,
           traceCb.pointer,
+          null,
+        );
+      }
+      if (progress && progressCb && options.progressOps !== null) {
+        progress.symbols.sqlite3_progress_handler(
+          handle,
+          options.progressOps,
+          progressCb.pointer,
           null,
         );
       }
@@ -622,6 +662,14 @@ export function openFfiBackend(
               if (traceCb) {
                 trace?.symbols.sqlite3_trace_v2(handle, 0, null, null);
               }
+              if (progressCb) {
+                progress?.symbols.sqlite3_progress_handler(
+                  handle,
+                  0,
+                  null,
+                  null,
+                );
+              }
             }
             update.close();
             commit.close();
@@ -629,10 +677,12 @@ export function openFfiBackend(
             preupdateCb?.close();
             walCb?.close();
             traceCb?.close();
+            progressCb?.close();
             lib.close();
             wal?.close();
             trace?.close();
             normalize?.close();
+            progress?.close();
           }),
       };
     },

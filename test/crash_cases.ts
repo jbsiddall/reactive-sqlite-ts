@@ -1027,6 +1027,39 @@ export const CASES: Record<string, CrashCase> = {
     },
   },
 
+  "progress-abort-then-teardown": {
+    code: 0,
+    match: "survived",
+    why:
+      "An interrupt unwinds SQLite mid-statement while our callback is on the stack, and the teardown then frees that callback. Abort, then dispose, then close, out of process.",
+    run() {
+      const db = fresh();
+      db.exec("INSERT INTO t VALUES (1, 'a')");
+      let ticks = 0;
+      const sub = withEvents(
+        db,
+        (e) => {
+          if (e.type === "progress") {
+            ticks++;
+            if (ticks > 2) e.abort();
+          }
+        },
+        LIB,
+        { progress: 100, onListenerError: () => {} },
+      );
+      try {
+        db.prepare(
+          "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<300000) SELECT count(*) c FROM c",
+        ).get();
+      } catch { /* interrupted, which is the point */ }
+      db.exec("INSERT INTO t VALUES (2, 'b')");
+      sub.dispose();
+      db.exec("INSERT INTO t VALUES (3, 'c')");
+      db.close();
+      console.log(ticks > 2 ? "survived" : "FAIL never ticked");
+    },
+  },
+
   "property-no-permutation-crashes": {
     code: 0,
     match: "survived",

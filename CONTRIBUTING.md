@@ -64,6 +64,28 @@ The gated test prints a visible `SKIP` line naming the library when it takes the
 absent branch, so a run that quietly proved nothing is not mistakable for a run
 that proved something.
 
+### Which callbacks can be on the stack at once
+
+Three of our callbacks fire MID-STATEMENT: `preupdate`, trace `row`, and
+`progress`. Asked once for the set, so it does not have to be re-derived at
+`busy_handler` and `set_authorizer`, which also fire mid-operation.
+
+**None of the three can nest inside another.** The argument is structural, not
+statistical: all three are invoked BY SQLite's bytecode engine, on the caller's
+thread, and while one of our callbacks is executing the engine is suspended
+inside it — it evaluates no further instructions, produces no further rows and
+writes no further preupdate rows until we return. There is no path by which a
+second one can be entered. A measurement is consistent with this (251 callback
+entries, zero progress ticks observed inside any of them) but it is weak
+evidence on its own, because the busy-work in that test was a JavaScript loop
+and a JavaScript loop cannot advance the VM.
+
+What CAN nest is a callback and a listener that re-enters SQLite: that is what
+`reg.inHook` and `guard()` exist to reject, and it is unaffected by the above.
+If a future hook fires from somewhere other than the bytecode engine — a
+background thread, or an unlock-notify callback — this reasoning does not
+transfer and the set must be re-examined.
+
 ### The one gap that remains
 
 The **absent-capability branches** — "preupdate unavailable",

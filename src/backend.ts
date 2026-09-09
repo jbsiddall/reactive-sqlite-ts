@@ -97,6 +97,12 @@ export type BackendHandlers = {
   trace(read: () => RawTrace): void;
   /** `true` turns the COMMIT into a ROLLBACK. */
   commit(): boolean;
+  /**
+   * A progress tick. `true` interrupts the running statement — and inside an
+   * explicit transaction that discards the whole transaction, so a backend
+   * must never turn an internal failure into `true`.
+   */
+  progress(): boolean;
   rollback(): void;
   /**
    * The backend itself failed — reading a row, say — before any handler above
@@ -110,6 +116,11 @@ export type AttachOptions = {
   /** Trace classes to install. Empty means no trace callback is registered. */
   trace: readonly TraceEvent[];
   traceSql: TraceSql;
+  /**
+   * Virtual-machine instructions between progress callbacks. `null` installs
+   * no progress handler at all.
+   */
+  progressOps: number | null;
   /**
    * Frames after which the backend checkpoints from inside the WAL hook,
    * replicating what SQLite's own hook did before ours displaced it. `null`

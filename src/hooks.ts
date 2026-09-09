@@ -290,7 +290,31 @@ export type DbEvent =
    */
   | ({ type: "statement" } & Traced)
   | ({ type: "profile" } & Traced & { nanos: bigint })
-  | ({ type: "row" } & Traced);
+  | ({ type: "row" } & Traced)
+  /**
+   * Roughly every {@linkcode EventOptions.progress} virtual-machine
+   * instructions during a long statement. The return value is ignored, as
+   * everywhere else: {@linkcode ProgressEvent.abort} is the only way to stop
+   * anything.
+   */
+  | ProgressEvent;
+
+export type ProgressEvent = {
+  type: "progress";
+  /**
+   * Interrupt the running statement. The caller sees "interrupted".
+   *
+   * **Inside an explicit transaction this discards the WHOLE transaction**,
+   * not just the running statement: every uncommitted change since `BEGIN` is
+   * gone, the next `COMMIT` fails with "cannot commit - no transaction is
+   * active", and the connection keeps working, so nothing looks broken.
+   *
+   * Only effective during the tick it was handed to, and only when called
+   * synchronously from the listener. Keeping it and calling it later aborts
+   * nothing and is reported as a listener error.
+   */
+  abort: () => void;
+};
 
 /** What every trace event carries. */
 export type Traced = {
@@ -323,6 +347,14 @@ export type EventOptions = {
    * about 1% on a read path. `"row"` fires once per RESULT ROW and measured
    * nearly 3x on a row-heavy SELECT — never include it by accident.
    */
+  /**
+   * Virtual-machine instructions between progress ticks. Omitted installs no
+   * progress handler at all, which is the right default: an unregistered
+   * handler costs nothing, and too small a number costs every query in the
+   * process. Measured on a 50 ms statement: 1000 is free, 100 costs about
+   * 12%, and 10 more than doubles execution.
+   */
+  progress?: number;
   trace?: true | readonly TraceEvent[];
   /**
    * How a traced statement's SQL is rendered. The default is the same on every
@@ -386,6 +418,8 @@ export type Capabilities = {
   readonly wal: boolean;
   /** sqlite3_trace_v2: statement, profile and row events. */
   readonly trace: boolean;
+  /** sqlite3_progress_handler: periodic ticks during a long statement. */
+  readonly progress: boolean;
   /**
    * sqlite3_normalized_sql, needed for `sql: "normalized"`. Off in stock
    * distribution builds, which do not set SQLITE_ENABLE_NORMALIZE.
@@ -691,6 +725,9 @@ function attach(
     drain: () => {},
   };
 
+  /** The listener currently on the stack, so an abort() can name who called it. */
+  let running: Listener | null = null;
+
   /** Never throws: a listener error must not cross the FFI boundary. */
   const dispatch = (event: DbEvent): boolean => {
     let veto = false;
@@ -698,6 +735,7 @@ function attach(
     reg.inListener = true;
     try {
       for (const l of [...reg.listeners]) {
+        running = l;
         try {
           const returned = l(event);
           if (event.type !== "precommit") {
@@ -717,6 +755,7 @@ function attach(
         }
       }
     } finally {
+      running = null;
       reg.inListener = outer;
     }
     return veto;
@@ -987,6 +1026,19 @@ function attach(
     );
   }
   const tracesStatements = traceKinds.includes("statement");
+  const progressOps = options.progress ?? null;
+  if (progressOps !== null && !capabilities.progress) {
+    backend.close();
+    throw new SqliteHooksError(
+      "this libsqlite3 does not export sqlite3_progress_handler, so progress events cannot be delivered",
+    );
+  }
+  if (progressOps !== null && !(progressOps > 0)) {
+    backend.close();
+    throw new SqliteHooksError(
+      "progress must be a positive number of virtual-machine instructions; SQLite disables the handler at zero or below",
+    );
+  }
 
   // Read BEFORE the hook is installed: once ours is registered the pragma
   // reports 0, because SQLite considers auto-checkpointing off — we are doing
@@ -1115,6 +1167,49 @@ function attach(
         dispatch({ type: "wal", db: raw.db, frames: raw.frames });
       }),
 
+    // The fallback is FALSE, and the inversion against precommit is
+    // deliberate: precommit's failure mode is a bad write landing, so its
+    // catch vetoes; a progress failure that interrupted would discard the
+    // caller's whole transaction, so its catch must let the statement run.
+    progress: () =>
+      inFfi(false, () => {
+        let interrupt = false;
+        let live = true;
+        let who = "a listener";
+        const abort = () => {
+          // Read at CALL time, not at dispatch time, so the name is whichever
+          // listener actually called abort(), not the last one to run.
+          const caller = running;
+          if (caller !== null && caller.name !== "") {
+            who = `listener ${caller.name}`;
+          }
+          if (!live) {
+            errors.push({
+              error: new SqliteHooksError(
+                `${who} kept abort() from a progress event and called it after that event had returned; it interrupted nothing. Call it synchronously.`,
+              ),
+              event: { type: "change", change: NO_ROW },
+            });
+            return;
+          }
+          interrupt = true;
+        };
+        try {
+          dispatch({ type: "progress", abort });
+        } finally {
+          live = false;
+        }
+        if (interrupt) {
+          errors.push({
+            error: new SqliteHooksError(
+              `the statement was interrupted by abort() from ${who}. Inside an explicit transaction this discards every uncommitted change since BEGIN.`,
+            ),
+            event: { type: "change", change: NO_ROW },
+          });
+        }
+        return interrupt;
+      }),
+
     trace: (read: () => RawTrace) =>
       inFfi(undefined, () => {
         const raw = read();
@@ -1158,6 +1253,7 @@ function attach(
     walCheckpointThreshold: checkpointThreshold,
     trace: traceKinds,
     traceSql,
+    progressOps,
   });
 
   let torn = false;

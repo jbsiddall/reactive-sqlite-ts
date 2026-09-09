@@ -42,6 +42,7 @@ withEvents(db, (e: DbEvent) => {
   if (e.type === "statement" || e.type === "profile" || e.type === "row") {
     return undefined;
   }
+  if (e.type === "progress") return undefined;
   if (e.type === "wal") {
     console.log(`   [wal] ${e.db}, ${e.frames} frames`);
     return undefined;
