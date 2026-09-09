@@ -347,12 +347,19 @@ batch" — is true of some DDL and **false of the case that matters most here**.
 | `INSERT INTO plain VALUES (1)` (control)       | `complete`          | 1           |
 | `INSERT INTO ft(body) VALUES ('hello')`        | `complete`          | 5           |
 
-Creating an FTS5 table writes two rows — into `ft_data` and `ft_config` — and
-those are ordinary tables, so `update_hook` reports them normally and the commit
-is indistinguishable from an ordinary write. Anything that detects DDL by
-watching for `coverage: "unknown"` therefore misses **every FTS5 creation**
-while working correctly on plain tables: the failure is invisible until someone
-uses a virtual table, which is exactly the population that needed it.
+Creating an FTS5 table writes two rows, and **both change events name
+`ft_data`** — an ordinary table, so `update_hook` reports them normally and the
+commit is indistinguishable from an ordinary write. The other shadow tables
+(`ft_config`, `ft_content`, `ft_docsize`, `ft_idx`) are created by the same
+statement and are present in `sqlite_master` immediately afterwards, but no row
+is written into any of them, so none is named by a change event. Measured on
+3.45.1 and 3.53.4, with `CREATE TABLE plain(x); INSERT INTO plain VALUES (1)` as
+the known-answer control in the same probe (exactly one change, naming `plain`)
+and an idle listener as the negative control (zero events). Anything that
+detects DDL by watching for `coverage: "unknown"` therefore misses **every FTS5
+creation** while working correctly on plain tables: the failure is invisible
+until someone uses a virtual table, which is exactly the population that needed
+it.
 
 ### `ATTACH` and `DETACH` produce no commit at all
 

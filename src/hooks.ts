@@ -765,10 +765,25 @@ type Registration = {
  * connection, so a second `withEvents` must join the existing registration
  * rather than install its own and silently clobber the first.
  */
-// Keyed on `object` rather than `Database` so {@linkcode insideHookOf} can
-// answer for a structurally-typed connection without a type assertion; every
-// write below still passes a real Database.
-const REGISTRATIONS = new WeakMap<object, Registration>();
+const { registerConnection, registrationOf, unregisterConnection } = (() => {
+  // Keyed on `object` rather than `Database` so {@linkcode insideHookOf} can
+  // answer for a structurally-typed connection without a type assertion. The
+  // map is closed over rather than module-scoped so the widened key type
+  // applies to LOOKUPS only: the sole way to write is `registerConnection`,
+  // which takes a `Database`. Narrowing-to-widening needs no assertion, and
+  // "only Databases are ever stored" stops being a fact about how many call
+  // sites happen to exist today and becomes one the type checker enforces.
+  const map = new WeakMap<object, Registration>();
+  return {
+    registerConnection: (db: Database, reg: Registration): void => {
+      map.set(db, reg);
+    },
+    registrationOf: (db: object): Registration | undefined => map.get(db),
+    unregisterConnection: (db: object): void => {
+      map.delete(db);
+    },
+  };
+})();
 
 /**
  * Whether a SQLite callback is on the stack for this connection.
@@ -787,7 +802,7 @@ const REGISTRATIONS = new WeakMap<object, Registration>();
  */
 export function insideHookOf(db: unknown): boolean {
   if (typeof db !== "object" || db === null) return false;
-  const reg = REGISTRATIONS.get(db);
+  const reg = registrationOf(db);
   return reg !== undefined && reg.inHook;
 }
 
@@ -848,7 +863,7 @@ function patchStatementIter(proto: object): () => void {
         // `db` is the driver's own public field on every Statement, so the
         // wrapper never has to guess which connection it is looking at.
         const owner: unknown = this?.db;
-        const reg = isDatabase(owner) ? REGISTRATIONS.get(owner) : undefined;
+        const reg = isDatabase(owner) ? registrationOf(owner) : undefined;
         if (reg !== undefined) refuseFromHook(reg, "statement.iter()");
         return original.apply(this, args);
       },
@@ -928,7 +943,7 @@ export function withEvents(
     throw new SqliteHooksError("the Database has no sqlite3 handle");
   }
 
-  const existing = REGISTRATIONS.get(db);
+  const existing = registrationOf(db);
   if (existing) return join(existing, db, listener, libPath, options);
 
   const backend = openFfiBackend(libPath, handle, options.preupdate ?? "auto");
@@ -959,7 +974,7 @@ export function withEvents(
 
   const reg = attach(db, backend, libPath, options);
   reg.listeners.add(listener);
-  REGISTRATIONS.set(db, reg);
+  registerConnection(db, reg);
   return subscription(db, reg, listener);
 }
 
@@ -1037,7 +1052,7 @@ function subscription(
       if (reg.listeners.size === 0) {
         reg.teardown();
         if (!reg.closed) reg.detach();
-        REGISTRATIONS.delete(db);
+        unregisterConnection(db);
       }
     },
   };
@@ -2160,7 +2175,7 @@ function attach(
     origClose();
     // The wrappers stay installed: from here they throw instead of handing a
     // freed pointer to the C API.
-    REGISTRATIONS.delete(db);
+    unregisterConnection(db);
     flush();
   });
 

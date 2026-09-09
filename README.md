@@ -1000,11 +1000,13 @@ obvious alternative — treat `coverage: "unknown"` as "DDL happened", since
 `update_hook` does not report writes to `sqlite_schema` — is wrong for the one
 case this map exists for: `CREATE VIRTUAL TABLE ft USING fts5(body)` commits
 with `coverage: "complete"` and two changes, because creating an FTS5 table
-writes rows into `ft_data` and `ft_config`, which are ordinary tables. A watcher
-keyed on `"unknown"` misses every FTS5 creation while appearing to work on plain
-tables. SQLite's schema cookie is not usable either: reading it is a query, and
-it is per-schema, so one `PRAGMA main.schema_version` would silently suppress
-refreshes for every ATTACHed schema.
+writes two rows into `ft_data`, which is an ordinary table. (The other shadow
+tables — `ft_config`, `ft_content`, `ft_docsize`, `ft_idx` — are created, but no
+row is written into them by the `CREATE`.) A watcher keyed on `"unknown"` misses
+every FTS5 creation while appearing to work on plain tables. SQLite's schema
+cookie is not usable either: reading it is a query, and it is per-schema, so one
+`PRAGMA main.schema_version` would silently suppress refreshes for every
+ATTACHed schema.
 
 What that signal misses, stated rather than assumed: **a schema change made on
 another connection to the same file produces no event here.** `refreshNow()` is

@@ -31,8 +31,9 @@
  * `DROP TABLE` - and false of the one case this map exists for.
  * `CREATE VIRTUAL TABLE ft USING fts5(body)` commits with
  * `coverage: "complete"` and `changeCount: 2`, because creating an FTS5 table
- * writes rows into `ft_data` and `ft_config` and those are ordinary tables
- * that `update_hook` reports normally. A watcher keyed on `"unknown"` would
+ * writes two rows into `ft_data`, and that is an ordinary table which
+ * `update_hook` reports normally. (`ft_config` and the other shadow tables
+ * are created too, but no row is written into them here.) A watcher keyed on `"unknown"` would
  * therefore miss every FTS5 creation while appearing to work on plain tables.
  * It also fires on incremental blob writes and on genuinely empty
  * transactions, so it over-refreshes in exactly the workloads where refreshing
