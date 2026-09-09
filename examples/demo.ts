@@ -13,7 +13,7 @@ import { resolveLibPath } from "../src/lib_path.ts";
 const LIB = resolveLibPath();
 console.log(`using ${LIB}`);
 
-const { Database } = await import("jsr:@db/sqlite@0.12");
+const { Database } = await import("@db/sqlite");
 const { probeCapabilities, withEvents, withValidation } = await import(
   "../src/hooks.ts"
 );

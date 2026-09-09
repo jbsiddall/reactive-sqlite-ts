@@ -15,7 +15,7 @@
 import { resolveLibPath } from "../src/lib_path.ts";
 
 const LIB = resolveLibPath();
-const { Database } = await import("jsr:@db/sqlite@0.12");
+const { Database } = await import("@db/sqlite");
 const { withEvents, withValidation } = await import("../src/hooks.ts");
 type PreUpdate = import("../src/hooks.ts").PreUpdate;
 type DbEvent = import("../src/hooks.ts").DbEvent;

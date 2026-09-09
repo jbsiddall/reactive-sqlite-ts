@@ -7,7 +7,7 @@
  * ```ts
  * // The driver picks its library at import time, so set this FIRST.
  * Deno.env.set("DENO_SQLITE_PATH", "/usr/lib/x86_64-linux-gnu/libsqlite3.so.0");
- * const { Database } = await import("jsr:@db/sqlite@0.12");
+ * const { Database } = await import("jsr:@db/sqlite@0.13");
  * const { withEvents } = await import("./hooks.ts"); // or "../mod.ts"
  *
  * const db = new Database("app.db");
@@ -98,7 +98,7 @@
  *   instead of dereferencing a freed `sqlite3*` (the driver itself does not
  *   check).
  */
-import type { Database } from "jsr:@db/sqlite@0.12";
+import type { Database } from "@db/sqlite";
 
 /** One row touched by a statement, as reported by sqlite3_update_hook. */
 export type Change = {

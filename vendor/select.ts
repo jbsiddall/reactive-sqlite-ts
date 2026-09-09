@@ -9,7 +9,7 @@
  * ```ts
  * import { useVendoredSqlite } from "./vendor/select.ts";
  * const LIB = useVendoredSqlite();          // sets DENO_SQLITE_PATH
- * const { Database } = await import("jsr:@db/sqlite@0.12"); // AFTER, so dynamic
+ * const { Database } = await import("jsr:@db/sqlite@0.13"); // AFTER, so dynamic
  * ```
  *
  * Needs `--allow-env` and `--allow-read`; the caller needs `--allow-ffi`.

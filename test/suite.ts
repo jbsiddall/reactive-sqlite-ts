@@ -22,7 +22,7 @@ import { resolveLibPath } from "../src/lib_path.ts";
 import { CASES } from "./crash_cases.ts";
 
 const LIB = resolveLibPath();
-const { Database } = await import("jsr:@db/sqlite@0.12");
+const { Database } = await import("@db/sqlite");
 const { SqliteHooksError, probeCapabilities, withEvents, withValidation } =
   await import("../src/hooks.ts");
 type DbEvent = import("../src/hooks.ts").DbEvent;
@@ -171,6 +171,17 @@ const plain = (v: unknown): unknown => {
   }
   return v;
 };
+
+/**
+ * The two undocumented @db/sqlite shapes src/hooks.ts patches around. Pinned
+ * here so a driver bump fails on this assertion instead of at an FFI callback.
+ */
+const DB_METHODS = ["exec", "run", "prepare", "transaction", "close"] as const;
+const STMT_METHODS = ["run", "get", "all", "values", "value"] as const;
+const TX_VARIANTS = ["default", "deferred", "immediate", "exclusive"] as const;
+
+const ownFunction = (obj: object, name: string): boolean =>
+  Object.hasOwn(obj, name) && typeof Reflect.get(obj, name) === "function";
 
 const SEMANTIC: Record<string, () => void> = {
   "autocommit insert emits change, precommit, postcommit"() {
@@ -1070,6 +1081,36 @@ const SEMANTIC: Record<string, () => void> = {
       message = (e as Error).message;
     }
     check("  refused", message.includes("cannot work with preupdate"), true);
+  },
+
+  "driver internals: statement methods are own, Database methods are not"() {
+    const db = memory();
+    const stmt = db.prepare("SELECT * FROM t");
+    check(
+      "  own on the statement",
+      STMT_METHODS.filter((n) => ownFunction(stmt, n)),
+      [...STMT_METHODS],
+    );
+    const proto = Object.getPrototypeOf(db);
+    check(
+      "  inherited on the Database",
+      DB_METHODS.filter((n) => !Object.hasOwn(db, n) && ownFunction(proto, n)),
+      [...DB_METHODS],
+    );
+    db.close();
+  },
+
+  "driver internals: transaction() returns a function carrying its variants"() {
+    const db = memory();
+    const tx = db.transaction(() => {});
+    check("  callable", typeof tx, "function");
+    check(
+      "  own variants",
+      TX_VARIANTS.filter((n) => ownFunction(tx, n)),
+      [...TX_VARIANTS],
+    );
+    check("  database back-reference", tx.database === db, true);
+    db.close();
   },
 
   "SqliteHooksError is exported and instanceof-able"() {
