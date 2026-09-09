@@ -1,0 +1,79 @@
+# Publish the vendored SQLite libraries as GitHub Release assets.
+#
+# Separate from sqlite-vendor.yml because this one holds `contents: write`, and
+# the rule is that a workflow which can publish never runs on unreviewed code.
+# This one runs only on a tag a human pushed.
+#
+#   git tag sqlite-vendor-v3.53.4 && git push origin sqlite-vendor-v3.53.4
+#
+# WHY RELEASE ASSETS RATHER THAN COMMITTED BINARIES
+# -------------------------------------------------
+# Measured: the two .so files cost 1.60 MiB of git objects, and every rebuild
+# adds another 1.60 MiB that history can never drop. @db/sqlite has the same
+# problem and solves it the same way -- it publishes per-platform prebuilts as
+# release assets and fetches them at runtime via @denosaurs/plug. That is
+# working evidence from the exact library we are replacing, not a preference.
+#
+# Every asset here has been executed before it is uploaded: x86_64 natively,
+# aarch64 under qemu-user. An artifact that has never run does not ship.
+name: sqlite-vendor-release
+
+on:
+  push:
+    tags:
+      - "sqlite-vendor-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install the cross toolchain and qemu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user-static
+
+      - name: Build and validate x86_64
+        run: |
+          vendor/build.sh --keep-src
+          vendor/smoke_test.sh
+
+      - name: Build and validate aarch64
+        run: |
+          vendor/build.sh --arch aarch64 --keep-src
+          vendor/smoke_test.sh --arch aarch64
+
+      # One tarball per target, each carrying its manifest, so an asset is
+      # self-describing: SQLite version, flag list, source checksum.
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          for dir in vendor/lib/*/; do
+            target="$(basename "$dir")"
+            tar -czf "out/libsqlite3-${target}.tar.gz" -C "$dir" libsqlite3.so build_manifest.json
+          done
+          ( cd out && sha256sum ./*.tar.gz > SHA256SUMS )
+          cat out/SHA256SUMS
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          fail_on_unmatched_files: true
+          body: |
+            Vendored SQLite shared libraries, built from the pinned amalgamation
+            by `vendor/build.sh` and validated by `smoke_test.sh` (aarch64 under
+            qemu-user) before upload.
+
+            Each tarball contains `libsqlite3.so` and its `build_manifest.json`
+            (SQLite version, exact compile-flag list, source SHA3-256/SHA-256).

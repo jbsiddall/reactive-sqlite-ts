@@ -3,7 +3,13 @@
 # binary in git can never be audited in review. CI builds or installs one; see
 # CONTRIBUTING.md for the local recipe. Nothing in this repo should ever need a
 # checked-in .so.
-vendor/
+#
+# Note the scoping: vendor/ itself is SOURCE (the build script, the selector,
+# the smoke test) and must stay tracked. Only its build outputs are ignored. A
+# bare `vendor/` pattern matches any directory of that name at any depth and
+# silently swallows the whole directory; check with `git check-ignore -v`.
+vendor/lib/
+vendor/.src/
 build/
 dist/
 *.so

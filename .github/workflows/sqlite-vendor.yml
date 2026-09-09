@@ -1,0 +1,87 @@
+# Build and VALIDATE the vendored SQLite for every architecture we ship.
+#
+# Read-only, like ci.yml and for the same reason: it cannot publish because it
+# was never given the permission, so it needs no guards. The publishing twin is
+# sqlite-vendor-release.yml.
+#
+# WHY THIS EXISTS AT ALL
+# ----------------------
+# vendor/lib/ is gitignored (see that directory's README, "Committing the
+# binaries"). Nothing keeps the build script working except a job that runs it,
+# so this one runs it on both target architectures and proves each result
+# actually executes -- the aarch64 one under qemu-user, because a
+# cross-compiled library that has never run is not evidence of anything.
+#
+# It deliberately does NOT need Deno for the build: build.sh and smoke_test.sh
+# are bash + cc. Deno appears only for the probe and the SESSION demo, which
+# are x86_64-only here for the obvious reason that this runner has no aarch64
+# Deno to run them with.
+name: sqlite-vendor
+
+on:
+  pull_request:
+    paths:
+      - "vendor/**"
+      - ".github/workflows/sqlite-vendor.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sqlite-vendor-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # gcc-aarch64-linux-gnu cross-compiles; libc6-dev-arm64-cross supplies the
+      # target headers (without it the build dies on bits/libc-header-start.h);
+      # qemu-user-static is what lets the result be run and therefore trusted.
+      - name: Install the cross toolchain and qemu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user-static
+
+      # --keep-src leaves sqlite3.h in place for smoke_test.sh to compile against.
+      - name: Build x86_64
+        run: vendor/build.sh --keep-src
+
+      - name: Build aarch64 (cross)
+        run: vendor/build.sh --arch aarch64 --keep-src
+
+      - name: Smoke test x86_64 (native)
+        run: vendor/smoke_test.sh
+
+      - name: Smoke test aarch64 (under qemu-user)
+        run: vendor/smoke_test.sh --arch aarch64
+
+      - name: Install Deno
+        uses: denoland/setup-deno@v2
+        with:
+          # Same pin as ci.yml.
+          deno-version: "2.8.2"
+
+      - name: Capability probe (x86_64)
+        run: deno task vendor:probe
+
+      - name: SESSION extension end-to-end (x86_64)
+        run: deno task vendor:session-demo
+
+      # Downloadable from the run, so a reviewer can try a library without a
+      # compiler. Not a release: this workflow has no write permission.
+      - name: Upload the built libraries
+        uses: actions/upload-artifact@v4
+        with:
+          name: libsqlite3-linux
+          path: |
+            vendor/lib/*/libsqlite3.so
+            vendor/lib/*/build_manifest.json
+          if-no-files-found: error

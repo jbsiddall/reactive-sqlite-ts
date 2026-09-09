@@ -23,17 +23,39 @@
     "lint": "deno lint",
     "check": "deno fmt --check . && deno lint . && deno check",
     "test": {
-      "description": "The in-process suite. Needs a libsqlite3 (see //libsqlite3).",
-      "command": "deno test --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write --allow-net"
+      "description": "The semantic matrix: every event scenario, asserted in this process. Needs a libsqlite3 (see //libsqlite3).",
+      "command": "deno run --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write --allow-net test/suite.ts semantic"
     },
     "test:crash": {
-      "description": "The crash matrix: every case runs in its OWN child process and is asserted on its exit code, so a genuine segfault (139) can never be mistaken for a pass. --allow-run is unscoped because the child is Deno.execPath(), known only at runtime; the only program spawned is this same Deno binary.",
-      "command": "deno run --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write --allow-net --allow-run test/suite.ts"
+      "description": "The crash matrix: every case runs in its OWN child process and is asserted on its exit code, so a genuine segfault (139) can never be mistaken for a pass. --allow-run is unscoped because the child is Deno.execPath(), known only at runtime; the only program spawned is this same Deno binary running test/crash_cases.ts.",
+      "command": "deno run --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write --allow-net --allow-run test/suite.ts crash"
+    },
+    "demo": {
+      "description": "Run the demo in examples/: every commit-lifecycle event, the precommit veto, batching and the preupdate row values, against a real database. Not a test; needs --allow-ffi and a libsqlite3 (see //libsqlite3).",
+      "command": "deno run --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write --allow-net examples/demo.ts"
+    },
+    "vendor:build": {
+      "description": "Build the vendored libsqlite3 from the pinned SQLite amalgamation into vendor/lib/<target>/. Needs a C compiler, curl and openssl; no Deno permissions are involved because the work is done by build.sh. Pass --arch aarch64 to cross-compile.",
+      "command": "vendor/build.sh"
+    },
+    "vendor:smoke": {
+      "description": "Compile smoke_test.c against a built library and run it, so a binary is only trusted after it has executed. Pass --arch aarch64 to run the cross-built library under qemu-user.",
+      "command": "vendor/smoke_test.sh"
+    },
+    "vendor:probe": {
+      "description": "Report which SQLite capabilities a libsqlite3 actually has, side by side. With no arguments it compares the prebuilt @db/sqlite downloads, the system library and the vendored build. Needs --allow-ffi.",
+      "command": "deno run --unstable-ffi --allow-ffi --allow-env --allow-read vendor/probe.ts"
+    },
+    "vendor:session-demo": {
+      "description": "Prove the SESSION extension works in the vendored build: record a session, produce a changeset, apply it to a second database, then invert it to undo. Raw FFI, no driver. Needs --allow-ffi.",
+      "command": "deno run --unstable-ffi --allow-ffi --allow-env --allow-read vendor/session_demo.ts"
     }
   },
   "lint": {
     "rules": {
-      "tags": ["recommended"]
+      "tags": [
+        "recommended"
+      ]
     }
   },
   "compilerOptions": {
@@ -44,7 +66,8 @@
     "noUncheckedIndexedAccess": true
   },
   "imports": {
-    "@db/sqlite": "jsr:@db/sqlite@^0.12.0"
+    "@db/sqlite": "jsr:@db/sqlite@^0.12.0",
+    "@std/path": "jsr:@std/path@^1.1.5"
   },
   "publish": {
     "exclude": [
