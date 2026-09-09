@@ -108,9 +108,9 @@ export interface TableRef {
  * What a reported table name turned out to be.
  *
  * The kinds that can be reduced to a table a caller would recognise carry
- * `canonical`; `"unattributable-shadow"` deliberately does not, so that the
- * one case this map cannot resolve is a compile error to ignore rather than a
- * silent identity.
+ * `canonical`; `"view"` and `"unattributable-shadow"` deliberately do not, so
+ * that the two cases with no honest table name are a compile error to ignore
+ * rather than a silent identity.
  */
 export type Resolution =
   | {
@@ -133,6 +133,22 @@ export type Resolution =
     readonly schema: string;
     readonly name: string;
     readonly canonical: string;
+  }
+  | {
+    /**
+     * A view. No `canonical`, for the same reason
+     * `"unattributable-shadow"` has none: there is no honest table name to
+     * give. A view holds no rows, SQLite never reports a change on one, and
+     * a dependency recorded against a view is a dependency that never fires
+     * - the failure mode that looks exactly like a correct live query until
+     * the underlying table changes. What a view really depends on is its
+     * body, which the authorizer reports as separate reads of the underlying
+     * tables (measured, 3.45.1 and 3.53.4, 2026-09-09); see
+     * `src/dependencies.ts`.
+     */
+    readonly kind: "view";
+    readonly schema: string;
+    readonly name: string;
   }
   | {
     /**
@@ -239,6 +255,7 @@ export class SchemaMap {
 
   readonly #entries: ReadonlyMap<string, Resolution>;
   readonly #shadows: ReadonlyMap<string, readonly string[]>;
+  readonly #byName: ReadonlyMap<string, readonly string[]>;
 
   private constructor(rows: readonly ListedTable[], version: string) {
     const virtuals = new Set<string>();
@@ -250,8 +267,17 @@ export class SchemaMap {
     const shadows = new Map<string, string[]>();
     const unattributable: TableRef[] = [];
     const lookalikes: TableRef[] = [];
+    // Which schemas hold a table of a given name. The authorizer reports a
+    // NULL schema for some accesses (`SELECT count(*) FROM t`, measured on
+    // 3.45.1 and 3.53.4, 2026-09-09) including for TEMP tables, so "null
+    // means main" is wrong; this is what lets a caller find out whether the
+    // name is unambiguous instead of guessing.
+    const byName = new Map<string, string[]>();
 
     for (const { schema, name, type } of rows) {
+      if (type === "shadow") {
+        byName.set(name, [...(byName.get(name) ?? []), schema]);
+      }
       const candidate = ownerCandidate(name);
       const ownedBy =
         candidate !== undefined && virtuals.has(key(schema, candidate))
@@ -283,6 +309,13 @@ export class SchemaMap {
       // Not a shadow. If the name would have claimed an owner, the
       // disagreement is recorded and detection wins.
       if (ownedBy !== undefined) lookalikes.push({ schema, name });
+
+      byName.set(name, [...(byName.get(name) ?? []), schema]);
+
+      if (type === "view") {
+        entries.set(key(schema, name), { kind: "view", schema, name });
+        continue;
+      }
       entries.set(key(schema, name), {
         kind: type === "virtual" ? "virtual" : "table",
         schema,
@@ -297,8 +330,10 @@ export class SchemaMap {
     this.sqliteVersion = version;
     this.unattributable = unattributable;
     this.shadowLookalikes = lookalikes;
+    for (const list of byName.values()) list.sort();
     this.#entries = entries;
     this.#shadows = shadows;
+    this.#byName = byName;
   }
 
   /**
@@ -335,6 +370,21 @@ export class SchemaMap {
    */
   shadowsOf(name: string, schema: string = DEFAULT_SCHEMA): readonly string[] {
     return this.#shadows.get(key(schema, name)) ?? [];
+  }
+
+  /**
+   * Every schema in the snapshot holding a table, view or virtual table of
+   * this name, sorted. Empty if the snapshot has never seen the name.
+   *
+   * This exists for one measured reason: the authorizer reports some accesses
+   * with a NULL schema - `SELECT count(*) FROM t` names `t` and no schema at
+   * all, whether `t` lives in `main` or in `temp` (3.45.1 and 3.53.4,
+   * 2026-09-09). Defaulting such a name to `main` would silently resolve the
+   * wrong table whenever both schemas hold the name. A caller can ask here
+   * instead, and treat "more than one" as the ambiguity it is.
+   */
+  schemasContaining(name: string): readonly string[] {
+    return this.#byName.get(name) ?? [];
   }
 
   /**

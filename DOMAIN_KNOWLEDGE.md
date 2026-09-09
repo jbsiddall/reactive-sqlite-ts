@@ -405,6 +405,104 @@ change" guard would suppress the refresh for every ATTACHed schema, silently.
 Reading every schema means reading `pragma_database_list` first, which is more
 SQL per check than the re-read it was meant to avoid.
 
+## What the authorizer reports as a statement's dependencies (2026-09-09)
+
+Measured on 3.45.1 (system) and 3.53.4 (vendored). Every result below was
+identical on both. Each probe carried three controls checked before any row was
+quoted: an idle listener reporting zero events; `SELECT a FROM t` reporting
+exactly one `read` with `arg1 = "t"` and `arg2 = "a"` (so a swapped argument
+order comes out wrong rather than empty); and `SELECT 1` reporting authorize
+events but **no** `read`, which is the deliberate-empty case the whole design
+rests on.
+
+### A view reports both halves; a trigger body reports the table nobody wrote
+
+`SELECT * FROM v` where `v` is `SELECT a FROM t` reports `read(t, a, main, "v")`
+**and** `read(v, a, main, null)`. Recording the name the caller wrote — `v` — is
+the plausible wrong implementation, and it fails silently: SQLite never reports
+a row change on a view, so the dependency never fires.
+
+`INSERT INTO u VALUES (9)` with an `AFTER INSERT ON u` trigger writing `log`
+reports `insert(u, null, main, null)` and `insert(log, null, main, "trg")`. The
+second names a table that appears in no SQL the caller wrote.
+
+### `arg4` is not a view/trigger marker — a CTE uses it too
+
+`WITH x AS (SELECT c FROM u) SELECT a FROM t, x` reports
+`read(u, c, main, "x")`, where `"x"` is the CTE name. Anything treating a
+non-null `arg4` as "this access came from inside a view or trigger body"
+misclassifies every CTE. A recursive CTE that names no table
+(`WITH RECURSIVE r(n) AS (SELECT 1 UNION SELECT n+1 FROM r WHERE n<3)`) reports
+`recursive` and `select` only, and no `read` at all.
+
+### The schema argument can be NULL, and NULL does not mean `main`
+
+`SELECT count(*) FROM t` reports `read(t, "", null, null)` — no schema, and an
+empty column name. It reports exactly the same shape for a TEMP table:
+`SELECT count(*) FROM tmp` gives `read(tmp, "", null, null)`, not `"temp"`. An
+extractor defaulting a null schema to `main` therefore resolves the wrong table
+whenever `main` and `temp` both hold the name, and does so silently. An ATTACHed
+schema _is_ named: `SELECT count(*) FROM aux.au` reports
+`read(au, "", "aux", null)`.
+
+### A virtual table names itself at compile time and its shadows at step time
+
+Preparing `SELECT body FROM ft WHERE ft MATCH 'hello'` reports only
+`read(ft, body, main, null)`, `function(null, "match", ...)` and
+`read(ft, ft, main, null)`. The reads of `ft_idx` (`pgno`, `segid`, `term`) and
+`ft_content` (`id`, `c0`) arrive only when the statement is **stepped**. So the
+dependency direction and the change-event direction need canonicalisation for
+different reasons: a compile-time extractor sees `ft` already, and only a query
+written directly against a shadow (`SELECT * FROM ft_content`) needs
+`resolveTable`.
+
+### Foreign key cascades are reported at compile time
+
+With `PRAGMA foreign_keys = ON` and `child.p REFERENCES t(a) ON DELETE CASCADE`,
+`DELETE FROM t WHERE a = 1` reports `delete(t, ...)`, `read(child, p, main)` and
+`delete(child, null, main, null)`. The cascade was confirmed to have actually
+fired in the same probe (`child` empty afterwards), so "reported" is not a claim
+about a mechanism that did nothing.
+
+### A caller's authorize listener cannot change the dependency set — except by denying
+
+Extraction shares one authorizer with any listener the caller attached, because
+SQLite allows one per connection. It sits **upstream of the verdict**: every
+listener runs before the decision is latched. With a listener calling `ignore()`
+on the read of `u`, `SELECT t.a, u.c FROM t JOIN u ON t.a = u.c` still extracts
+`{t, u}` — in both listener orderings — and the `ignore` was confirmed to have
+taken effect in the same probe (the join went from one row to zero).
+
+`deny` is different. It fails the compile, so accesses SQLite had not reached
+are never reported: denying the **first** table named yields `{t}` and no `u`. A
+short set like that is the silent-staleness bug in its purest form, which is why
+`extractDependencies` returns `failed` for any compile that threw rather than
+publishing what it managed to see.
+
+### Only the first statement of a multi-statement string is compiled
+
+`SELECT x FROM m; SELECT z FROM tmp` reports `read(m, x, main, null)` and
+nothing about `tmp`. Nothing in the driver exposes the unused tail, so this
+cannot be detected and is a stated precondition rather than a downgrade.
+
+### A schema change re-fires the authorizer at step time, with new dependencies
+
+Prepare `SELECT * FROM vw` with `vw` defined as `SELECT x FROM p` — reports
+`read(p, x, main, "vw")`. Then `DROP VIEW vw; CREATE VIEW vw AS SELECT y FROM q`
+and **step the statement that was already prepared**: it reports
+`read(q, y, main, "vw")` and returns q's row. SQLite re-compiles transparently
+and the authorizer fires again. A dependency set is therefore correct for the
+schema it was taken under and stops being correct when the schema changes.
+
+### `VACUUM` and `REINDEX` produce no authorize events at all
+
+Every other statement measured produces at least one (`SELECT 1` → `select`;
+`BEGIN` → `transaction`; `PRAGMA user_version` → `pragma`; `DETACH nosuch` →
+`detach`). That is what makes "zero authorize events for a statement that
+compiled" a usable check for _is the authorizer even installed_ — but only
+against a fixed probe statement, never the caller's, since the caller's might be
+one of those two.
+
 ## The record of the divergence (2026-09-09)
 
 Against the driver `@db/sqlite` as vendored here, and both libraries in the

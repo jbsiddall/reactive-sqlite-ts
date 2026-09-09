@@ -57,6 +57,10 @@ export {
   SchemaMapError,
 } from "./src/schema_map.ts";
 
+export { DependencyError, extractDependencies } from "./src/dependencies.ts";
+
+export type { Dependencies, ExtractOptions } from "./src/dependencies.ts";
+
 export type {
   ListedTable,
   Resolution,

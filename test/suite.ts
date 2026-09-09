@@ -45,7 +45,27 @@ const { isSchemaChangingAction, SchemaWatch, SchemaWatchError, watchSchema } =
  * the value instead of on the shape.
  */
 const canonicalOf = (r: import("../src/schema_map.ts").Resolution): string =>
-  r.kind === "unattributable-shadow" ? `UNATTRIBUTABLE ${r.name}` : r.canonical;
+  r.kind === "unattributable-shadow"
+    ? `UNATTRIBUTABLE ${r.name}`
+    : r.kind === "view"
+    ? `VIEW ${r.name}`
+    : r.canonical;
+const { DependencyError, extractDependencies } = await import(
+  "../src/dependencies.ts"
+);
+type Dependencies = import("../src/dependencies.ts").Dependencies;
+/**
+ * The sets, rendered so a check() diff is readable - and rendered ONLY for the
+ * kinds that have sets. `"none"` and `"failed"` come back as their own words,
+ * which is the point of the type: this helper cannot accidentally print an
+ * empty set for a failure.
+ */
+const depsOf = (d: Dependencies): unknown =>
+  d.kind === "none" || d.kind === "failed" ? d.kind : {
+    kind: d.kind,
+    reads: d.reads.map((r) => `${r.schema}.${r.name}`),
+    writes: d.writes.map((r) => `${r.schema}.${r.name}`),
+  };
 const { openFfiBackend } = await import("../src/backend_ffi.ts");
 type DbEvent = import("../src/hooks.ts").DbEvent;
 type PreUpdate = import("../src/hooks.ts").PreUpdate;
@@ -3145,10 +3165,18 @@ const SEMANTIC: Record<string, () => void> = {
       "  every listed table resolves to itself",
       listed.filter((r) => {
         const kind = map.resolveTable(r.name, r.schema).kind;
-        return kind !== "table" && kind !== "virtual";
+        return kind !== "table" && kind !== "virtual" && kind !== "view";
       }).map((r) => `${r.schema}.${r.name}`),
       [],
     );
+    // A view is not a table resolving to itself and must not be counted as
+    // one: it has no rows, SQLite never reports a change on it, and a
+    // dependency recorded against it never fires.
+    check("  and the view is classified as a view", map.resolveTable("vw"), {
+      kind: "view",
+      schema: "main",
+      name: "vw",
+    });
     check(
       "  zero shadow entries",
       listed.filter((r) => map.shadowsOf(r.name, r.schema).length > 0)
@@ -3427,10 +3455,7 @@ const SEMANTIC: Record<string, () => void> = {
     const canonical = new Set(
       named.map((n) => {
         const [schema, table] = n.split(".");
-        const r = map.resolveTable(table!, schema!);
-        return r.kind === "unattributable-shadow"
-          ? `UNATTRIBUTABLE ${n}`
-          : r.canonical;
+        return canonicalOf(map.resolveTable(table!, schema!));
       }),
     );
     check("  and they all canonicalise to ft", [...canonical], ["ft"]);
@@ -3468,10 +3493,7 @@ const SEMANTIC: Record<string, () => void> = {
       [
         ...new Set(names.map((n) => {
           const [schema, table] = n.split(".");
-          const r = map.resolveTable(table!, schema!);
-          return r.kind === "unattributable-shadow"
-            ? `UNATTRIBUTABLE ${n}`
-            : r.canonical;
+          return canonicalOf(map.resolveTable(table!, schema!));
         })),
       ].sort();
 
@@ -3794,6 +3816,281 @@ const SEMANTIC: Record<string, () => void> = {
         .filter((a) => isSchemaChangingAction(a)),
       [],
     );
+  },
+
+  // ------------------------------------------------ dependency extraction
+  //
+  // C1 and C2 are the controls, and C2 is the one that looks like it tests
+  // nothing. It tests the distinction the whole design rests on: a statement
+  // that depends on no table and a statement whose extraction failed must not
+  // arrive as the same value, because the first should never be refreshed and
+  // the second must never be trusted.
+
+  "dependencies C1: a plain single-table select yields exactly {t}"() {
+    const db = memory();
+    const map = captureSchemaMap(db);
+    const d = extractDependencies(db, "SELECT v FROM t", {
+      schemaMap: map,
+      libPath: LIB,
+    });
+    check("  exactly {t}", depsOf(d), {
+      kind: "complete",
+      reads: ["main.t"],
+      writes: [],
+    });
+    db.close();
+  },
+
+  "dependencies C2: SELECT 1 is deliberately empty, a bad table is failed"() {
+    const db = memory();
+    const map = captureSchemaMap(db);
+    const empty = extractDependencies(db, "SELECT 1", {
+      schemaMap: map,
+      libPath: LIB,
+    });
+    check("  SELECT 1 is 'none'", empty.kind, "none");
+    const bad = extractDependencies(db, "SELECT * FROM nope", {
+      schemaMap: map,
+      libPath: LIB,
+    });
+    check("  a missing table is 'failed'", bad.kind, "failed");
+    check(
+      "  and it carries why",
+      bad.kind === "failed" && /no such table/.test(bad.error.message),
+      true,
+    );
+    // The two must not be the same value. If a future refactor made a failure
+    // report an empty set, this is the line that catches it.
+    check("  and they are different kinds", empty.kind === bad.kind, false);
+    db.close();
+  },
+
+  "dependencies T1: a read through a VIEW names the table, not the view"() {
+    const db = memory();
+    db.exec("CREATE VIEW vt AS SELECT v FROM t");
+    const map = captureSchemaMap(db);
+    // The map must classify it as a view; if it called it a table, the
+    // extractor below would keep it and this scenario would pass for the
+    // wrong reason.
+    check("  the map calls vt a view", map.resolveTable("vt").kind, "view");
+    const d = extractDependencies(db, "SELECT * FROM vt", {
+      schemaMap: map,
+      libPath: LIB,
+    });
+    check("  only the underlying table", depsOf(d), {
+      kind: "complete",
+      reads: ["main.t"],
+      writes: [],
+    });
+    db.close();
+  },
+
+  "dependencies T2: a TRIGGER's writes are reported, table unnamed in the SQL"() {
+    const db = memory();
+    db.exec("CREATE TABLE audit(msg)");
+    db.exec(
+      "CREATE TRIGGER trg AFTER INSERT ON t BEGIN INSERT INTO audit VALUES ('x'); END",
+    );
+    const map = captureSchemaMap(db);
+    const d = extractDependencies(db, "INSERT INTO t(v) VALUES ('a')", {
+      schemaMap: map,
+      libPath: LIB,
+    });
+    check("  audit is there though nothing named it", depsOf(d), {
+      kind: "complete",
+      reads: [],
+      writes: ["main.audit", "main.t"],
+    });
+    db.close();
+  },
+
+  "dependencies: a query over a shadow table canonicalises to the vtab"() {
+    const db = memory();
+    db.exec("CREATE VIRTUAL TABLE ft USING fts5(body)");
+    const map = captureSchemaMap(db);
+    check(
+      "  the map calls ft_content a shadow",
+      map.resolveTable("ft_content").kind,
+      "shadow",
+    );
+    check(
+      "  a query written against the shadow resolves to ft",
+      depsOf(
+        extractDependencies(db, "SELECT * FROM ft_content", {
+          schemaMap: map,
+          libPath: LIB,
+        }),
+      ),
+      { kind: "complete", reads: ["main.ft"], writes: [] },
+    );
+    // Measured: at COMPILE time an FTS5 query names the virtual table itself
+    // and the shadows only appear when it is stepped. Both directions land on
+    // ft, which is the assertion that matters.
+    check(
+      "  and a MATCH query names ft directly",
+      depsOf(
+        extractDependencies(db, "SELECT body FROM ft WHERE ft MATCH 'x'", {
+          schemaMap: map,
+          libPath: LIB,
+        }),
+      ),
+      { kind: "complete", reads: ["main.ft"], writes: [] },
+    );
+    db.close();
+  },
+
+  "dependencies: a NULL schema on an ambiguous name downgrades, not guesses"() {
+    const db = memory();
+    db.exec("CREATE TEMP TABLE t(id INTEGER PRIMARY KEY, v TEXT)");
+    const map = captureSchemaMap(db);
+    check("  both schemas hold t", map.schemasContaining("t"), [
+      "main",
+      "temp",
+    ]);
+    // `count(*)` is the measured case that reports a table with NO schema.
+    const d = extractDependencies(db, "SELECT count(*) FROM t", {
+      schemaMap: map,
+      libPath: LIB,
+    });
+    check("  downgraded and over-approximated", depsOf(d), {
+      kind: "unknown",
+      reads: ["main.t", "temp.t"],
+      writes: [],
+    });
+    check(
+      "  and the limit names the ambiguity",
+      d.kind === "unknown" && d.limits.some((l) => l.includes("no schema")),
+      true,
+    );
+    db.close();
+  },
+
+  "dependencies: an unrecognised access downgrades rather than being ignored"() {
+    const db = memory();
+    const map = captureSchemaMap(db);
+    // `pragma` names no table but is not harmless: it can read the schema.
+    // The allowlist is what makes this a downgrade instead of a silent pass.
+    const d = extractDependencies(db, "PRAGMA table_list", {
+      schemaMap: map,
+      libPath: LIB,
+    });
+    check("  kind", d.kind, "unknown");
+    check(
+      "  and it says which action",
+      d.kind === "unknown" && d.limits.some((l) => l.includes('"pragma"')),
+      true,
+    );
+    db.close();
+  },
+
+  "dependencies: a table absent from the snapshot downgrades"() {
+    const db = memory();
+    const map = captureSchemaMap(db);
+    db.exec("CREATE TABLE later(x)");
+    const d = extractDependencies(db, "SELECT x FROM later", {
+      schemaMap: map,
+      libPath: LIB,
+    });
+    check("  still recorded, but not complete", depsOf(d), {
+      kind: "unknown",
+      reads: ["main.later"],
+      writes: [],
+    });
+    check(
+      "  and it says the snapshot is stale",
+      d.kind === "unknown" &&
+        d.limits.some((l) => l.includes("not in the schema snapshot")),
+      true,
+    );
+    // The control: with a fresh reading it comes out complete. Without this,
+    // "downgrades" could be true of everything.
+    check(
+      "  a fresh snapshot resolves it",
+      depsOf(
+        extractDependencies(db, "SELECT x FROM later", {
+          schemaMap: map.refresh(db),
+          libPath: LIB,
+        }),
+      ),
+      { kind: "complete", reads: ["main.later"], writes: [] },
+    );
+    db.close();
+  },
+
+  "dependencies: a caller's deny/ignore does not change the extracted set"() {
+    const db = memory();
+    db.exec("CREATE TABLE u(c)");
+    const map = captureSchemaMap(db);
+    const SQL = "SELECT t.v, u.c FROM t JOIN u ON t.id = u.c";
+    const both = { kind: "complete", reads: ["main.t", "main.u"], writes: [] };
+
+    let verdict: "allow" | "deny" | "ignore" = "allow";
+    let target = "u";
+    let sawTarget = false;
+    const sub = withEvents(
+      db,
+      (e) => {
+        if (e.type !== "authorize") return;
+        if (e.action !== "read" || e.arg1 !== target) return;
+        sawTarget = true;
+        if (verdict === "deny") e.deny();
+        if (verdict === "ignore") e.ignore();
+      },
+      LIB,
+      { authorize: true },
+    );
+
+    const extract = () =>
+      depsOf(extractDependencies(db, SQL, { schemaMap: map, libPath: LIB }));
+
+    check("  baseline", extract(), both);
+    // The control that the verdict really took effect: without it, "the set
+    // did not change" would be explained by the listener never firing.
+    check("  the listener actually ran", sawTarget, true);
+
+    // `ignore` is the case the upstream position is for: the compile
+    // succeeds with the column blanked, and the set is unchanged.
+    verdict = "ignore";
+    check("  under ignore, unchanged", extract(), both);
+
+    // `deny` fails the compile, and the accesses SQLite had not reached are
+    // never reported. A truncated set is the silent-staleness bug, so it must
+    // arrive as `failed` rather than as a short but confident answer - and
+    // that must hold wherever the denied table sits in the statement.
+    verdict = "deny";
+    target = "u";
+    check("  deny of the LAST table is 'failed'", extract(), "failed");
+    target = "t";
+    check("  deny of the FIRST table is 'failed'", extract(), "failed");
+
+    sub.dispose();
+    db.close();
+  },
+
+  "dependencies: a connection with no authorizer refuses rather than answers"() {
+    const db = memory();
+    const map = captureSchemaMap(db);
+    // Hooks already attached WITHOUT authorize. Options are per connection, so
+    // the extractor cannot turn it on, and an empty answer here would be a
+    // live query that never refreshes.
+    const sub = withEvents(db, () => {}, LIB);
+    let caught: unknown;
+    try {
+      extractDependencies(db, "SELECT v FROM t", {
+        schemaMap: map,
+        libPath: LIB,
+      });
+    } catch (e) {
+      caught = e;
+    }
+    check("  it throws", caught instanceof DependencyError, true);
+    check(
+      "  and says why",
+      caught instanceof Error && caught.message.includes("authorize"),
+      true,
+    );
+    sub.dispose();
+    db.close();
   },
 
   "SqliteHooksError is exported and instanceof-able"() {

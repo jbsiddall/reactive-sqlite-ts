@@ -1031,6 +1031,69 @@ record of what has been tried is cleared only by a DDL-triggered refresh. Asking
 about an absent name a thousand times costs one refresh; alternating between two
 absent names costs two, not a thousand.
 
+### Which tables a statement depends on
+
+`extractDependencies` compiles a statement and reports the tables it touches,
+read by SQLite's authorizer rather than by parsing the SQL. It never steps the
+statement, so nothing is read and nothing is written.
+
+```ts
+import {
+  captureSchemaMap,
+  extractDependencies,
+} from "jsr:@jbsiddall/reactive-sqlite";
+
+const map = captureSchemaMap(db);
+extractDependencies(db, "SELECT v FROM t", { schemaMap: map, libPath: LIB });
+// { kind: "complete", reads: [{ schema: "main", name: "t" }], writes: [] }
+extractDependencies(db, "SELECT 1", { schemaMap: map, libPath: LIB });
+// { kind: "none" }  — no reads/writes fields at all
+```
+
+There is no registry here, no `stale` flag and nothing is re-run.
+
+**The point of the four kinds is that partial looks like it works.** An
+extractor returning `{a}` for a query that really depends on `{a, b}` produces a
+live query that refreshes on most writes and is silently stale on the rest —
+every test that writes to `a` passes, nothing ever throws, and it surfaces
+months later as "it sometimes doesn't update". So anything the extractor cannot
+see through downgrades the whole result to `kind: "unknown"` and says why in
+`limits`, instead of being quietly left out of the set. `"complete"` and
+`"unknown"` mean here what they mean on `Batch.coverage`.
+
+The other two kinds carry **no `reads` and no `writes` fields at all**, so a
+caller cannot reach for the sets without branching. `"none"` is a statement that
+genuinely depends on nothing and should never be refreshed; `"failed"` is a
+statement that did not compile, and treating it as an empty set would build a
+live query that never refreshes. Making them different shapes in the type is the
+same move `Resolution`'s `"unattributable-shadow"` makes.
+
+**A view is dropped in favour of what its body reads.** `SELECT * FROM v` is
+reported by SQLite as a read of `v` _and_ a read of the underlying `t`;
+recording `v` is what the SQL says and is exactly wrong, because SQLite never
+reports a row change on a view. `Resolution` gained a `"view"` kind with no
+`canonical` for the same reason. **A trigger's writes are included** even though
+the table appears in no SQL anyone wrote. **A query written against a shadow
+table canonicalises** to the virtual table that owns it.
+
+**What it misses, measured rather than assumed:**
+
+- Only the first statement of a multi-statement string is compiled. Nothing in
+  the driver exposes the unused tail, so this is a precondition, not a
+  downgrade: pass one statement.
+- The answer describes the statement **as compiled under the current schema**.
+  If the schema changes, SQLite re-compiles a prepared statement at the next
+  step and the authorizer fires again with the _new_ dependencies — a view
+  redefined between prepare and step reports the new table.
+- A caller's own `authorize` listener cannot change the set by returning
+  `ignore()`; extraction runs upstream of the verdict. A `deny` fails the
+  compile and truncates what SQLite reports, so it arrives as `"failed"` rather
+  than as a short, confident set.
+- Hooks attached without `authorize: true` leave the hook off, and options are
+  per connection. Rather than answer `"none"` for everything,
+  `extractDependencies` compiles a fixed `SELECT 1` first and throws
+  `DependencyError` if no authorize event arrives.
+
 ## Portability
 
 Deno FFI over `@db/sqlite` today. Neither the event model nor the public API is
