@@ -107,7 +107,7 @@ done
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 # ---------------------------------------------------------------------------
-# Target triple. Matches what select.ts computes from Deno.build.{os,arch}, so
+# Target triple. Matches what src/vendored.ts computes from Deno.build.{os,arch}, so
 # a library built here is found by a consumer without any configuration.
 # ---------------------------------------------------------------------------
 case "$(uname -s)" in

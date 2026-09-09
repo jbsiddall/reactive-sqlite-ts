@@ -31,7 +31,7 @@ extension at all.** That is the default path — what you get when nobody sets
 ## Using it
 
 ```ts
-import { useVendoredSqlite } from "./vendor/select.ts";
+import { useVendoredSqlite } from "./src/vendored.ts";
 const LIB = useVendoredSqlite(); // sets DENO_SQLITE_PATH; throws if none matches
 
 // AFTER, so the driver reads the variable we just set. Static imports hoist.
@@ -164,7 +164,7 @@ Ranked recommendation:
 
 Out of scope, because nothing here can validate them and an unvalidated artifact
 is the thing to avoid. `build.sh` already handles darwin (`-dynamiclib`,
-`-install_name`, `libsqlite3.dylib`) and `select.ts` already computes
+`-install_name`, `libsqlite3.dylib`) and `src/vendored.ts` already computes
 `darwin-arm64` / `darwin-x86_64`, so the work left is a CI job and a Mac to
 confirm on:
 
@@ -189,7 +189,7 @@ model below.
 
 They are not interchangeable and the failure is opaque, so the libc is part of
 the target triple: `linux-x86_64-gnu`, not `linux-x86_64`. Deno exposes no libc
-field, so `select.ts` defaults to `gnu` and a musl host opts in with
+field, so `src/vendored.ts` defaults to `gnu` and a musl host opts in with
 `REACTIVE_SQLITE_LIBC=musl`. That is the right way round — glibc is the
 overwhelmingly common case and gets no configuration; musl is a deliberate
 declaration rather than a silent mismatch.
@@ -245,9 +245,9 @@ LFS rather than as plain blobs, and commit only tagged releases.
 
 ### (e) Selecting the right artifact at runtime
 
-`select.ts` builds the triple from `Deno.build.os` and `Deno.build.arch` — the
-same string `build.sh` names its output directory with, so a library built on a
-machine is found on that machine with no configuration.
+`src/vendored.ts` builds the triple from `Deno.build.os` and `Deno.build.arch` —
+the same string `build.sh` names its output directory with, so a library built
+on a machine is found on that machine with no configuration.
 
 When nothing matches, the failure is a `NoVendoredLibraryError` naming the
 triple it wanted, the exact path it looked for, which targets _are_ present, and
@@ -281,6 +281,7 @@ bare `exit 139`.
 | `smoke_test.c` / `smoke_test.sh` | the SESSION round trip in C, runnable under qemu         |
 | `probe.ts`                       | which capabilities does a given `libsqlite3` have        |
 | `session_demo.ts`                | the SESSION round trip over Deno FFI                     |
-| `select.ts`                      | pick the artifact for this platform, or fail readably    |
+| `select.ts`                      | read the build manifest beside a built library           |
+| `../src/vendored.ts`             | pick the artifact for this platform, or fail readably    |
 | `lib/<target>/`                  | build output — gitignored                                |
 | `.src/`                          | downloaded amalgamation — gitignored                     |

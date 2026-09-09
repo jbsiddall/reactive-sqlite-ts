@@ -61,7 +61,7 @@
 import { probeCapabilities, resolveLibPath } from "../mod.ts";
 import type { Capabilities } from "../mod.ts";
 import { driverPrebuilt } from "../vendor/probe.ts";
-import { vendoredLibraryPath } from "../vendor/select.ts";
+import { vendoredLibraryPath } from "../src/vendored.ts";
 
 const README = new URL("../README.md", import.meta.url);
 const BEGIN = "<!-- capability-table:begin -->";
@@ -433,7 +433,7 @@ async function gate(columns: Column[]): Promise<void> {
  * where installing one failed, and this check has nothing to say about SQLite.
  *
  * Measured 2026-09-09 (Deno 2.9.6): none of this file's imports — `../mod.ts`,
- * `../vendor/probe.ts`, `../vendor/select.ts` — dlopens anything at import
+ * `../vendor/probe.ts`, `../src/vendored.ts` — dlopens anything at import
  * time; all three import cleanly with `--allow-ffi` withheld. That is why the
  * structural mode can live here and reuse the very `ROWS` object the generator
  * uses, rather than that list being moved to a third module to keep FFI out of

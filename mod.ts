@@ -52,6 +52,17 @@ export { formatEvent, jsonReplacer } from "./src/format.ts";
 export { resolveLibPath } from "./src/lib_path.ts";
 
 export {
+  availableTargets,
+  currentTarget,
+  libraryFileName,
+  NoVendoredLibraryError,
+  useVendoredSqlite,
+  vendoredLibraryPath,
+} from "./src/vendored.ts";
+
+export type { Target } from "./src/vendored.ts";
+
+export {
   captureSchemaMap,
   SchemaMap,
   SchemaMapError,

@@ -66,6 +66,7 @@ const MANIFEST: readonly string[] = [
   "src/lib_path.ts",
   "src/schema_map.ts",
   "src/schema_watch.ts",
+  "src/vendored.ts",
   "vendor/README.md",
   "vendor/build.sh",
   "vendor/probe.ts",

@@ -649,6 +649,13 @@ Consequence for tooling: a structural, no-library check can live in
 generator uses, instead of that list being moved to a third module purely to
 keep FFI out of the check.
 
+**RE-MEASURED 2026-09-09 after the selection code moved to `src/vendored.ts`:**
+both halves still import clean under the identical flags — `src/vendored.ts`,
+which now picks the artifact, and what is left of `vendor/select.ts`, which now
+only reads the build manifest. The negative was re-taken rather than inherited,
+because the module it was measured on is no longer the module that does the
+work.
+
 ### The capability audit no longer needs a library that lacks normalize (2026-09-09)
 
 `tools/capability_coverage.ts` used to exit 2 when `DENO_SQLITE_PATH` pointed at

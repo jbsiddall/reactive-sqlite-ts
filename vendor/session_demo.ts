@@ -23,7 +23,7 @@
  * Needs `--unstable-ffi --allow-ffi --allow-env --allow-read`.
  */
 
-import { vendoredLibraryPath } from "./select.ts";
+import { vendoredLibraryPath } from "../src/vendored.ts";
 
 // SQLite result codes we care about.
 const SQLITE_OK = 0;

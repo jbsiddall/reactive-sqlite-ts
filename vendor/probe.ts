@@ -21,12 +21,12 @@
  * Needs `--unstable-ffi --allow-ffi --allow-env --allow-read`.
  */
 
+import { readManifest } from "./select.ts";
 import {
   availableTargets,
   currentTarget,
   libraryFileName,
-  readManifest,
-} from "./select.ts";
+} from "../src/vendored.ts";
 import { dirname, fromFileUrl, join } from "@std/path";
 
 const VENDOR_DIR = dirname(fromFileUrl(import.meta.url));
