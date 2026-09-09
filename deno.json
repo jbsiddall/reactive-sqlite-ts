@@ -30,6 +30,14 @@
       "description": "The crash matrix: every case runs in its OWN child process and is asserted on its exit code, so a genuine segfault (139) can never be mistaken for a pass. --allow-run is unscoped because the child is Deno.execPath(), known only at runtime; the only program spawned is this same Deno binary running test/crash_cases.ts.",
       "command": "deno run --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write --allow-net --allow-run test/suite.ts crash"
     },
+    "table": {
+      "description": "Regenerate the capability x library table in README.md by probing each library, each in its own child process. --allow-run is unscoped because the child is Deno.execPath(), known only at runtime; the only program spawned is this same Deno binary running this same file in --probe mode.",
+      "command": "deno run --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write --allow-run tools/capability_table.ts"
+    },
+    "test:table": {
+      "description": "Re-probe the three libraries and fail if README.md's capability table does not match — plus the gate that must pass before any of those numbers is reportable: three distinct files, three non-identical columns, each version found in the bytes of its own file, and one pinned known answer.",
+      "command": "deno run --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write --allow-run tools/capability_table.ts --check"
+    },
     "test:publish": {
       "description": "Assert what the published package actually contains — LICENSE and NOTICE present, test/ and tools/ absent. Spawns `deno publish --dry-run`, which validates without uploading. --allow-run is unscoped because the child is Deno.execPath(), known only at runtime.",
       "command": "deno run --allow-run --allow-read --allow-env test/publish_manifest.ts"

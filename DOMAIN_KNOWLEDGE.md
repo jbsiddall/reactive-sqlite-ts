@@ -70,6 +70,49 @@ announces the substitution except a download line on stderr. See **What a
 verification failure actually looks like here** below, where this cost a
 measurement.
 
+## The three libsqlite3 builds reachable here
+
+**Observed 2026-09-09**, by `probeCapabilities()` against each library in its
+own process, and corroborated for the negatives by `nm -D --defined-only`, which
+does not go through `dlopen` at all. The cell-by-cell result is the generated
+table in `README.md` ("What three real libraries actually support"), regenerated
+by `deno task table` and checked by `deno task test:table`.
+
+**The measured negatives, which are the point of having three columns:**
+
+- The prebuilt `@db/sqlite` 0.13.0 downloads (SQLite **3.46.0**,
+  `$DENO_DIR/plug/`) exports neither `sqlite3_preupdate_hook` nor
+  **`sqlite3_progress_handler`** nor `sqlite3_normalized_sql`. The progress one
+  we did not previously believe: it means that library is an honest fixture for
+  the `progress`-absent branch as well as the `preupdate`-absent branch. `wal`,
+  `trace`, `busy`, `authorize` and `collation` are all present in it.
+- The system library on Debian/Ubuntu (SQLite **3.45.1**) has everything except
+  `sqlite3_normalized_sql`.
+- The vendored build (SQLite **3.53.4**) has all nine.
+
+Each of those is "looked for it in that file, on that date, and it was not
+there", not "did not check".
+
+**This fixture has an expiry date.** The prebuilt is the only library reachable
+here that genuinely lacks capabilities, and vendoring the driver removes it.
+Anything that needs a real absent-capability library should be built while it
+still exists.
+
+### Loading several libsqlite3 builds in one process
+
+**Measured 2026-09-09, and the result is a negative:** dlopening the system,
+vendored and prebuilt libraries in a single Deno process reported 3.45.1, 3.53.4
+and 3.46.0 correctly, in either order. No collapse, no segfault. The three
+SONAMEs happen to differ — `libsqlite3.so.0`, `libsqlite3.so` and
+`libsqlite3-3.46.0.so.0` (read with `objdump -p`).
+
+That "no" is recorded because it is worth exactly as much as a "yes" and is
+about to look like nobody asked. It is also not a guarantee: `dlopen` may hand
+back an ALREADY-LOADED object when the SONAME matches, so the safety here is an
+accident of how `vendor/build.sh` links today — one `-Wl,-soname` away from
+three identical, plausible columns and no error. `tools/capability_table.ts`
+probes each library in its own child process anyway, for that reason.
+
 ## SQLite: attribution hazards for a query-to-tables map
 
 **UNSTAMPED.** These were measured while the authorizer hook was built, but the

@@ -439,7 +439,7 @@ function render(reports: LibraryReport[]): void {
 }
 
 /** The system library, if this machine has one where the usual distros put it. */
-function systemLibrary(): string | undefined {
+export function systemLibrary(): string | undefined {
   const candidates = [
     "/usr/lib/x86_64-linux-gnu/libsqlite3.so.0",
     "/usr/lib/aarch64-linux-gnu/libsqlite3.so.0",
@@ -465,7 +465,7 @@ function systemLibrary(): string | undefined {
  * $DENO_DIR/plug/<host>/<sha256>.so beside a metadata.json naming the URL, so
  * the metadata is what identifies it; the hashed filename says nothing.
  */
-function driverPrebuilt(): string | undefined {
+export function driverPrebuilt(): string | undefined {
   const denoDir = Deno.env.get("DENO_DIR") ??
     (() => {
       const home = Deno.env.get("HOME");

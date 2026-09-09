@@ -155,6 +155,43 @@ return value can change what the database does.
 | Unknown collation needed | `sqlite3_collation_needed` | yes | no   | no; supplies the collation    | Every comparison then crosses into JS; see cost below  |
 | Statement authorisation  | `sqlite3_set_authorizer`   | yes | no   | **yes** → `deny()`/`ignore()` | Compile-time; +49%; `ignore()` NULLs a column silently |
 
+### What three real libraries actually support
+
+The table above is what SQLite allows. This one is what the library on YOUR disk
+allows, and the three columns are the three you can realistically end up with:
+the system `libsqlite3`, the vendored build, and the prebuilt `@db/sqlite`
+downloads for itself when `DENO_SQLITE_PATH` is unset. Each cell is the value
+{@linkcode probeCapabilities} returned for that library. Read your own with
+`probeCapabilities(libPath)`, or `subscription.capabilities`.
+
+<!-- capability-table:begin -->
+
+Observed **2026-09-09**, by running `probeCapabilities()` against each library
+at the path below, each in its own process. Every `no` is a measured negative —
+the symbol was looked for in that file, on that date, and was not there — not an
+unchecked cell. Regenerate with `deno task table`; `deno task test:table` fails
+if this is stale.
+
+| Capability      | system 3.45.1 | vendored 3.53.4 | @db/sqlite prebuilt 3.46.0 |
+| --------------- | ------------- | --------------- | -------------------------- |
+| `hooks`         | yes           | yes             | yes                        |
+| `preupdate`     | yes           | yes             | no                         |
+| `wal`           | yes           | yes             | yes                        |
+| `trace`         | yes           | yes             | yes                        |
+| `progress`      | yes           | yes             | no                         |
+| `busy`          | yes           | yes             | yes                        |
+| `authorize`     | yes           | yes             | yes                        |
+| `collation`     | yes           | yes             | yes                        |
+| `normalizedSql` | no            | yes             | no                         |
+
+- `system` — the path `resolveLibPath()` returns — the library `deno task test`
+  runs against
+- `vendored` — `vendor/lib/<target>/`, built by `deno task vendor:build`
+- `@db/sqlite prebuilt` — `$DENO_DIR/plug/`, downloaded by `@db/sqlite` 0.13.0
+  when `DENO_SQLITE_PATH` is unset
+
+<!-- capability-table:end -->
+
 ## This library versus the other SQLite bindings
 
 A different question from the table above: not "what does SQLite allow" but

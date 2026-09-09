@@ -20,7 +20,16 @@ export DENO_SQLITE_PATH=/usr/lib/x86_64-linux-gnu/libsqlite3.so.0   # Linux
 deno task check       # fmt --check, lint, type check
 deno task test        # the in-process suite
 deno task test:crash  # the out-of-process crash matrix
+deno task test:table  # README's capability table still matches the libraries
 ```
+
+`test:table` needs all THREE libraries on disk — the system one, a vendored
+build (`deno task vendor:build`), and the prebuilt `@db/sqlite` downloads when
+`DENO_SQLITE_PATH` is unset. It is therefore not in CI, which builds neither of
+the last two; it is a developer-machine check, and it says which library it
+loaded from which path before it asserts anything. Run it after anything that
+changes `Capabilities` or the vendored build's flags, and `deno task table` to
+regenerate.
 
 If `DENO_SQLITE_PATH` is unset, the driver downloads and loads a prebuilt
 library of its own while our FFI opens a system one. The two `sqlite3*` layouts
@@ -193,7 +202,12 @@ The **absent-capability branches** — "preupdate unavailable",
 run against a library that genuinely lacks those symbols, because both libraries
 reachable here have them. The honest fixture for those is the prebuilt library
 `@db/sqlite` downloads when `DENO_SQLITE_PATH` is unset, which carries a much
-smaller symbol set. Not wired up.
+smaller symbol set. Still not wired up as a test fixture — but that library is
+now PROBED, and what it does and does not have is measured rather than supposed:
+see the capability table in `README.md` and the three-builds section of
+`DOMAIN_KNOWLEDGE.md`. It lacks `sqlite3_progress_handler` too, so it is a
+fixture for the `progress`-absent branch as well. It disappears when the driver
+is vendored.
 
 ### How far the guard actually reaches
 
