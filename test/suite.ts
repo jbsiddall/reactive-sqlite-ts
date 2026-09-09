@@ -33,6 +33,9 @@ const {
   withValidation,
 } = await import("../src/hooks.ts");
 const { formatEvent, jsonReplacer } = await import("../src/format.ts");
+const { captureSchemaMap, SchemaMap, SchemaMapError } = await import(
+  "../src/schema_map.ts"
+);
 const { openFfiBackend } = await import("../src/backend_ffi.ts");
 type DbEvent = import("../src/hooks.ts").DbEvent;
 type PreUpdate = import("../src/hooks.ts").PreUpdate;
@@ -3100,6 +3103,372 @@ const SEMANTIC: Record<string, () => void> = {
       [...TX_VARIANTS],
     );
     check("  database back-reference", tx.database === db, true);
+    db.close();
+  },
+
+  // ------------------------------------------------------- the schema map
+  //
+  // The negative control is the first scenario and it asserts ZERO shadow
+  // entries, not "no wrong answers": a map that never classifies anything
+  // would pass a "no wrong answers" check while being useless.
+
+  "schema map: a schema with no virtual tables has ZERO shadow entries"() {
+    const db = memory();
+    db.exec("CREATE TABLE other(a)");
+    db.exec("CREATE VIEW vw AS SELECT 1 AS one");
+    // Underscore in the name, and `t` really is a table - but not a virtual
+    // one, so nothing here may be attributed to it.
+    db.exec("CREATE TABLE t_x(a)");
+    const map = captureSchemaMap(db);
+    const listed = db.prepare("PRAGMA table_list").all<
+      { schema: string; name: string }
+    >();
+    check(
+      "  every listed table resolves to itself",
+      listed.filter((r) => {
+        const kind = map.resolveTable(r.name, r.schema).kind;
+        return kind !== "table" && kind !== "virtual";
+      }).map((r) => `${r.schema}.${r.name}`),
+      [],
+    );
+    check(
+      "  zero shadow entries",
+      listed.filter((r) => map.shadowsOf(r.name, r.schema).length > 0)
+        .map((r) => `${r.schema}.${r.name}`),
+      [],
+    );
+    check("  nothing unattributable", map.unattributable, []);
+    check("  nothing looks like a shadow", map.shadowLookalikes, []);
+    check(
+      "  t_x is a plain table resolving to itself",
+      map.resolveTable("t_x"),
+      {
+        kind: "table",
+        schema: "main",
+        name: "t_x",
+        canonical: "t_x",
+      },
+    );
+    db.close();
+  },
+
+  "schema map: FTS5, the known answer in both directions"() {
+    const db = memory();
+    db.exec("CREATE VIRTUAL TABLE ft USING fts5(body)");
+    const map = captureSchemaMap(db);
+    check("  shadowsOf(ft)", map.shadowsOf("ft"), [
+      "ft_config",
+      "ft_content",
+      "ft_data",
+      "ft_docsize",
+      "ft_idx",
+    ]);
+    check(
+      "  every shadow canonicalises to ft",
+      map.shadowsOf("ft").map((n) => {
+        const r = map.resolveTable(n);
+        return r.kind === "shadow" ? r.canonical : `${r.kind}!`;
+      }),
+      ["ft", "ft", "ft", "ft", "ft"],
+    );
+    check("  ft resolves to itself as virtual", map.resolveTable("ft"), {
+      kind: "virtual",
+      schema: "main",
+      name: "ft",
+      canonical: "ft",
+    });
+    check("  an ordinary table is untouched", map.resolveTable("t"), {
+      kind: "table",
+      schema: "main",
+      name: "t",
+      canonical: "t",
+    });
+    check("  shadowsOf an ordinary table is empty", map.shadowsOf("t"), []);
+    db.close();
+  },
+
+  "schema map: rtree, a second module with a different shadow set"() {
+    const db = memory();
+    db.exec("CREATE VIRTUAL TABLE rt USING rtree(id, minx, maxx)");
+    const map = captureSchemaMap(db);
+    check("  shadowsOf(rt)", map.shadowsOf("rt"), [
+      "rt_node",
+      "rt_parent",
+      "rt_rowid",
+    ]);
+    check(
+      "  and each canonicalises to rt",
+      map.shadowsOf("rt").map((n) => {
+        const r = map.resolveTable(n);
+        return r.kind === "shadow" ? r.canonical : `${r.kind}!`;
+      }),
+      ["rt", "rt", "rt"],
+    );
+    db.close();
+  },
+
+  "schema map: a nested prefix goes to the longer virtual table"() {
+    const db = memory();
+    db.exec("CREATE VIRTUAL TABLE ft USING fts5(body)");
+    db.exec("CREATE VIRTUAL TABLE ft_sub USING fts5(body)");
+    const map = captureSchemaMap(db);
+    check("  ft keeps only its own five", map.shadowsOf("ft"), [
+      "ft_config",
+      "ft_content",
+      "ft_data",
+      "ft_docsize",
+      "ft_idx",
+    ]);
+    check("  ft_sub gets its own", map.shadowsOf("ft_sub"), [
+      "ft_sub_config",
+      "ft_sub_content",
+      "ft_sub_data",
+      "ft_sub_docsize",
+      "ft_sub_idx",
+    ]);
+    const r = map.resolveTable("ft_sub_data");
+    check(
+      "  ft_sub_data belongs to ft_sub",
+      r.kind === "shadow" ? r.canonical : r.kind,
+      "ft_sub",
+    );
+    db.close();
+  },
+
+  "schema map: detection beats attribution for a shadow lookalike"() {
+    const db = memory();
+    db.exec("CREATE VIRTUAL TABLE ft USING fts5(body)");
+    // Named exactly like a shadow of ft. SQLite allows it because FTS5's
+    // module rejects the suffix, and table_list calls it a plain table.
+    db.exec("CREATE TABLE ft_notes(x)");
+    const map = captureSchemaMap(db);
+    check("  it resolves to itself", map.resolveTable("ft_notes"), {
+      kind: "table",
+      schema: "main",
+      name: "ft_notes",
+      canonical: "ft_notes",
+    });
+    check(
+      "  it is NOT a shadow of ft",
+      map.shadowsOf("ft").includes("ft_notes"),
+      false,
+    );
+    check("  and the disagreement is reported", map.shadowLookalikes, [
+      { schema: "main", name: "ft_notes" },
+    ]);
+    db.close();
+  },
+
+  "schema map: temp has its own virtual tables and they do not leak into main"() {
+    const db = memory();
+    db.exec("CREATE VIRTUAL TABLE temp.tv USING fts5(body)");
+    const map = captureSchemaMap(db);
+    check("  shadowsOf under temp", map.shadowsOf("tv", "temp").length, 5);
+    check("  nothing under main", map.shadowsOf("tv"), []);
+    check(
+      "  and main does not know the name",
+      map.resolveTable("tv").kind,
+      "unknown",
+    );
+    const r = map.resolveTable("tv_data", "temp");
+    check(
+      "  temp shadow attributes to temp vtab",
+      r.kind === "shadow" ? r.canonical : r.kind,
+      "tv",
+    );
+    db.close();
+  },
+
+  "schema map: a name the snapshot never saw is 'unknown', not a silent hit"() {
+    const db = memory();
+    const map = captureSchemaMap(db);
+    check("  kind", map.resolveTable("nope"), {
+      kind: "unknown",
+      schema: "main",
+      name: "nope",
+      canonical: "nope",
+    });
+    db.close();
+  },
+
+  "schema map: it is a snapshot, and refresh() is how a new one is taken"() {
+    const db = memory();
+    const before = captureSchemaMap(db);
+    db.exec("CREATE VIRTUAL TABLE ft USING fts5(body)");
+    check("  the old snapshot has not moved", before.shadowsOf("ft"), []);
+    check("  and says so", before.resolveTable("ft_data").kind, "unknown");
+    const after = before.refresh(db);
+    check("  the new one sees it", after.shadowsOf("ft").length, 5);
+    check("  the old one still does not", before.shadowsOf("ft"), []);
+    db.close();
+  },
+
+  "schema map: an unattributable shadow is reported, never resolved to itself"() {
+    // Not reachable against a real libsqlite3 - deleting the owning virtual
+    // table's sqlite_schema row makes SQLite reclassify every shadow as a
+    // plain table (measured, 3.45.1 and 3.53.4). The branch is built from
+    // rows directly so that the defensive path is exercised rather than
+    // assumed.
+    const map = SchemaMap.from([
+      { schema: "main", name: "sqlite_schema", type: "table" },
+      { schema: "main", name: "orphan_data", type: "shadow" },
+      { schema: "main", name: "nounderscore", type: "shadow" },
+    ], "0.0.0");
+    const r = map.resolveTable("orphan_data");
+    check("  kind", r.kind, "unattributable-shadow");
+    check(
+      "  it carries no canonical name at all",
+      Object.hasOwn(r, "canonical"),
+      false,
+    );
+    check(
+      "  a shadow with no underscore too",
+      map.resolveTable("nounderscore").kind,
+      "unattributable-shadow",
+    );
+    check("  both are listed", map.unattributable, [
+      { schema: "main", name: "orphan_data" },
+      { schema: "main", name: "nounderscore" },
+    ]);
+  },
+
+  "schema map: below the PRAGMA table_list floor it throws, not answers empty"() {
+    // An unrecognised pragma returns zero rows in SQLite rather than failing,
+    // so an ancient library would otherwise produce a map of an empty schema
+    // in which every answer looks safe and is wrong.
+    const ancient = {
+      prepare(sql: string) {
+        return {
+          all: () => sql.includes("table_list") ? [] : [{ v: "3.36.0" }],
+          get: () => ({ v: "3.36.0" }),
+        };
+      },
+    };
+    let caught: unknown;
+    try {
+      captureSchemaMap(ancient);
+    } catch (e) {
+      caught = e;
+    }
+    check("  SchemaMapError", caught instanceof SchemaMapError, true);
+    check("  naming the version", msg(caught).includes("3.36.0"), true);
+    check("  and the pragma", msg(caught).includes("table_list"), true);
+  },
+
+  "schema map: a table_list without the columns we read throws"() {
+    const wrong = {
+      prepare: () => ({ all: () => [{ nom: "t" }], get: () => ({ v: "9" }) }),
+    };
+    let caught: unknown;
+    try {
+      captureSchemaMap(wrong);
+    } catch (e) {
+      caught = e;
+    }
+    check("  SchemaMapError", caught instanceof SchemaMapError, true);
+  },
+
+  "schema map: schema+table keys survive identifiers with separators in them"() {
+    // Quoted identifiers are arbitrary text, so ("a b", "c") and ("a", "b c")
+    // must not collide. Built from rows because ATTACH of two such schemas is
+    // not needed to exercise the key.
+    const map = SchemaMap.from([
+      { schema: "a b", name: "c", type: "table" },
+      { schema: "a", name: "b c", type: "virtual" },
+      { schema: "a", name: "b c_data", type: "shadow" },
+    ], "0.0.0");
+    check("  the plain one", map.resolveTable("c", "a b").kind, "table");
+    check("  the virtual one", map.resolveTable("b c", "a").kind, "virtual");
+    const r = map.resolveTable("b c_data", "a");
+    check(
+      "  and the shadow attributes across the space",
+      r.kind === "shadow" ? r.canonical : r.kind,
+      "b c",
+    );
+    check("  shadowsOf", map.shadowsOf("b c", "a"), ["b c_data"]);
+    check("  and not under the other schema", map.shadowsOf("c", "a b"), []);
+  },
+
+  "schema map: an FTS5 write canonicalises to the table that was written"() {
+    // The change half of the pair, end to end: the hook names only shadows.
+    const db = memory();
+    db.exec("CREATE VIRTUAL TABLE ft USING fts5(body)");
+    const map = captureSchemaMap(db);
+    const named: string[] = [];
+    const sub = withEvents(db, (e) => {
+      if (e.type === "change") named.push(`${e.change.db}.${e.change.table}`);
+    }, LIB);
+    db.exec("INSERT INTO ft(body) VALUES ('hello world')");
+    sub.dispose();
+    check("  the hook never names ft", named.includes("main.ft"), false);
+    check(
+      "  it names these shadows",
+      [...new Set(named)].sort(),
+      ["main.ft_content", "main.ft_data", "main.ft_docsize"],
+    );
+    const canonical = new Set(
+      named.map((n) => {
+        const [schema, table] = n.split(".");
+        const r = map.resolveTable(table!, schema!);
+        return r.kind === "unattributable-shadow"
+          ? `UNATTRIBUTABLE ${n}`
+          : r.canonical;
+      }),
+    );
+    check("  and they all canonicalise to ft", [...canonical], ["ft"]);
+    db.close();
+  },
+
+  "schema map: an FTS5 MATCH resolves to ft as a dependency"() {
+    // The read half of the pair. The authorizer names `ft` when the statement
+    // is prepared and the shadow tables when it is stepped; both sides have to
+    // come out as ft or a live query over MATCH cannot be invalidated.
+    const db = memory();
+    db.exec("CREATE VIRTUAL TABLE ft USING fts5(body)");
+    db.exec("INSERT INTO ft(body) VALUES ('hello world')");
+    const map = captureSchemaMap(db);
+    const reads: string[] = [];
+    const sub = withEvents(
+      db,
+      (e) => {
+        if (e.type === "authorize" && e.action === "read" && e.arg1 !== null) {
+          reads.push(`${e.arg3 ?? "main"}.${e.arg1}`);
+        }
+      },
+      LIB,
+      { authorize: true },
+    );
+    const stmt = db.prepare("SELECT * FROM ft WHERE ft MATCH 'hello'");
+    const atPrepare = [...reads];
+    reads.length = 0;
+    check("  the query returns the row", stmt.all().length, 1);
+    const atStep = [...reads];
+    stmt.finalize();
+    sub.dispose();
+
+    const canonicalise = (names: string[]) =>
+      [
+        ...new Set(names.map((n) => {
+          const [schema, table] = n.split(".");
+          const r = map.resolveTable(table!, schema!);
+          return r.kind === "unattributable-shadow"
+            ? `UNATTRIBUTABLE ${n}`
+            : r.canonical;
+        })),
+      ].sort();
+
+    check(
+      "  prepare named the virtual table",
+      atPrepare.includes("main.ft"),
+      true,
+    );
+    check("  prepare resolves to ft", canonicalise(atPrepare), ["ft"]);
+    check(
+      "  step named shadows instead",
+      atStep.some((n) => n.startsWith("main.ft_")),
+      true,
+    );
+    check("  step resolves to ft too", canonicalise(atStep), ["ft"]);
     db.close();
   },
 

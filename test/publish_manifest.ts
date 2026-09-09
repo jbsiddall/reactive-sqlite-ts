@@ -26,6 +26,7 @@ const MUST_SHIP = [
   "deno.json",
   "mod.ts",
   "src/hooks.ts",
+  "src/schema_map.ts",
 ];
 
 /** Excluded today. Listed so the test fails if what ships WIDENS, not only if it narrows. */

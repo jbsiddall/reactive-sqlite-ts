@@ -935,6 +935,36 @@ into a string. Quoted SQLite identifiers are arbitrary text —
 schema `a b` with table `c` and schema `a` with table `b c` collide under any
 single-character separator. Whatever character you pick can appear in a name.
 
+### Virtual tables change under other names
+
+A row written into an FTS5 table `ft` arrives on the update hook as
+`ft_content`, `ft_docsize` and `ft_data`, never as `ft`; a `MATCH` over it names
+`ft` when the statement is prepared and those shadow tables when it is stepped.
+Compare the two sets directly and nothing over a virtual table ever matches.
+
+`captureSchemaMap(db)` reads the schema once and answers both directions:
+
+```ts
+import { captureSchemaMap } from "jsr:@jbsiddall/reactive-sqlite";
+
+const map = captureSchemaMap(db);
+map.resolveTable("ft_content"); // { kind: "shadow", canonical: "ft", ... }
+map.resolveTable("orders"); // { kind: "table",  canonical: "orders", ... }
+map.shadowsOf("ft"); // ["ft_config","ft_content","ft_data","ft_docsize","ft_idx"]
+```
+
+Detection comes from `PRAGMA table_list`, which is SQLite's own classification;
+the owning virtual table is derived from the name, because nothing reports it.
+Where the two disagree the map says so rather than guessing: a table merely
+_named_ like a shadow (`ft_notes` beside `ft`) resolves to itself and is listed
+on `shadowLookalikes`, and a shadow whose owner cannot be derived comes back as
+`kind: "unattributable-shadow"` carrying no `canonical` field at all, so it
+cannot be mistaken for the ordinary path.
+
+It is a **snapshot**, not a live view: nothing after the capture is visible to
+it, deliberately, because it is meant to be consulted from inside hook callbacks
+where issuing SQL is undefined behaviour. `map.refresh(db)` returns a new one.
+
 ## Portability
 
 Deno FFI over `@db/sqlite` today. Neither the event model nor the public API is

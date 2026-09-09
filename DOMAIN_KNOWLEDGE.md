@@ -145,7 +145,133 @@ now rather than after it is built:
 Also: collect around the `prepare`, not the whole call. Executing a write to a
 virtual table authorizes its shadow tables too, because FTS5 prepares its own
 statements against them, whereas preparing a read of it names only the virtual
-table.
+table. Corroborated and stamped in "Shadow tables and the virtual tables that
+own them" below: a `MATCH` names only `ft` at prepare and only shadows at step.
+
+## Shadow tables and the virtual tables that own them
+
+Measured 2026-09-09 against both libraries in the capability ledger — the system
+build 3.45.1 and the vendored build 3.53.4 — through `@db/sqlite` 0.13.0 under
+`resolveLibPath()`. Every answer below was byte-identical on the two unless the
+text says otherwise.
+
+### Detection is authoritative; attribution is derived
+
+`PRAGMA table_list` (SQLite 3.37+) reports a `type` column of `table`,
+`virtual`, `shadow` or `view`. For `CREATE VIRTUAL TABLE ft USING fts5(body)` it
+reports `ft` as `virtual` and `ft_config`, `ft_content`, `ft_data`,
+`ft_docsize`, `ft_idx` as `shadow`; for `rtree` it reports `rt_node`,
+`rt_parent`, `rt_rowid`. `sqlite_schema` cannot substitute: queried directly it
+gives every one of those shadows `type = 'table'`.
+
+Nothing reports _which_ virtual table owns a given shadow. The owner has to be
+derived from the name, and the rule used here is the one SQLite itself applies
+when deciding whether a name is a shadow at all: the text before the **last**
+underscore, which must name a virtual table in the same schema.
+
+The two agree, in the strongest sense that could be arranged. With
+`PRAGMA writable_schema=ON`, the `sqlite_schema` row for `ft` deleted, and the
+database closed and reopened, all five of its shadow tables come back reported
+as `type = 'table'`. `type = 'shadow'` therefore _entails_ a live owning virtual
+table, so the derivation is total over the shadow set and a shadow with no
+derivable owner was not reachable by any route tried here.
+
+**Measured negative, recorded so it is not mistaken for an untested claim:**
+last-underscore and longest-virtual-table-prefix could not be told apart on
+either library. Distinguishing them needs a shadow whose suffix itself contains
+an underscore, and no module reachable here produces one — FTS5's shadow
+suffixes are `config`, `content`, `data`, `docsize`, `idx`, rtree's are `node`,
+`parent`, `rowid`. Nested prefixes (`ft` and `ft_sub` both virtual) are handled
+identically by both rules: `ft_sub_data` goes to `ft_sub`.
+
+### A table can be named like a shadow and not be one
+
+`CREATE TABLE ft_notes(x)` succeeds beside the virtual table `ft`, and
+`table_list` calls it a plain `table` — the module's `xShadowName` rejects the
+suffix. So the name is not sufficient evidence in either direction, and code
+that attributes by prefix alone will claim an ordinary table.
+
+Dropping a shadow table directly (`DROP TABLE ft_data`) also succeeds on both
+libraries: `SQLITE_DBCONFIG_DEFENSIVE` is not set by the driver.
+
+### The change events an FTS5 write actually produces
+
+`INSERT INTO ft(body) VALUES ('hello world')` on an fts5 table fires
+`sqlite3_update_hook` for `ft_content`, `ft_docsize` and `ft_data`, and never
+for `ft`.
+
+Reading it back is the mirror image. Preparing
+`SELECT * FROM ft WHERE ft MATCH 'hello'` authorizes `read(ft, body, main)` and
+`read(ft, ft, main)` — the virtual table, no shadows. Stepping the same
+statement authorizes `read(ft_idx, ...)` and `read(ft_content, ...)` — the
+shadows, no virtual table. A dependency set collected at prepare time and a
+change set collected at commit time therefore have no name in common for any
+virtual table unless one side is canonicalised.
+
+### `tables_used` is not an option for virtual tables
+
+The `tables_used` eponymous virtual table (`SQLITE_ENABLE_BYTECODE`) exists on
+the vendored 3.53.4 build and **not** on the system 3.45.1 build, where it is
+`no such table: tables_used`.
+
+Where it does exist it reports nothing at all for a virtual table — not only for
+`MATCH`. Measured on 3.53.4:
+
+| statement                                 | `tables_used` rows |
+| ----------------------------------------- | ------------------ |
+| `SELECT * FROM plain`                     | `main.plain`       |
+| `SELECT * FROM ft`                        | none               |
+| `SELECT * FROM ft WHERE ft MATCH 'hello'` | none               |
+| `INSERT INTO ft(body) VALUES('z')`        | none               |
+| `SELECT * FROM ft_content`                | `main.ft_content`  |
+
+### Which virtual table modules are available
+
+`PRAGMA module_list`, both libraries: `fts5` and `rtree` are present on both.
+`vec0` is present on neither (`no such module: vec0`) — there is no sqlite-vec
+extension on this machine, so the vector case is untested here rather than
+known-good — `CREATE VIRTUAL TABLE v USING vec0(...)` fails with
+`no such module: vec0` on both. The vendored build additionally carries
+`geopoly`, `bytecode` and `tables_used`; the system build additionally carries
+`json_each` and `json_tree` as modules, which 3.53.4 no longer lists. `fts3`,
+`fts4`, `fts4aux`, `fts3tokenize`, `fts5vocab`, `rtree_i32`, `sqlite_stmt` and
+`dbstat` are on both.
+
+### `sqlite_sequence` and `sqlite_stat*` do not arrive as change events
+
+Recorded either way because "we never saw one" and "we never looked" are
+indistinguishable a month later. Both libraries, 2026-09-09:
+
+- Inserting into a table with `INTEGER PRIMARY KEY AUTOINCREMENT` produces one
+  change event, for that table. `sqlite_sequence` is written by that insert and
+  **no** event names it. A second autoincrement table behaved the same.
+- `ANALYZE` produces **no** change events at all — nothing names `sqlite_stat1`
+  or any other `sqlite_stat*` table.
+
+`PRAGMA table_list` reports `sqlite_sequence`, `sqlite_stat1`, `sqlite_schema`
+and `sqlite_temp_schema` as plain `table`, so nothing distinguishes them from
+application tables there either. If they ever do start arriving, they will look
+like ordinary tables and will need filtering by name.
+
+### Below the 3.37 floor, the pragma fails silently
+
+SQLite answers an unrecognised pragma with an **empty result set**, not an
+error: `PRAGMA nonexistent_pragma_xyz` returns zero rows on both libraries. A
+pre-3.37 library would therefore make `PRAGMA table_list` look like a database
+with no tables in it, and every attribution question would get a confidently
+wrong answer. The distinguisher is that `table_list` on any open connection
+reports at least the `sqlite_schema` row, so zero rows is unambiguous evidence
+that the pragma is not recognised. Both libraries here are above the floor;
+`src/schema_map.ts` checks anyway, because the check costs one comparison and
+the failure mode is silent.
+
+### Schemas are part of the identity
+
+A virtual table created as `temp.tv` puts its shadows in the `temp` schema, and
+`table_list` reports them with `schema = 'temp'` and names of exactly the same
+shape as `main`'s. Change events carry the schema too (`Change.db`). A map keyed
+by table name alone will merge a `main` table with a `temp` one of the same
+name.
 
 ## The record of the divergence (2026-09-09)
 

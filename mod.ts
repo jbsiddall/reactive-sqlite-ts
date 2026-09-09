@@ -47,3 +47,16 @@ export type {
 export { formatEvent, jsonReplacer } from "./src/format.ts";
 
 export { resolveLibPath } from "./src/lib_path.ts";
+
+export {
+  captureSchemaMap,
+  SchemaMap,
+  SchemaMapError,
+} from "./src/schema_map.ts";
+
+export type {
+  ListedTable,
+  Resolution,
+  SchemaSource,
+  TableRef,
+} from "./src/schema_map.ts";
