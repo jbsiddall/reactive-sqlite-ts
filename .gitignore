@@ -1,0 +1,45 @@
+# Compiled native artifacts are NOT committed. A libsqlite3 build is ~1.5MB
+# stripped and much larger unstripped, it is per-platform and per-libc, and a
+# binary in git can never be audited in review. CI builds or installs one; see
+# CONTRIBUTING.md for the local recipe. Nothing in this repo should ever need a
+# checked-in .so.
+vendor/
+build/
+dist/
+*.so
+*.so.*
+*.dylib
+*.dll
+*.o
+*.a
+*.lib
+
+# SQLite amalgamation sources fetched to build a library with
+# SQLITE_ENABLE_PREUPDATE_HOOK. Reproducible from a URL + checksum, so they are
+# a download, not source.
+sqlite-amalgamation-*/
+sqlite-amalgamation-*.zip
+
+# Databases produced by examples and tests, and the WAL/SHM files beside them.
+*.db
+*.sqlite
+*.sqlite3
+*-wal
+*-shm
+
+# Deno's module/plug cache when it is pinned into the workspace (CI does this
+# so the driver's downloaded library, if any, is cacheable).
+.deno/
+deno_dir/
+coverage/
+*.lcov
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local environment
+.env
+.env.local

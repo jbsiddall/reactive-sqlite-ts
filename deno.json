@@ -1,0 +1,57 @@
+{
+  "name": "@jbsiddall/reactive-sqlite",
+  "version": "0.1.0",
+  "license": "MIT",
+  "exports": {
+    ".": "./mod.ts"
+  },
+  "//libsqlite3": [
+    "Every task that touches the library needs --unstable-ffi --allow-ffi and,",
+    "critically, a DENO_SQLITE_PATH pointing at the SAME libsqlite3 the driver",
+    "loads. @db/sqlite reads DENO_SQLITE_PATH once at import time and otherwise",
+    "downloads its own prebuilt library into $DENO_DIR/plug/. If our FFI dlopens",
+    "a different file, the sqlite3* handle we borrow belongs to another build",
+    "and the process dies of SIGSEGV — exit 139, no message. The tasks do not",
+    "set DENO_SQLITE_PATH for you: it is host-specific, and silently guessing it",
+    "is exactly the mistake that segfaults. Export it, or let the library's path",
+    "resolution pick a system library and pass that same value to the FFI.",
+    "--allow-net is present because the driver falls back to downloading its",
+    "library when DENO_SQLITE_PATH is unset; with it set, nothing is fetched."
+  ],
+  "tasks": {
+    "fmt": "deno fmt",
+    "lint": "deno lint",
+    "check": "deno fmt --check . && deno lint . && deno check",
+    "test": {
+      "description": "The in-process suite. Needs a libsqlite3 (see //libsqlite3).",
+      "command": "deno test --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write --allow-net"
+    },
+    "test:crash": {
+      "description": "The crash matrix: every case runs in its OWN child process and is asserted on its exit code, so a genuine segfault (139) can never be mistaken for a pass. --allow-run is unscoped because the child is Deno.execPath(), known only at runtime; the only program spawned is this same Deno binary.",
+      "command": "deno run --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write --allow-net --allow-run test/suite.ts"
+    }
+  },
+  "lint": {
+    "rules": {
+      "tags": ["recommended"]
+    }
+  },
+  "compilerOptions": {
+    "strict": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitReturns": true,
+    "noUncheckedIndexedAccess": true
+  },
+  "imports": {
+    "@db/sqlite": "jsr:@db/sqlite@^0.12.0"
+  },
+  "publish": {
+    "exclude": [
+      ".github/",
+      "test/",
+      "examples/",
+      "CONTRIBUTING.md"
+    ]
+  }
+}

@@ -1,0 +1,131 @@
+# Type check and both suites run against real FFI. They need `mod.ts`,
+# `test/` and the `deno.json` tasks that point at them; until the source
+# lands, the lint/check/test steps have nothing to work on and will fail.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    # ubuntu-24.04 is pinned rather than ubuntu-latest because the whole test
+    # run depends on a specific system libsqlite3, and "latest" silently
+    # changing its distro would change that library underneath us.
+    #
+    # macOS/arm64 is not in the matrix yet. What it would need: Apple's
+    # /usr/lib/libsqlite3.dylib lives only in the dyld shared cache and is
+    # built WITHOUT SQLITE_ENABLE_PREUPDATE_HOOK, so the preupdate tests
+    # cannot run against it. A macOS leg therefore has to `brew install
+    # sqlite` and point DENO_SQLITE_PATH at
+    # /opt/homebrew/opt/sqlite/lib/libsqlite3.dylib (Intel runners:
+    # /usr/local/opt/sqlite/lib/libsqlite3.dylib) — and Homebrew's build also
+    # omits the preupdate hook, so a fully green macOS leg needs a SQLite
+    # amalgamation compiled here with -DSQLITE_ENABLE_PREUPDATE_HOOK. Same for
+    # Windows, plus a .dll and a different loader path.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      # Ubuntu 24.04 ships SQLite 3.45.x built with SQLITE_ENABLE_PREUPDATE_HOOK
+      # (verified: the sqlite3_preupdate_* symbols are exported from
+      # libsqlite3.so.0). libsqlite3-0 is normally already present; installing
+      # it explicitly makes the dependency visible instead of incidental.
+      - name: Install libsqlite3
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libsqlite3-0
+
+      # One library, chosen here, used by BOTH the @db/sqlite driver and our own
+      # dlopen. @db/sqlite reads DENO_SQLITE_PATH once at import time and
+      # otherwise downloads its own prebuilt library; if the two differ, the
+      # sqlite3* handle we borrow belongs to a foreign build and the process
+      # dies of SIGSEGV — exit 139, no stack, no message. Setting it in
+      # GITHUB_ENV makes every later step in this job inherit the same value.
+      - name: Pin DENO_SQLITE_PATH
+        run: |
+          set -euo pipefail
+          LIB=/usr/lib/x86_64-linux-gnu/libsqlite3.so.0
+          test -f "$LIB" || { echo "::error::no libsqlite3 at $LIB"; exit 1; }
+          echo "DENO_SQLITE_PATH=$LIB" >> "$GITHUB_ENV"
+          echo "using $LIB"
+
+      # The hooks this library exists to expose have to actually be in the
+      # library we just pinned. A missing symbol is a build-flag problem, and
+      # it is far better to say so here than to have a test fail obscurely.
+      - name: Verify the library exports the hook symbols
+        run: |
+          set -euo pipefail
+          SYMS=$(nm -D --defined-only "$DENO_SQLITE_PATH")
+          for s in sqlite3_update_hook sqlite3_commit_hook sqlite3_rollback_hook \
+                   sqlite3_wal_hook sqlite3_trace_v2 sqlite3_progress_handler \
+                   sqlite3_busy_handler sqlite3_preupdate_hook; do
+            echo "$SYMS" | grep -q " $s\$" || { echo "::error::$DENO_SQLITE_PATH does not export $s"; exit 1; }
+          done
+          echo "all hook symbols present"
+
+      - name: deno fmt --check
+        run: deno fmt --check
+
+      - name: deno lint
+        run: deno lint
+
+      - name: deno check
+        run: deno check
+
+      # Proves, before any suite runs, that the driver and our FFI really did
+      # load the same SQLite. If this passes and a later suite still segfaults,
+      # the bug is ours; if this fails, the environment is wrong. Either way no
+      # suite can "pass" by quietly not exercising FFI at all.
+      - name: FFI/driver agreement smoke test
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/smoke.ts" <<'TS'
+          const lib = Deno.env.get("DENO_SQLITE_PATH");
+          if (!lib) throw new Error("DENO_SQLITE_PATH is not set");
+          const ffi = Deno.dlopen(lib, {
+            sqlite3_libversion: { parameters: [], result: "pointer" },
+          });
+          const ptr = ffi.symbols.sqlite3_libversion();
+          if (ptr === null) throw new Error("sqlite3_libversion returned NULL");
+          const viaFfi = new Deno.UnsafePointerView(ptr).getCString();
+          const { Database } = await import("jsr:@db/sqlite@0.12");
+          const db = new Database(":memory:");
+          const viaDriver =
+            db.prepare("select sqlite_version() as v").get<{ v: string }>()!.v;
+          db.close();
+          ffi.close();
+          console.log(`ffi=${viaFfi} driver=${viaDriver} lib=${lib}`);
+          if (viaFfi !== viaDriver) {
+            throw new Error(
+              `libsqlite3 mismatch: FFI ${viaFfi} vs driver ${viaDriver}. The FFI tests would SIGSEGV.`,
+            );
+          }
+          TS
+          deno run --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write --allow-net "$RUNNER_TEMP/smoke.ts"
+
+      - name: Tests
+        run: deno task test
+
+      # Runs each crash case in its own child process and asserts on the exit
+      # code, so a real segfault (139) cannot be reported as a pass.
+      - name: Crash matrix
+        run: deno task test:crash
