@@ -482,8 +482,59 @@ publishing what it managed to see.
 ### Only the first statement of a multi-statement string is compiled
 
 `SELECT x FROM m; SELECT z FROM tmp` reports `read(m, x, main, null)` and
-nothing about `tmp`. Nothing in the driver exposes the unused tail, so this
-cannot be detected and is a stated precondition rather than a downgrade.
+nothing about `tmp`. The driver accepts the string without complaint:
+`db.prepare("SELECT x FROM m; NOT SQL AT ALL")` does not throw.
+
+### The unused tail IS reachable, two ways (2026-09-09, 3.45.1 and 3.53.4)
+
+An earlier note here said the tail could not be detected. That was wrong, and it
+had shipped as a stated precondition on a call that returned a confident
+`complete` set missing a table.
+
+- **`sqlite3_prepare_v2`'s `pzTail`** reports where the unused text begins.
+  Measured directly over FFI:
+  `"INSERT INTO a VALUES (1); INSERT INTO b VALUES
+  (2)"` → tail
+  `" INSERT INTO b VALUES (2)"`; `"SELECT x FROM a;"` → tail `""`;
+  `"SELECT x FROM a; -- note"` → tail `" -- note"`; and, the case a scan for `;`
+  gets wrong, `"SELECT x FROM a WHERE x = ';'"` → tail `""`.
+- **`sqlite3_sql(stmt)`**, which the driver already exposes as the public getter
+  `Statement.sql`, returns exactly the text SQLite consumed — verbatim, leading
+  whitespace included, and always a byte-exact prefix of what was passed.
+  `"  SELECT x FROM a ; SELECT y FROM b"` → `"  SELECT x FROM a ;"`. The rest of
+  the input is the tail, obtained without recompiling anything and therefore
+  without firing the authorizer a second time.
+
+### Whitespace, comments and a bare `;` compile to no statement at all
+
+This is what lets the "is there another statement?" question be handed back to
+SQLite instead of being lexed. Preparing each of `""`, `"   "`, `" -- note"`,
+`"\n/* c */\n"`, `";"` and `" ; "` returns `SQLITE_OK` with a **NULL**
+`sqlite3_stmt*`; the driver surfaces that as a `Statement` whose `unsafeHandle`
+is `null`, and `finalize()` on it is safe. `" SELECT y FROM b"` returns OK with
+a non-NULL statement, and `" NOT SQL AT ALL"` returns `SQLITE_ERROR` with
+`near "NOT": syntax error`. Those three answers are the whole classifier.
+
+### What a dependency extraction costs (2026-09-09, both libraries)
+
+| per call                                       | 3.45.1   | 3.53.4   |
+| ---------------------------------------------- | -------- | -------- |
+| extract, no `withEvents` registration held     | 3.52 ms  | 3.57 ms  |
+| extract, a registration already held           | 0.027 ms | 0.026 ms |
+| bare `SELECT 1` prepare + finalize             | 0.005 ms | 0.005 ms |
+| `withEvents` attach + dispose, nothing between | 3.45 ms  | 3.63 ms  |
+
+The cost is the attach, not the extraction: a caller that extracts in a loop
+with nothing else holding a registration pays a dlopen-class cost per statement,
+about 130x the same call made while a registration is open. A negative result
+worth recording: caching inside the extractor would buy nothing, because the
+probe it performs is 0.1% of the attach-path call.
+
+`Deno.dlopen` of just `sqlite3_prepare_v2` and `sqlite3_finalize`, plus a
+`close()`, measured 0.57 ms / 0.59 ms — which is why the tail is read through
+the driver's own `Statement.sql` rather than a private dlopen of `pzTail`: a
+private one would have turned the 0.027 ms held-registration call into 0.6 ms,
+and `Statement.sql` needs no new FFI at all.
 
 ### A schema change re-fires the authorizer at step time, with new dependencies
 

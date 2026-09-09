@@ -100,10 +100,23 @@
  * ## Stated limits, measured rather than assumed
  *
  * - **Only the first statement of a multi-statement string is compiled**, so
- *   `SELECT x FROM m; SELECT z FROM tmp` reports `m` and never `tmp`
- *   (measured). This module cannot detect a trailing statement - nothing in
- *   the driver exposes the unused tail - so it is a documented precondition,
- *   not a downgrade. Pass one statement.
+ *   `SELECT x FROM m; SELECT z FROM tmp` can only ever report `m`. That is a
+ *   *downgrade*, not a precondition. A precondition the code cannot check, on
+ *   an input a caller produces by pasting two statements, is the silent-
+ *   staleness bug with a note attached: this exact string returned a confident
+ *   `"complete"` set missing `tmp` until the tail check below existed.
+ *
+ *   The tail is located by the library rather than by scanning for `;`, which
+ *   is wrong for `SELECT x FROM a WHERE x = ';'` (measured: that is one
+ *   statement, and comes out `"complete"`). `Statement.sql` is
+ *   `sqlite3_sql()`, which returns exactly the text SQLite consumed, so what
+ *   follows it is the unused tail. The tail is then handed back to SQLite:
+ *   whitespace, comments and a bare `;` compile to *no statement at all*
+ *   (measured on 3.45.1 and 3.53.4 - `sqlite3_prepare_v2` returns `SQLITE_OK`
+ *   with a NULL `sqlite3_stmt*`), and those are the forms that stay
+ *   `"complete"`. A tail that compiles to a statement, or that does not
+ *   compile at all, downgrades to `"unknown"`. The line between "nothing" and
+ *   "another statement" is therefore drawn by SQLite's own parser, not here.
  * - **The set describes the statement as compiled now.** If the schema
  *   changes, SQLite re-compiles a prepared statement transparently at the next
  *   step, and it was measured that the authorizer fires *again* at that point
@@ -317,11 +330,107 @@ function resolveAccess(
 }
 
 /**
+ * Where the compiled statement stopped, if that can be established.
+ *
+ * `"no-statement"` is not an error: a string of only whitespace or comments
+ * compiles to no statement at all, and there is then no tail to speak of.
+ */
+type TailReading =
+  | { readonly kind: "no-statement" }
+  | { readonly kind: "tail"; readonly text: string }
+  | { readonly kind: "unlocatable"; readonly consumed: string };
+
+/**
+ * The part of `sql` the compile did not use.
+ *
+ * `consumed` is `sqlite3_sql()` for the statement that was prepared - the text
+ * SQLite actually took, verbatim, leading whitespace included (measured). A
+ * scan for `;` is the wrong way to compute this, because a `;` inside a string
+ * literal is not a statement boundary; asking the library is not.
+ *
+ * The prefix check is not paranoia about SQLite: it is what makes the slice
+ * below safe if `consumed` is ever anything but the text that went in. When it
+ * does not hold, the answer is downgraded rather than guessed.
+ */
+function tailAfter(sql: string, consumed: string | null): TailReading {
+  if (consumed === null) return { kind: "no-statement" };
+  if (!sql.startsWith(consumed)) return { kind: "unlocatable", consumed };
+  return { kind: "tail", text: sql.slice(consumed.length) };
+}
+
+/**
+ * Whether `tail` is more than nothing, and the limit to record if it is.
+ *
+ * SQLite draws the line, not a lexer here: preparing a string of whitespace,
+ * comments or bare `;` returns success with no statement, so those are the
+ * forms that leave a result `"complete"`. Anything that compiles to a
+ * statement, or that fails to compile, is text whose tables are not in the set
+ * and so is a downgrade either way - a trailing `NOT SQL AT ALL` must no more
+ * pass for a single statement than a trailing `SELECT` does.
+ *
+ * This prepares the tail on the caller's connection, so a caller's own
+ * `authorize` listener sees the trailing statement's accesses. It is compiled
+ * and finalized, never stepped. The extractor is not capturing at this point,
+ * so the tail's tables never reach the set - naming them would be a different
+ * lie from omitting them, and the caller asked about one statement.
+ */
+function tailLimit(db: Database, tail: string): string | null {
+  if (tail === "") return null;
+  let handle: Deno.PointerValue;
+  let st;
+  try {
+    st = db.prepare(tail);
+  } catch (cause) {
+    return `the statement is followed by ${
+      JSON.stringify(tail)
+    }, which did not compile on its own (${
+      cause instanceof Error ? cause.message : String(cause)
+    }); only the first statement was compiled, so any table it names is missing from the set`;
+  }
+  try {
+    handle = st.unsafeHandle;
+  } finally {
+    st.finalize();
+  }
+  if (handle === null) return null;
+  return `the statement is followed by a further statement, ${
+    JSON.stringify(tail)
+  }; only the first statement of a string is compiled, so the tables that one touches are missing from the set`;
+}
+
+/**
  * Compile `sql` on `db` and report the tables it touches.
  *
  * The statement is prepared and immediately finalized; it is never stepped, so
- * nothing is read and nothing is written. Pass exactly one statement - see the
- * module doc on multi-statement strings.
+ * nothing is read and nothing is written.
+ *
+ * `sql` should be one statement. A string carrying anything more than
+ * whitespace, comments or a bare `;` after the first statement is not refused,
+ * but it never comes back `"complete"`: only the first statement is compiled,
+ * so the rest of the tables would be missing from an answer that claimed to be
+ * whole. It comes back `"unknown"` with the tail named in `limits`.
+ *
+ * ## What a call costs
+ *
+ * Measured 2026-09-09 on SQLite 3.45.1 and 3.53.4, within noise of each other:
+ *
+ * | per call | 3.45.1 | 3.53.4 |
+ * | --- | --- | --- |
+ * | no {@linkcode withEvents} registration held on `db` | 3.52 ms | 3.57 ms |
+ * | a registration already held | 0.027 ms | 0.026 ms |
+ *
+ * The difference is not this function. It is `withEvents` attaching and
+ * detaching, which dlopens libsqlite3 and builds every FFI callback: 3.45 ms
+ * and 3.63 ms for an attach/dispose pair with nothing in between. Calling this
+ * in a loop over many statements with nothing else holding a registration pays
+ * that dlopen-class cost once *per statement*, roughly 130x the same call made
+ * while a registration is open, for no visible reason.
+ *
+ * The remedy is to hold one: take a {@linkcode withEvents} subscription for as
+ * long as the connection is in use and dispose of it at the end. This module
+ * deliberately caches nothing to hide that - the attach is the cost, and the
+ * object that will hold a registration for a connection's lifetime belongs to
+ * the registry, not here.
  *
  * @throws {DependencyError} if the connection cannot report authorize events.
  */
@@ -397,9 +506,15 @@ export function extractDependencies(
       );
     }
     let failure: Error | null = null;
+    let tail: TailReading = { kind: "no-statement" };
     capture = true;
     try {
-      db.prepare(sql).finalize();
+      const st = db.prepare(sql);
+      try {
+        tail = tailAfter(sql, st.unsafeHandle === null ? null : st.sql);
+      } finally {
+        st.finalize();
+      }
     } catch (cause) {
       failure = cause instanceof Error ? cause : new Error(String(cause));
     } finally {
@@ -409,6 +524,19 @@ export function extractDependencies(
     // reached yet - a denied first table truncates the rest, measured - so the
     // partial set is withheld rather than published as an answer.
     if (failure !== null) return { kind: "failed", error: failure };
+
+    // Only now, and never before `failure` is settled: a caller's `deny()`
+    // fails the compile, and a failed compile has no meaningful tail.
+    if (tail.kind === "unlocatable") {
+      limits.push(
+        `SQLite reported consuming ${
+          JSON.stringify(tail.consumed)
+        }, which is not a prefix of the statement passed, so whether anything follows the first statement could not be determined`,
+      );
+    } else if (tail.kind === "tail") {
+      const limit = tailLimit(db, tail.text);
+      if (limit !== null) limits.push(limit);
+    }
 
     const r = reads.drain();
     const w = writes.drain();

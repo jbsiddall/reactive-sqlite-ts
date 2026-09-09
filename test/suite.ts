@@ -4093,6 +4093,135 @@ const SEMANTIC: Record<string, () => void> = {
     db.close();
   },
 
+  // ---------------------------------------------- multi-statement strings
+  //
+  // The defect these were written for: `SELECT x FROM t; SELECT y FROM u`
+  // returned `complete` with `u` missing. A confident set that is short by one
+  // table is exactly the silent-staleness bug, and it arrives from an input a
+  // caller produces by pasting two statements.
+  //
+  // The controls are the trailing forms that are NOT a second statement -
+  // a bare `;`, a comment, whitespace. If the check fired on those it would
+  // downgrade almost every statement anyone writes, and `unknown` everywhere
+  // is `complete` nowhere.
+
+  "dependencies M1: a trailing statement is never reported as complete"() {
+    const db = memory();
+    db.exec("CREATE TABLE u(w)");
+    const map = captureSchemaMap(db);
+    const opts = { schemaMap: map, libPath: LIB };
+
+    // CONTROLS: each half on its own is complete and names its own table.
+    check(
+      "  first half alone",
+      depsOf(extractDependencies(db, "SELECT v FROM t", opts)),
+      {
+        kind: "complete",
+        reads: ["main.t"],
+        writes: [],
+      },
+    );
+    check(
+      "  second half alone",
+      depsOf(extractDependencies(db, "SELECT w FROM u", opts)),
+      {
+        kind: "complete",
+        reads: ["main.u"],
+        writes: [],
+      },
+    );
+
+    const both = extractDependencies(
+      db,
+      "SELECT v FROM t; SELECT w FROM u",
+      opts,
+    );
+    check("  the pair is not complete", both.kind, "unknown");
+    // The set that IS returned is still the first statement's, and it must not
+    // silently gain the second statement's tables either: the caller asked
+    // about one statement and gets told the answer is short, not a guess.
+    check("  and it carries the first statement's table only", depsOf(both), {
+      kind: "unknown",
+      reads: ["main.t"],
+      writes: [],
+    });
+    check(
+      "  and names the tail",
+      both.kind === "unknown" &&
+        both.limits.some((l) => l.includes("SELECT w FROM u")),
+      true,
+    );
+
+    // Writes take the same route, and a write missed is the worse direction.
+    const writes = extractDependencies(
+      db,
+      "INSERT INTO t(v) VALUES ('a'); INSERT INTO u(w) VALUES ('b')",
+      opts,
+    );
+    check("  two writes is not complete", writes.kind, "unknown");
+    check("  and u is absent from the set", depsOf(writes), {
+      kind: "unknown",
+      reads: [],
+      writes: ["main.t"],
+    });
+
+    db.close();
+  },
+
+  "dependencies M2: a tail that is nothing stays complete"() {
+    const db = memory();
+    const map = captureSchemaMap(db);
+    const opts = { schemaMap: map, libPath: LIB };
+    // Each of these is ONE statement. Measured on 3.45.1 and 3.53.4: SQLite
+    // compiles a tail of whitespace, comments or a bare `;` to no statement at
+    // all, which is how the line is drawn without lexing anything here.
+    for (
+      const sql of [
+        "SELECT v FROM t",
+        "SELECT v FROM t;",
+        "SELECT v FROM t;  ",
+        "SELECT v FROM t; -- a note",
+        "SELECT v FROM t;\n/* a note */\n",
+        "SELECT v FROM t; ; ;",
+        // The reason a scan for `;` is the wrong implementation: this one is a
+        // single statement whose text contains a semicolon.
+        "SELECT v FROM t WHERE v = ';'",
+      ]
+    ) {
+      check(
+        `  ${JSON.stringify(sql)} is complete`,
+        depsOf(extractDependencies(db, sql, opts)),
+        { kind: "complete", reads: ["main.t"], writes: [] },
+      );
+    }
+    db.close();
+  },
+
+  "dependencies M3: a tail that is not SQL is not a single statement either"() {
+    const db = memory();
+    const map = captureSchemaMap(db);
+    const opts = { schemaMap: map, libPath: LIB };
+    // The driver accepts this string and compiles the first statement, so
+    // without a tail check it came out `complete`. It is garbage, not nothing.
+    const d = extractDependencies(db, "SELECT v FROM t; NOT SQL AT ALL", opts);
+    check("  not complete", d.kind, "unknown");
+    check(
+      "  and says the tail did not compile",
+      d.kind === "unknown" &&
+        d.limits.some((l) => l.includes("NOT SQL AT ALL")),
+      true,
+    );
+    // A trailing statement that is a no-table statement is still a statement:
+    // the downgrade is about what was not compiled, not about what it touched.
+    const one = extractDependencies(db, "SELECT v FROM t; SELECT 1", opts);
+    check("  a trailing SELECT 1 also downgrades", one.kind, "unknown");
+    // And a first statement touching nothing with a real tail must not come
+    // back "none" - "none" means "never needs refreshing".
+    const none = extractDependencies(db, "SELECT 1; SELECT v FROM t", opts);
+    check("  a tail after SELECT 1 is not 'none'", none.kind, "unknown");
+    db.close();
+  },
+
   "SqliteHooksError is exported and instanceof-able"() {
     let caught: unknown;
     try {

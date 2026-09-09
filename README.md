@@ -1078,9 +1078,13 @@ table canonicalises** to the virtual table that owns it.
 
 **What it misses, measured rather than assumed:**
 
-- Only the first statement of a multi-statement string is compiled. Nothing in
-  the driver exposes the unused tail, so this is a precondition, not a
-  downgrade: pass one statement.
+- Only the first statement of a multi-statement string is compiled, so anything
+  after it downgrades the result to `"unknown"` — never `"complete"` with the
+  rest of the tables quietly missing. What counts as "after it" is decided by
+  SQLite, not by scanning for `;`: the tail is whatever `Statement.sql` did not
+  consume, and it is handed back to SQLite to compile. Whitespace, comments and
+  a bare `;` compile to no statement, so `SELECT x FROM t; -- note` is still
+  `"complete"`, and so is `SELECT x FROM t WHERE x = ';'`.
 - The answer describes the statement **as compiled under the current schema**.
   If the schema changes, SQLite re-compiles a prepared statement at the next
   step and the authorizer fires again with the _new_ dependencies — a view
@@ -1093,6 +1097,14 @@ table canonicalises** to the virtual table that owns it.
   per connection. Rather than answer `"none"` for everything,
   `extractDependencies` compiles a fixed `SELECT 1` first and throws
   `DependencyError` if no authorize event arrives.
+
+**What a call costs.** Measured 2026-09-09 on SQLite 3.45.1 and 3.53.4: 3.5 ms
+per call with no `withEvents` registration held on the connection, and 0.027 ms
+with one already held. The difference is `withEvents` attaching and detaching —
+a dlopen and a full set of FFI callbacks — not the extraction, which is about
+0.005 ms of prepare. Extracting in a loop with nothing else holding a
+registration therefore pays that cost per statement, roughly 130x. Hold one
+subscription open for as long as the connection is in use.
 
 ## Portability
 
