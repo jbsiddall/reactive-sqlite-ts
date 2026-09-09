@@ -157,6 +157,11 @@ text says otherwise.
 
 ### Detection is authoritative; attribution is derived
 
+Everything in this section was measured against **`fts5` and `rtree` only**.
+They are the two virtual table modules present on both libraries; see "Which
+virtual table modules are available" below. No vector module is reachable here,
+so nothing below is evidence about `vec0` or about any module not named.
+
 `PRAGMA table_list` (SQLite 3.37+) reports a `type` column of `table`,
 `virtual`, `shadow` or `view`. For `CREATE VIRTUAL TABLE ft USING fts5(body)` it
 reports `ft` as `virtual` and `ft_config`, `ft_content`, `ft_data`,
@@ -173,8 +178,30 @@ The two agree, in the strongest sense that could be arranged. With
 `PRAGMA writable_schema=ON`, the `sqlite_schema` row for `ft` deleted, and the
 database closed and reopened, all five of its shadow tables come back reported
 as `type = 'table'`. `type = 'shadow'` therefore _entails_ a live owning virtual
-table, so the derivation is total over the shadow set and a shadow with no
-derivable owner was not reachable by any route tried here.
+table, so the derivation is total over the shadow set.
+
+An unattributable shadow -- a table SQLite classifies as `shadow` whose owner
+cannot be derived -- was not reachable, but "not reachable" here means "these
+routes were tried and none produced one", not "proved impossible". The routes
+tried, both libraries:
+
+1. `DROP TABLE ft_data`, dropping a shadow table directly while its virtual
+   table lives. Succeeds; the remaining shadows stay `shadow`.
+2. `DROP TABLE ft`, dropping the virtual table. Takes every shadow with it,
+   leaving nothing behind to be unattributable.
+3. `ALTER TABLE ft RENAME TO gt`. Refused with `SQL logic error` on both
+   libraries, so a rename cannot separate a shadow from its owner's name.
+4. `PRAGMA writable_schema=ON`, `DELETE FROM sqlite_schema` for `ft`'s own row,
+   then reopening the database. This is the one that gets furthest, and it is
+   what establishes the entailment: the shadows survive and are reclassified as
+   plain `table`.
+5. `CREATE TABLE ft_notes(x)` and `CREATE TABLE ft_sub_notes(x)` beside a
+   virtual table, to see whether a hand-made table can be classified as a
+   shadow. Both are reported as plain `table`.
+
+That is five routes, not an exhaustive search of what SQLite can be made to do.
+The `unattributable-shadow` branch in `src/schema_map.ts` is therefore
+defensive, and deleting it needs a stronger argument than this paragraph.
 
 **Measured negative, recorded so it is not mistaken for an untested claim:**
 last-underscore and longest-virtual-table-prefix could not be told apart on
@@ -208,34 +235,58 @@ shadows, no virtual table. A dependency set collected at prepare time and a
 change set collected at commit time therefore have no name in common for any
 virtual table unless one side is canonicalised.
 
-### `tables_used` is not an option for virtual tables
+### `tables_used` reports nothing for a virtual table, and is not everywhere
 
-The `tables_used` eponymous virtual table (`SQLITE_ENABLE_BYTECODE`) exists on
-the vendored 3.53.4 build and **not** on the system 3.45.1 build, where it is
-`no such table: tables_used`.
+Established fact, with the measurement attached rather than only the conclusion
+it supports. This one has now been understated twice by a summary that outlived
+its measurement -- first as "returns no rows for an FTS5 MATCH", which is true
+and much narrower than the truth -- so the queries and both libraries' answers
+are recorded here in full and the conclusion is written underneath them.
 
-Where it does exist it reports nothing at all for a virtual table — not only for
-`MATCH`. Measured on 3.53.4:
+Measured 2026-09-09, `@db/sqlite` 0.13.0 under `resolveLibPath()`, schema
+`CREATE VIRTUAL TABLE ft USING fts5(body)` with one row inserted, plus
+`CREATE TABLE plain(x)`. Each query run as
+`SELECT * FROM tables_used(<the statement>)`.
 
-| statement                                 | `tables_used` rows |
-| ----------------------------------------- | ------------------ |
-| `SELECT * FROM plain`                     | `main.plain`       |
-| `SELECT * FROM ft`                        | none               |
-| `SELECT * FROM ft WHERE ft MATCH 'hello'` | none               |
-| `INSERT INTO ft(body) VALUES('z')`        | none               |
-| `SELECT * FROM ft_content`                | `main.ft_content`  |
+| statement passed to `tables_used`         | system 3.45.1                | vendored 3.53.4   |
+| ----------------------------------------- | ---------------------------- | ----------------- |
+| `SELECT * FROM plain`                     | `no such table: tables_used` | `main.plain`      |
+| `SELECT * FROM ft`                        | `no such table: tables_used` | no rows           |
+| `SELECT * FROM ft WHERE ft MATCH 'hello'` | `no such table: tables_used` | no rows           |
+| `INSERT INTO ft(body) VALUES('z')`        | `no such table: tables_used` | no rows           |
+| `SELECT * FROM ft_content`                | `no such table: tables_used` | `main.ft_content` |
+
+Two separate facts, either of which alone rules it out as a dependency source
+here:
+
+1. **It is absent from the system build.** `tables_used` is the eponymous
+   virtual table that comes with `SQLITE_ENABLE_BYTECODE`. The vendored 3.53.4
+   build is compiled with it; the system 3.45.1 build is not, and every query
+   above fails outright there. `PRAGMA module_list` agrees: `bytecode` and
+   `tables_used` appear only on the vendored build.
+2. **Where it exists it is silently empty for the whole virtual-table class,**
+   not just for `MATCH`. A plain `SELECT * FROM ft` and an `INSERT INTO ft` both
+   return no rows, while the same query against the shadow table `ft_content` or
+   against an ordinary table returns the expected row. It returns an empty
+   result rather than an error, so a caller that trusts it concludes the
+   statement depends on nothing.
+
+The measurement is what to re-scope if this is revisited; do not re-derive the
+scope from the sentence. Anything narrower than the table above is a summary,
+and summaries of this fact have been wrong twice.
 
 ### Which virtual table modules are available
 
 `PRAGMA module_list`, both libraries: `fts5` and `rtree` are present on both.
-`vec0` is present on neither (`no such module: vec0`) — there is no sqlite-vec
-extension on this machine, so the vector case is untested here rather than
-known-good — `CREATE VIRTUAL TABLE v USING vec0(...)` fails with
-`no such module: vec0` on both. The vendored build additionally carries
-`geopoly`, `bytecode` and `tables_used`; the system build additionally carries
-`json_each` and `json_tree` as modules, which 3.53.4 no longer lists. `fts3`,
-`fts4`, `fts4aux`, `fts3tokenize`, `fts5vocab`, `rtree_i32`, `sqlite_stmt` and
-`dbstat` are on both.
+`vec0` is present on neither: `CREATE VIRTUAL TABLE v USING vec0(...)` fails
+with `no such module: vec0` on both, because no sqlite-vec extension is
+installed on this machine. Every claim in this file about shadow tables is
+therefore a claim about `fts5` and `rtree`; the vector case is **untested**, not
+known-good, and it is exactly the case someone will reach for. The vendored
+build additionally carries `geopoly`, `bytecode` and `tables_used`; the system
+build additionally carries `json_each` and `json_tree` as modules, which 3.53.4
+no longer lists. `fts3`, `fts4`, `fts4aux`, `fts3tokenize`, `fts5vocab`,
+`rtree_i32`, `sqlite_stmt` and `dbstat` are on both.
 
 ### `sqlite_sequence` and `sqlite_stat*` do not arrive as change events
 

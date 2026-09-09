@@ -389,9 +389,12 @@ verified so far.
     `rt_rowid` and `rt_node`). So the change signal arrives under a table name
     no query of yours mentions, and matching events against the tables a query
     reads will never match — silently, and in the direction that fails open.
-    Deriving the owning virtual table from the shadow name is possible in
-    principle (a virtual table `X` owns shadow tables named `X_*`), but this
-    library does not do it and does not pretend to.
+    `captureSchemaMap` (see "Virtual tables change under other names") derives
+    the owning virtual table from the shadow name, using SQLite's own rule, and
+    it is verified against `fts5` and `rtree` specifically -- the two modules
+    present on both libraries here. No vector module is reachable in this
+    project, so `vec0` and anything else unnamed is untested rather than
+    known-good.
 11. **`update_hook` does not fire for WITHOUT ROWID tables.** It is documented
     as reporting rows in a _rowid_ table. `preupdate_hook` does still fire for
     them, so with `preupdate` available the write is visible — just not through
@@ -474,6 +477,7 @@ authorizer is the mirror image: preparing
 `SELECT body FROM ft WHERE ft MATCH
 'hello'` reports `ft` and no shadow table at
 all. Neither source alone can tell you that a query depends on a virtual table.
+Measured on `fts5` and `rtree`; other modules were not tested.
 
 One asymmetry to know if you collect these: _executing_ a write to a virtual
 table also authorizes its shadow tables, because FTS5 prepares its own
@@ -940,7 +944,7 @@ single-character separator. Whatever character you pick can appear in a name.
 A row written into an FTS5 table `ft` arrives on the update hook as
 `ft_content`, `ft_docsize` and `ft_data`, never as `ft`; a `MATCH` over it names
 `ft` when the statement is prepared and those shadow tables when it is stepped.
-Compare the two sets directly and nothing over a virtual table ever matches.
+Compare the two sets directly and nothing over such a table ever matches.
 
 `captureSchemaMap(db)` reads the schema once and answers both directions:
 
@@ -953,11 +957,17 @@ map.resolveTable("orders"); // { kind: "table",  canonical: "orders", ... }
 map.shadowsOf("ft"); // ["ft_config","ft_content","ft_data","ft_docsize","ft_idx"]
 ```
 
-Detection comes from `PRAGMA table_list`, which is SQLite's own classification;
-the owning virtual table is derived from the name, because nothing reports it.
-Where the two disagree the map says so rather than guessing: a table merely
-_named_ like a shadow (`ft_notes` beside `ft`) resolves to itself and is listed
-on `shadowLookalikes`, and a shadow whose owner cannot be derived comes back as
+Detection comes from `PRAGMA table_list`, which is SQLite's own classification
+and covers whatever modules the library was built with; the owning virtual table
+is derived from the name, because nothing reports it. The derivation is verified
+against `fts5` and `rtree` specifically — the two modules present on both
+libraries this project builds against. No vector module is reachable here, so
+`vec0` is untested rather than known-good, and so is any other module: the
+detection half should still hold, the attribution half rests on a naming
+convention that has only been checked on those two. Where the two disagree the
+map says so rather than guessing: a table merely _named_ like a shadow
+(`ft_notes` beside `ft`) resolves to itself and is listed on `shadowLookalikes`,
+and a shadow whose owner cannot be derived comes back as
 `kind: "unattributable-shadow"` carrying no `canonical` field at all, so it
 cannot be mistaken for the ordinary path.
 
