@@ -1,174 +1,153 @@
 # reactive-sqlite
 
-SQLite's hook surface — `update`, `preupdate`, `commit`, `rollback`, WAL,
-`trace`, `progress`, `busy` — as ergonomic, typed JavaScript events, with
-changes batched per transaction and a commit that your code can veto.
+SQLite's C-level hooks — `update`, `preupdate`, `commit`, `rollback` and friends
+— as typed JavaScript events, batched per transaction, with a commit your code
+can veto.
 
-> **Status: early, pre-1.0, API unstable.** `0.x` releases may break anything.
-> Not yet recommended for production. Feedback and issues are very welcome.
+## Why
 
-## Why this exists
+SQLite has exposed change notification in C for decades, but almost none of it
+reaches JavaScript.
+[`better-sqlite3`](https://github.com/WiseLibs/better-sqlite3) is an excellent
+Node library and its API docs list no change-notification methods; an open PR
+([#1337](https://github.com/WiseLibs/better-sqlite3/pull/1337), reviewed
+favourably but unmerged) would add `updateHook`/`commitHook`/`rollbackHook`. In
+Deno, [`@db/sqlite`](https://jsr.io/@db/sqlite) is the main FFI driver and
+declares `sqlite3_update_hook` in its symbol table but exposes no public hook
+API, and `node:sqlite` (Node's builtin, also Deno's) offers `setAuthorizer` and
+the session extension but no update, commit or rollback hook. This library fills
+that one gap and nothing else.
 
-SQLite has had a genuinely good change-notification API since forever.
-`sqlite3_update_hook` tells you which row of which table changed;
-`sqlite3_preupdate_hook` hands you the old and new values; `sqlite3_commit_hook`
-lets you refuse a commit outright. Almost none of that reaches JavaScript. Most
-bindings expose `exec`, `prepare` and little else, so the ecosystem is left
-polling, diffing, wrapping every writer in application-level bookkeeping, or
-tailing the WAL.
-
-This library does one thing: it puts those callbacks in front of you as typed
-events, with the sharp edges guarded. It is deliberately small and deliberately
-unopinionated — the intent is to be a stable base that reactive query layers,
-sync engines, audit logs, cache invalidators and change-data-capture tools can
-build on, rather than to be any of those things itself.
-
-## Capability table
-
-What SQLite itself offers, and therefore what this library can offer. "Veto"
-means the C callback's return value can change what the database does.
-
-| Event                           | C hook                     | Fires before | Fires after | Can veto / abort                                            |
-| ------------------------------- | -------------------------- | ------------ | ----------- | ----------------------------------------------------------- |
-| Row insert / update / delete    | `sqlite3_update_hook`      | no           | yes         | **no** — callback returns `void`                            |
-| Row change with old/new values  | `sqlite3_preupdate_hook`   | yes          | no          | **no** — callback returns `void`                            |
-| Commit                          | `sqlite3_commit_hook`      | yes          | no          | **yes** — non-zero turns it into a rollback                 |
-| Rollback                        | `sqlite3_rollback_hook`    | no           | yes         | no                                                          |
-| Commit landed (synthesised)     | —                          | no           | yes         | n/a — it has already happened                               |
-| WAL frame written               | `sqlite3_wal_hook`         | no           | yes         | no veto; may return an error code and control checkpointing |
-| Statement lifecycle / timing    | `sqlite3_trace_v2`         | both         | both        | no — the return value is reserved                           |
-| Long-running statement progress | `sqlite3_progress_handler` | during       | during      | **yes** — non-zero aborts the statement                     |
-| Lock contention                 | `sqlite3_busy_handler`     | during       | during      | **yes** — decides retry vs `SQLITE_BUSY`                    |
-
-The "commit landed" event has no C hook behind it: SQLite's commit hook runs
-_before_ the commit, so a "it is now durable" notification has to be synthesised
-by the library after the writing call returns.
+> **Status: pre-1.0, incomplete, API unstable.** Not on a registry yet. Some
+> events below are not implemented — see the table.
 
 ## Install
 
+Nothing is published yet. Both lines below describe the first release.
+
 ```sh
-deno add jsr:@jbsiddall/reactive-sqlite
+deno add jsr:@jbsiddall/reactive-sqlite   # planned
+npm  install reactive-sqlite              # planned; no npm package or build exists today
 ```
 
-Registering hooks means calling into `libsqlite3` directly, so the process needs
+Registering hooks means calling `libsqlite3` directly, so a Deno process needs
 FFI permission:
 
 ```sh
-deno run --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write your_app.ts
+deno run --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write app.ts
 ```
 
-### The one setup rule: a single libsqlite3
+### The native library
 
-Your SQLite driver and this library must load **the same** shared library. The
-driver reads `DENO_SQLITE_PATH` once, at import time, and otherwise downloads a
-prebuilt library of its own. If the two end up loading different builds, the
-`sqlite3*` connection handle passed across belongs to a foreign build and the
-process dies of `SIGSEGV` — exit 139, no exception, no message.
-
-So: decide the library first, set `DENO_SQLITE_PATH`, and import the driver
-after that.
+You supply `libsqlite3` yourself and point `DENO_SQLITE_PATH` at it **before**
+importing the driver. Automatic download of a matching library from a GitHub
+Release is planned; it does not exist yet.
 
 ```sh
-# Linux
-export DENO_SQLITE_PATH=/usr/lib/x86_64-linux-gnu/libsqlite3.so.0
-# macOS (Homebrew)
-export DENO_SQLITE_PATH=/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib
+export DENO_SQLITE_PATH=/usr/lib/x86_64-linux-gnu/libsqlite3.so.0            # Linux
+export DENO_SQLITE_PATH=/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib        # macOS
 ```
 
-The library compares `sqlite3_libversion()` against the driver's reported
-`sqlite_version()` and refuses to attach on a mismatch. Matching versions are
-not proof of the same file, but they catch the realistic mistake.
+It must be the _same file_ the driver loads. `@db/sqlite` reads
+`DENO_SQLITE_PATH` once at import time and otherwise downloads a prebuilt
+library of its own; if the two differ, the `sqlite3*` handle passed across
+belongs to a foreign build and the process dies of `SIGSEGV` — exit 139, no
+exception, no message. The library compares `sqlite3_libversion()` against the
+driver's `sqlite_version()` and refuses to attach on a mismatch, which catches
+the realistic mistake but is not proof of one file.
 
 ## Usage
+
+Reject rows that fail validation, by vetoing the commit:
 
 ```ts
 import { Database } from "@db/sqlite";
 import { withEvents } from "@jbsiddall/reactive-sqlite";
 
-const db = new Database("app.db");
+const db = new Database("shop.db");
 
-const sub = withEvents(db, (event) => {
-  switch (event.type) {
-    case "change":
-      // One row, mid-transaction. Do not touch the connection from here.
-      console.log(event.table, event.action, event.rowid);
-      return;
-
-    case "precommit":
-      // Return false to veto: the COMMIT becomes a ROLLBACK.
-      return event.changes.every(isValid);
-
-    case "postcommit":
-      // It has landed; the connection is safe to use again.
-      if (event.coverage !== "complete") refreshEverything();
-      else applyRows(event.changes);
-      return;
-
-    case "rollback":
-      // Discarded — explicitly, by failure, or by a veto.
-      return;
-  }
+withEvents(db, (event) => {
+  if (event.type !== "precommit") return;
+  // Returning false turns the COMMIT into a ROLLBACK.
+  return event.changes.every((c) =>
+    c.table !== "products" || (c.new?.price ?? 0) >= 0
+  );
 });
 
-// ...later
-sub.dispose();
+db.run("INSERT INTO products (name, price) VALUES ('widget', -5)"); // rejected
 ```
 
-A batch's `coverage` says how much of the transaction you were actually shown:
-`"complete"` (every row is present), `"truncated"` (more rows changed than the
-retention limit), or `"unknown"` (nothing was observed — **which is not the same
-as nothing having changed**; see below). Branch on it, and fall back to a full
-refresh rather than assuming an empty change list means an idle transaction.
+**The one surprise:** a bare `INSERT`/`UPDATE`/`DELETE` with no explicit `BEGIN`
+is its own implicit transaction, so vetoing its commit rejects exactly that
+statement. Inside an explicit multi-statement transaction the same veto rolls
+back **the whole transaction**, not just the offending row. SQLite offers no
+row-level veto from any hook (see [Hard limits](#hard-limits)). For true per-row
+rejection, use a `BEFORE` trigger whose `WHEN` clause calls a registered JS
+function and whose body is `RAISE(IGNORE)`: that skips just the offending row
+and lets the rest of the transaction commit.
+
+## Capability table
+
+What SQLite itself allows, and what is built. "Veto" means the C callback's
+return value can change what the database does.
+
+| Event                    | C hook                     | Pre | Post | Veto                    | Status      | Notes                                       |
+| ------------------------ | -------------------------- | --- | ---- | ----------------------- | ----------- | ------------------------------------------- |
+| Row insert/update/delete | `sqlite3_update_hook`      | no  | yes  | no (returns `void`)     | implemented | Blob writes invisible; see limits           |
+| Row change with old/new  | `sqlite3_preupdate_hook`   | yes | no   | no (returns `void`)     | in progress | Needs `SQLITE_ENABLE_PREUPDATE_HOOK`        |
+| Commit                   | `sqlite3_commit_hook`      | yes | no   | **yes** → rollback      | implemented | Scope is the whole transaction, not one row |
+| Rollback                 | `sqlite3_rollback_hook`    | no  | yes  | no                      | implemented |                                             |
+| Commit landed            | — (synthesised)            | no  | yes  | n/a, already happened   | implemented | No C hook: commit hook runs _before_ commit |
+| WAL frame written        | `sqlite3_wal_hook`         | no  | yes  | no; controls checkpoint | not built   |                                             |
+| Statement lifecycle      | `sqlite3_trace_v2`         | yes | yes  | no                      | not built   |                                             |
+| Statement progress       | `sqlite3_progress_handler` | —   | —    | **yes** → aborts stmt   | not built   | Fires during execution                      |
+| Lock contention          | `sqlite3_busy_handler`     | —   | —    | **yes** → retry or busy | not built   | Fires during execution                      |
+
+Only the rows marked _implemented_ can be called today.
+
+## Coverage
+
+Each batch carries a `coverage`: `"complete"` (every row present), `"truncated"`
+(more rows changed than the retention limit), or `"unknown"` (nothing observed —
+**not the same as nothing having changed**). Branch on it, and fall back to a
+full refresh rather than reading an empty change list as an idle transaction.
 
 ## Hard limits
 
-These are properties of SQLite, not of this implementation. No amount of library
-design removes them.
+Properties of SQLite, not of this implementation.
 
-1. **No row-level veto exists — from any hook.** Both `sqlite3_update_hook` and
-   `sqlite3_preupdate_hook` return `void`. There is no way to reject or rewrite
-   an individual row as it is written. The only veto point SQLite offers is the
-   commit hook, which is all-or-nothing for the whole transaction. If you need
-   per-row rejection, that is a `CHECK` constraint, a trigger, or validation in
-   your own write path.
-2. **Incremental blob writes are invisible to `update_hook`.** Writing through a
-   blob handle changes the row and fires the commit hook, but never the update
-   hook. Only `preupdate_hook` sees it, reported as a delete flagged by
+1. **No row-level veto from any hook.** Both `sqlite3_update_hook` and
+   `sqlite3_preupdate_hook` return `void`. The commit hook is the only veto
+   point and is all-or-nothing per transaction.
+2. **Incremental blob writes are invisible to `update_hook`.** Only
+   `preupdate_hook` sees them, reported as a delete flagged by
    `sqlite3_preupdate_blobwrite`.
-3. **`preupdate` requires a library built with `SQLITE_ENABLE_PREUPDATE_HOOK`.**
-   It is off in a stock SQLite build. Debian and Ubuntu's `libsqlite3` enables
-   it; Apple's system SQLite and Homebrew's do not. Where the symbol is absent,
-   the preupdate events simply cannot be offered, and the library says so
-   instead of failing obscurely.
-4. **DDL is not reported as changes.** `CREATE TABLE` and friends write to
-   `sqlite_schema`, which the update hook does not report, so such a transaction
-   commits with an empty change batch.
-5. **Some deletes are not reported either.** SQLite's truncate optimisation
-   (`DELETE FROM t` with no `WHERE`) removes rows without invoking the update
-   hook per row.
-6. **A hook must not use the connection that invoked it.** Reading the database
-   from inside a `change`, `precommit` or `rollback` callback is undefined
-   behaviour in SQLite, and the library rejects it rather than letting it
-   corrupt state. Do that work after the commit, or defer it.
-7. **A veto surfaces to the caller as SQLite's generic "constraint failed".**
-   That is the only thing SQLite reports; your own reason is attached alongside
-   it by this library.
-8. **One hook of each kind per connection.** SQLite keeps a single callback per
-   kind, so multiple listeners have to be multiplexed by the library — and any
-   other code registering its own hooks on the same connection will silently
-   replace ours.
+3. **`preupdate` needs `SQLITE_ENABLE_PREUPDATE_HOOK` at compile time.** Off in
+   a stock build. Ubuntu's and Debian's `libsqlite3` have it; Apple's system
+   SQLite and Homebrew's do not. Where the symbol is absent the events cannot be
+   offered, and the library says so rather than failing obscurely.
+4. **DDL is not reported.** `CREATE TABLE` and friends write `sqlite_schema`,
+   which the update hook ignores, so such a transaction commits with an empty
+   batch.
+5. **Some deletes are not reported.** The truncate optimisation (`DELETE FROM t`
+   with no `WHERE`) removes rows without invoking the hook per row.
+6. **A hook must not use the connection that invoked it.** Undefined behaviour
+   in SQLite; the library rejects it rather than corrupting state. Defer that
+   work until after the commit.
+7. **A veto surfaces as SQLite's generic "constraint failed".** That is all
+   SQLite reports; your own reason is attached alongside it.
+8. **One hook of each kind per connection.** Multiple listeners are multiplexed
+   by the library, and any other code registering hooks on the same connection
+   silently replaces ours.
 9. **FFI is a whole-process trust boundary.** `--allow-ffi` switches off the
-   runtime sandbox for this library.
+   runtime sandbox.
 
 ## Portability
 
-The current implementation is Deno FFI over
-[`@db/sqlite`](https://jsr.io/@db/sqlite). That is a starting point, not the
-destination: neither the event model nor the public API is meant to be tied to
-one runtime or one driver, and the boundary is kept narrow (an opaque connection
-pointer plus a handful of symbols) so other backends can be added without
-changing the API you write against. Bun and Node-API backends are on the
-roadmap.
+Deno FFI over `@db/sqlite` today. Neither the event model nor the public API is
+meant to be tied to one runtime or driver — the boundary is an opaque connection
+pointer plus a handful of symbols — so Bun and Node-API backends can be added
+without changing the API you write against. Neither exists yet.
 
 ## Licence
 
