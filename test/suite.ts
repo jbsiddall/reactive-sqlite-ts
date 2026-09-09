@@ -24,8 +24,13 @@ import { PROPERTIES, PROPERTY_RUNS, PROPERTY_SEED } from "./properties.ts";
 
 const LIB = resolveLibPath();
 const { Database } = await import("@db/sqlite");
-const { SqliteHooksError, probeCapabilities, withEvents, withValidation } =
-  await import("../src/hooks.ts");
+const {
+  opFor,
+  probeCapabilities,
+  SqliteHooksError,
+  withEvents,
+  withValidation,
+} = await import("../src/hooks.ts");
 type DbEvent = import("../src/hooks.ts").DbEvent;
 type PreUpdate = import("../src/hooks.ts").PreUpdate;
 type RowValue = import("../src/hooks.ts").RowValue;
@@ -1216,6 +1221,66 @@ const SEMANTIC: Record<string, () => void> = {
     }
     check("  silent on correct usage", warned.lines, []);
     check("  the veto still held, the accept still landed", rows(db), 1);
+    db.close();
+  },
+
+  "an opcode outside the documented three is delivered as 'unknown'"() {
+    // SQLite cannot be made to emit one, so the mapping is driven directly;
+    // it is total, which is what makes dropping the event impossible.
+    check(
+      "  the documented three",
+      [18, 23, 9].map(opFor),
+      ["insert", "update", "delete"],
+    );
+    check(
+      "  anything else",
+      [-1, 0, 1, 7, 42, 1_000_000].map(opFor),
+      ["unknown", "unknown", "unknown", "unknown", "unknown", "unknown"],
+    );
+  },
+
+  "every event carries the raw opcode SQLite sent"() {
+    const db = memory();
+    const seen: string[] = [];
+    withEvents(db, (e) => {
+      if (e.type === "change") {
+        seen.push(`change ${e.change.op}/${e.change.opcode}`);
+      }
+      if (e.type === "preupdate") seen.push(`pre ${e.op}/${e.opcode}`);
+    }, LIB);
+    db.exec("INSERT INTO t VALUES (1, 'a')");
+    db.exec("UPDATE t SET v = 'b' WHERE id = 1");
+    db.exec("DELETE FROM t WHERE id = 1");
+    check("  raw, undecoded", seen, [
+      "pre insert/18",
+      "change insert/18",
+      "pre update/23",
+      "change update/23",
+      "pre delete/9",
+      "change delete/9",
+    ]);
+    db.close();
+  },
+
+  "a blob write's op and opcode legitimately disagree"() {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE t(id INTEGER PRIMARY KEY, b BLOB)");
+    db.exec("INSERT INTO t VALUES (1, zeroblob(8))");
+    const seen: string[] = [];
+    withEvents(db, (e) => {
+      if (e.type === "change") {
+        seen.push(`${e.change.op}/${e.change.opcode}`);
+      }
+    }, LIB);
+    const blob = db.openBlob({
+      table: "t",
+      column: "b",
+      row: 1,
+      readonly: false,
+    });
+    blob.writeSync(0, new Uint8Array([1, 2, 3, 4]));
+    blob.close();
+    check("  our interpretation, SQLite's opcode", seen, ["update/9"]);
     db.close();
   },
 

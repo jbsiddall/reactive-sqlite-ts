@@ -86,6 +86,37 @@ rejection, use a `BEFORE` trigger whose `WHEN` clause calls a registered JS
 function and whose body is `RAISE(IGNORE)`: that skips just the offending row
 and lets the rest of the transaction commit.
 
+### `op` is open at the edge, and `opcode` is what arrived
+
+Every change carries both our reading of what happened and the raw value SQLite
+sent:
+
+```ts
+type Change = {
+  op: "insert" | "update" | "delete" | "unknown";
+  opcode: number; // as SQLite gave it: 18, 23, 9 for the three above
+  db: string;
+  table: string;
+  rowid: bigint;
+};
+```
+
+SQLite documents `sqlite3_update_hook` as sending only `SQLITE_INSERT`,
+`SQLITE_UPDATE` and `SQLITE_DELETE`, and in practice that is all it sends. The
+union is still open, because an opcode we did not recognise would otherwise have
+to be dropped, and silently losing a change is the one thing this library exists
+to prevent. So anything unrecognised arrives as `op: "unknown"` with the number
+intact in `opcode`, and **your `switch` needs that case** — the compiler will
+tell you so.
+
+`op` and `opcode` may legitimately disagree, and that disagreement is
+information rather than an inconsistency: it is the only signal that an event
+was synthesised by this library rather than reported directly by SQLite. An
+incremental blob write is the case. `sqlite3_update_hook` never sees one at all,
+so the event is built from the preupdate hook, which reports the write as a
+DELETE. You get `op: "update"` — our honest reading of what the write really was
+— alongside `opcode: 9`, the DELETE opcode SQLite actually delivered.
+
 ## Capability table
 
 What SQLite itself allows, and what is built. "Veto" means the C callback's

@@ -102,12 +102,29 @@ import type { Database } from "@db/sqlite";
 
 /** One row touched by a statement, as reported by sqlite3_update_hook. */
 export type Change = {
-  op: "insert" | "update" | "delete";
+  /**
+   * SQLite documents only INSERT, UPDATE and DELETE, but the union is open at
+   * the edge on purpose: an opcode we do not recognise arrives as `"unknown"`
+   * rather than being dropped, because losing a change is the failure this
+   * module exists to prevent. {@linkcode Change.opcode} carries what arrived.
+   */
+  op: "insert" | "update" | "delete" | "unknown";
+  /** The opcode as SQLite gave it, undecoded. 18, 23 and 9 for the three above. */
+  opcode: number;
   /** Schema name — "main", "temp", or an ATTACHed alias. */
   db: string;
   table: string;
   rowid: bigint;
 };
+
+/**
+ * The opcode-to-`op` mapping the hooks apply, exposed because a consumer that
+ * receives `"unknown"` sees the raw {@linkcode Change.opcode} and may want to
+ * classify it the same way. Total: every number maps, none is rejected.
+ */
+export function opFor(opcode: number): Change["op"] {
+  return OPS[opcode] ?? "unknown";
+}
 
 /**
  * One column value, decoded from a `sqlite3_value*` while it was still valid.
@@ -153,6 +170,8 @@ export type Row = Readonly<Record<string, RowValue>>;
 export type PreUpdate = {
   /** As SQLite reports it. An incremental blob write arrives as `"delete"`. */
   op: Change["op"];
+  /** The opcode as SQLite gave it, undecoded. See {@linkcode Change.opcode}. */
+  opcode: number;
   /** Schema name — "main", "temp", or an ATTACHed alias. */
   db: string;
   table: string;
@@ -301,7 +320,7 @@ export class SqliteHooksError extends Error {
   override readonly name = "SqliteHooksError";
 }
 
-const OPS: Record<number, Change["op"]> = {
+const OPS: Record<number, "insert" | "update" | "delete"> = {
   18: "insert",
   9: "delete",
   23: "update",
@@ -817,6 +836,15 @@ function attach(
    * Body of an FFI callback. Anything escaping here would unwind through
    * SQLite's own C frames, so nothing is allowed to.
    */
+  /** Carried by an error report that has no row behind it; opcode -1 is no opcode. */
+  const NO_ROW: Change = {
+    op: "unknown",
+    opcode: -1,
+    db: "",
+    table: "",
+    rowid: 0n,
+  };
+
   const inFfi = <T>(fallback: T, body: () => T): T => {
     if (reg.inHook) {
       // Re-entered through a path we do not instrument. Dispatching now would
@@ -827,7 +855,7 @@ function attach(
         ),
         event: {
           type: "change",
-          change: { op: "update", db: "", table: "", rowid: 0n },
+          change: NO_ROW,
         },
       });
       return fallback;
@@ -840,7 +868,7 @@ function attach(
         error,
         event: {
           type: "change",
-          change: { op: "update", db: "", table: "", rowid: 0n },
+          change: NO_ROW,
         },
       });
       return fallback;
@@ -989,11 +1017,7 @@ function attach(
       } as const,
       (_ctx, dbh, opcode, zDb, zTable, iKey1, iKey2) =>
         inFfi(undefined, () => {
-          // SQLite only ever passes the three opcodes in OPS; the fallback
-          // labels an impossible one rather than dropping the row, which the
-          // closed Change["op"] union has no way to express.
-          // deno-lint-ignore project/no-type-assertion
-          const op = OPS[opcode] ?? `op${opcode}` as never;
+          const op = opFor(opcode);
           const schema = readC(zDb);
           const table = readC(zTable);
           const count = pre.sqlite3_preupdate_count(dbh);
@@ -1027,6 +1051,7 @@ function attach(
           dispatch({
             type: "preupdate",
             op,
+            opcode,
             db: schema,
             table,
             oldRowid: iKey1,
@@ -1047,8 +1072,12 @@ function attach(
           // `coverage: "unknown"`. preupdate does see it — as a DELETE with a
           // blobwrite column — so report the row as the update it really is.
           if (blobwrite >= 0) {
+            // `op` and `opcode` disagree here, and that disagreement is the
+            // only signal that we synthesised this event: SQLite delivered a
+            // DELETE opcode, and an incremental blob write really is an update.
             const change: Change = {
               op: "update",
+              opcode,
               db: schema,
               table,
               rowid: iKey1,
@@ -1068,9 +1097,8 @@ function attach(
     (_arg, op, zDb, zTable, rowid) =>
       inFfi(undefined, () => {
         const change: Change = {
-          // As above: an opcode outside OPS is unreachable, and unrepresentable.
-          // deno-lint-ignore project/no-type-assertion
-          op: OPS[op] ?? `op${op}` as never,
+          op: opFor(op),
+          opcode: op,
           db: readC(zDb),
           table: readC(zTable),
           rowid,
