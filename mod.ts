@@ -3,15 +3,16 @@
  * plus a JavaScript veto on the values a statement is about to write.
  *
  * ```ts
+ * const LIB = "/usr/lib/x86_64-linux-gnu/libsqlite3.so.0";
  * // The driver picks its library at import time, so set this FIRST.
- * Deno.env.set("DENO_SQLITE_PATH", "/usr/lib/x86_64-linux-gnu/libsqlite3.so.0");
+ * Deno.env.set("DENO_SQLITE_PATH", LIB);
  * const { Database } = await import("jsr:@db/sqlite@0.13");
  * const { withEvents } = await import("./mod.ts");
  *
  * const db = new Database("app.db");
  * const sub = withEvents(db, (e) => {
  *   if (e.type === "postcommit") console.log(e.changes);
- * }, Deno.env.get("DENO_SQLITE_PATH")!);
+ * }, LIB);
  * ```
  *
  * Run with `--unstable-ffi --allow-ffi` (plus whatever the driver needs).

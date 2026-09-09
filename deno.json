@@ -82,7 +82,8 @@
       "test/",
       "examples/",
       "tools/",
-      "CONTRIBUTING.md"
+      "CONTRIBUTING.md",
+      "DRIVER_DEFECTS.md"
     ]
   }
 }

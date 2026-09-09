@@ -126,7 +126,7 @@ return value can change what the database does.
 
 | Event                       | C hook                     | Pre | Post | Veto                       | Notes                                                    |
 | --------------------------- | -------------------------- | --- | ---- | -------------------------- | -------------------------------------------------------- |
-| Row insert/update/delete    | `sqlite3_update_hook`      | no  | yes  | no (returns `void`)        | Blob writes invisible; see limits                        |
+| Row insert/update/delete    | `sqlite3_update_hook`      | —   | —    | no (returns `void`)        | SQLite documents the timing as undefined; see limits     |
 | Row change with old/new     | `sqlite3_preupdate_hook`   | yes | no   | no (returns `void`)        | Needs `SQLITE_ENABLE_PREUPDATE_HOOK`                     |
 | Commit                      | `sqlite3_commit_hook`      | yes | no   | **yes** → rollback         | Scope is the whole transaction, not one row              |
 | Rollback                    | `sqlite3_rollback_hook`    | no  | yes  | no                         |                                                          |
@@ -291,7 +291,9 @@ full refresh rather than reading an empty change list as an idle transaction.
 
 ## Hard limits
 
-Properties of SQLite, not of this implementation.
+Properties of SQLite, not of this implementation, except where a subsection
+below says otherwise. This list is not exhaustive — it is what has been hit and
+verified so far.
 
 1. **No row-level veto from any hook.** Both `sqlite3_update_hook` and
    `sqlite3_preupdate_hook` return `void`. The commit hook is the only veto
@@ -318,6 +320,62 @@ Properties of SQLite, not of this implementation.
    silently replaces ours.
 9. **FFI is a whole-process trust boundary.** `--allow-ffi` switches off the
    runtime sandbox.
+10. **Hooks never fire on a virtual table — only on its shadow tables.** This is
+    the one that quietly breaks change-driven cache invalidation, and it only
+    happens for virtual tables, so ordinary testing does not surface it. An
+    `INSERT INTO ft(body) VALUES ('hello world')` on an FTS5 table `ft` reports
+    changes to `ft_content`, `ft_docsize`, `ft_data` and `ft_idx`, and never to
+    `ft` (verified on SQLite 3.45.1; `rtree` behaves the same way, reporting
+    `rt_rowid` and `rt_node`). So the change signal arrives under a table name
+    no query of yours mentions, and matching events against the tables a query
+    reads will never match — silently, and in the direction that fails open.
+    Deriving the owning virtual table from the shadow name is possible in
+    principle (a virtual table `X` owns shadow tables named `X_*`), but this
+    library does not do it and does not pretend to.
+11. **`update_hook` does not fire for WITHOUT ROWID tables.** It is documented
+    as reporting rows in a _rowid_ table. `preupdate_hook` does still fire for
+    them, so with `preupdate` available the write is visible — just not through
+    the row-change events (verified on SQLite 3.45.1).
+12. **`update_hook` does not report the row an `ON CONFLICT REPLACE`
+    displaces.** `INSERT OR REPLACE` that evicts a conflicting row reports only
+    the insert. `preupdate_hook` reports both the delete and the insert
+    (verified on SQLite 3.45.1).
+13. **`preupdate_hook` does not fire for virtual tables or system tables.** Its
+    shadow tables are ordinary tables and are reported normally, which is why
+    FTS5 writes appear under shadow names rather than not at all.
+14. **The timing of `update_hook` relative to the row change is undefined.**
+    SQLite does not specify whether the callback runs before or after the row is
+    written. Do not build ordering assumptions on it; use `preupdate_hook`,
+    which is defined to run before.
+
+### The dispose boundary
+
+While a subscription is attached, this library intercepts the connection's
+methods, so using a `Database` after `close()` throws a clear error. After
+`dispose()` it does not: the driver's own methods are restored, and
+use-after-close is undefined behaviour again. It has two shapes and **the quiet
+one is not the safer one** — `openBlob()` dereferences the freed handle and
+takes the process down with SIGSEGV, while `exec()` returns as though it worked.
+A silent wrong answer is worse than a crash, not better.
+
+`dispose()` restores the driver's methods deliberately. A dispose that leaves
+behaviour behind is not a dispose, and this library will not permanently alter
+an object it was lent in order to compensate for a defect that is not its own.
+Both shapes are recorded in `DRIVER_DEFECTS.md` with reproductions.
+
+The crash suite's guarantee is scoped to match: **no permutation of API calls on
+a connection this library is watching may segfault.** Nothing is promised about
+a connection it has detached from and no longer controls, because nothing can
+be.
+
+### Keying a cache by table
+
+If you build invalidation on these events, key it on the **(schema, table)
+pair**, not on a string you joined them into. Quoted SQLite identifiers are
+arbitrary text — `ATTACH ':memory:' AS "a b"` is legal, and so is
+`CREATE TABLE "b c"` — so schema `a b` with table `c` and schema `a` with table
+`b c` collide under any single-character separator. Whatever character you pick
+can appear in a name.
 
 ## Portability
 
