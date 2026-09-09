@@ -705,3 +705,23 @@ pin, and requires ZERO for a version that is not listed at all. More
 not-exercisable rows than recorded means the audit has quietly stopped checking
 things while still exiting 0, which is exactly the failure a count catches and a
 per-row footnote does not.
+
+### `deno publish --dry-run` refuses a graph it cannot ship (2026-09-09, Deno 2.9.6)
+
+**MEASURED.** Adding `src/format.ts` to `publish.exclude` in `deno.json`, while
+`mod.ts` still reaches it through a static import, makes
+`deno publish --dry-run --allow-dirty --no-check` exit **1** rather than emit a
+file list missing that module. Excluding a file NOTHING imports (`NOTICE`) exits
+0 and simply drops it from the list, which is how the narrowing case was
+observed instead.
+
+Consequence for `test/publish_manifest.ts`: its "every local module `mod.ts`
+reaches ships" assertion cannot be made to fail by removing an imported file —
+publish refuses before the assertion runs. It is therefore driven by fixtures,
+where it IS seen to fail, and kept against the real manifest only as a second
+opinion for what publish's own refusal does not cover: a module reached at run
+time rather than through a static import, or an exclusion publish tolerates.
+
+The two directions that CAN be moved on the real tree were both observed: adding
+an unimported `src/` file fails the check as a WIDENING, and excluding `NOTICE`
+fails it as a NARROWING.
