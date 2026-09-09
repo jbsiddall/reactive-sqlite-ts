@@ -11,6 +11,8 @@ import type {
   Backend,
   BackendHandlers,
   RawPreUpdate,
+  RawTrace,
+  TraceSql,
 } from "./backend.ts";
 import { SQLITE_DELETE, SQLITE_INSERT } from "./backend.ts";
 import type { Capabilities, EventOptions, RowValue } from "./hooks.ts";
@@ -89,11 +91,35 @@ const WAL_SYMBOLS = {
   },
 } as const;
 
+/**
+ * Tracing. Opened separately so a build without it is a missing capability
+ * rather than an unusable library.
+ */
+const TRACE_SYMBOLS = {
+  sqlite3_trace_v2: {
+    parameters: ["pointer", "u32", "function", "pointer"],
+    result: "i32",
+  },
+  sqlite3_sql: { parameters: ["pointer"], result: "pointer" },
+  /** Inlines bound parameter VALUES. Its result is malloc'd and must be freed. */
+  sqlite3_expanded_sql: { parameters: ["pointer"], result: "pointer" },
+  sqlite3_free: { parameters: ["pointer"], result: "void" },
+} as const;
+
+/** Needs SQLITE_ENABLE_NORMALIZE, which stock distribution builds do not set. */
+const NORMALIZE_SYMBOLS = {
+  sqlite3_normalized_sql: { parameters: ["pointer"], result: "pointer" },
+} as const;
+
+const TRACE_STMT = 0x01, TRACE_PROFILE = 0x02, TRACE_ROW = 0x04;
+
 /** PASSIVE: what sqlite3_wal_checkpoint(), and so SQLite's own hook, uses. */
 const CHECKPOINT_PASSIVE = 0;
 
 type CoreLib = Deno.DynamicLibrary<typeof SYMBOLS>;
 type WalLib = Deno.DynamicLibrary<typeof WAL_SYMBOLS>;
+type TraceLib = Deno.DynamicLibrary<typeof TRACE_SYMBOLS>;
+type NormalizeLib = Deno.DynamicLibrary<typeof NORMALIZE_SYMBOLS>;
 type PreSymbols = Deno.DynamicLibrary<typeof PREUPDATE_SYMBOLS>["symbols"];
 
 /** SQLITE_NULL etc., as returned by sqlite3_value_type. */
@@ -103,8 +129,22 @@ type Opened = {
   lib: CoreLib;
   pre: PreSymbols | null;
   wal: WalLib | null;
+  trace: TraceLib | null;
+  normalize: NormalizeLib | null;
   unavailable: string;
 };
+
+/** Null when the build lacks the group. Its own handle, so its absence is isolated. */
+function openOptional<T extends Deno.ForeignLibraryInterface>(
+  libPath: string,
+  symbols: T,
+): Deno.DynamicLibrary<T> | null {
+  try {
+    return Deno.dlopen(libPath, symbols);
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Capabilities are DERIVED from `pre`, never carried beside it: two fields
@@ -113,12 +153,20 @@ type Opened = {
  */
 const capabilitiesOf = (opened: Opened): Capabilities =>
   opened.pre !== null
-    ? { hooks: true, preupdate: true, wal: opened.wal !== null }
+    ? {
+      hooks: true,
+      preupdate: true,
+      wal: opened.wal !== null,
+      trace: opened.trace !== null,
+      normalizedSql: opened.normalize !== null,
+    }
     : {
       hooks: true,
       preupdate: false,
       preupdateUnavailable: opened.unavailable,
       wal: opened.wal !== null,
+      trace: opened.trace !== null,
+      normalizedSql: opened.normalize !== null,
     };
 
 /**
@@ -152,7 +200,9 @@ function openLibrary(
       return {
         lib: full,
         pre: full.symbols,
-        wal: openWal(libPath),
+        wal: openOptional(libPath, WAL_SYMBOLS),
+        trace: openOptional(libPath, TRACE_SYMBOLS),
+        normalize: openOptional(libPath, NORMALIZE_SYMBOLS),
         unavailable: "",
       };
     } catch (cause) {
@@ -179,16 +229,14 @@ function openLibrary(
       `preupdate: "required" was asked for, but ${unavailable}`,
     );
   }
-  return { lib, pre: null, wal: openWal(libPath), unavailable };
-}
-
-/** Null when the build has no WAL. Its own handle, so its absence is isolated. */
-function openWal(libPath: string): WalLib | null {
-  try {
-    return Deno.dlopen(libPath, WAL_SYMBOLS);
-  } catch {
-    return null;
-  }
+  return {
+    lib,
+    pre: null,
+    wal: openOptional(libPath, WAL_SYMBOLS),
+    trace: openOptional(libPath, TRACE_SYMBOLS),
+    normalize: openOptional(libPath, NORMALIZE_SYMBOLS),
+    unavailable,
+  };
 }
 
 /**
@@ -202,6 +250,8 @@ export function probeFfi(libPath: string): Capabilities {
   } finally {
     opened.lib.close();
     opened.wal?.close();
+    opened.trace?.close();
+    opened.normalize?.close();
   }
 }
 
@@ -212,7 +262,7 @@ export function openFfiBackend(
   want: NonNullable<EventOptions["preupdate"]>,
 ): Backend {
   const opened = openLibrary(libPath, want);
-  const { lib, pre, wal } = opened;
+  const { lib, pre, wal, trace, normalize } = opened;
   const capabilities = capabilitiesOf(opened);
   const version = readC(lib.symbols.sqlite3_libversion());
 
@@ -292,6 +342,67 @@ export function openFfiBackend(
     }
   };
 
+  /**
+   * The SQL text for a traced statement. `"statement"` protects BOUND
+   * PARAMETERS only — a literal written into the SQL string is returned
+   * verbatim — so it is the safe default, not the private one.
+   */
+  const sqlText = (
+    t: TraceLib,
+    stmt: Deno.PointerValue,
+    mode: TraceSql,
+  ): string => {
+    if (mode === "with-parameter-values") {
+      const p = t.symbols.sqlite3_expanded_sql(stmt);
+      const text = readC(p);
+      t.symbols.sqlite3_free(p); // malloc'd by SQLite, unlike the others
+      return text;
+    }
+    if (mode === "normalized" && normalize !== null) {
+      return readC(normalize.symbols.sqlite3_normalized_sql(stmt));
+    }
+    return readC(t.symbols.sqlite3_sql(stmt));
+  };
+
+  const readTrace = (
+    t: TraceLib,
+    kind: number,
+    stmt: Deno.PointerValue,
+    x: Deno.PointerValue,
+    mode: TraceSql,
+  ): RawTrace => {
+    if (kind === TRACE_PROFILE) {
+      const nanos = x === null
+        ? 0n
+        : new Deno.UnsafePointerView(x).getBigInt64();
+      return {
+        kind: "profile",
+        sql: sqlText(t, stmt, mode),
+        trigger: false,
+        nanos,
+      };
+    }
+    if (kind === TRACE_ROW) {
+      return {
+        kind: "row",
+        sql: sqlText(t, stmt, mode),
+        trigger: false,
+        nanos: null,
+      };
+    }
+    // STMT: X is the unexpanded text, or an SQL comment for a trigger
+    // subprogram — and for a trigger the comment is the only description
+    // there is, so it is reported as-is whatever the mode.
+    const text = readC(x);
+    const trigger = text.startsWith("--");
+    return {
+      kind: "statement",
+      sql: trigger ? text : sqlText(t, stmt, mode),
+      trigger,
+      nanos: null,
+    };
+  };
+
   const readRow = (
     p: PreSymbols,
     dbh: Deno.PointerValue,
@@ -339,6 +450,8 @@ export function openFfiBackend(
       release(() => {
         lib.close();
         wal?.close();
+        trace?.close();
+        normalize?.close();
       }),
     attach(handlers: BackendHandlers, options: AttachOptions): Attachment {
       const preupdateCb = pre
@@ -397,6 +510,37 @@ export function openFfiBackend(
         },
       );
 
+      const traceMask = trace
+        ? options.trace.reduce(
+          (m, k) =>
+            m |
+            (k === "statement"
+              ? TRACE_STMT
+              : k === "profile"
+              ? TRACE_PROFILE
+              : TRACE_ROW),
+          0,
+        )
+        : 0;
+      const traceCb = trace && traceMask !== 0
+        ? new Deno.UnsafeCallback(
+          {
+            parameters: ["u32", "pointer", "pointer", "pointer"],
+            result: "i32",
+          } as const,
+          (kind, _ctx, p, x) => {
+            safely(handlers, () => {
+              handlers.trace(() =>
+                readTrace(trace, kind, p, x, options.traceSql)
+              );
+            });
+            // SQLite ignores this today and asks for zero so it can start
+            // using it later; a listener has no say in it either way.
+            return 0;
+          },
+        )
+        : null;
+
       const threshold = options.walCheckpointThreshold;
       const walCb = wal
         ? new Deno.UnsafeCallback(
@@ -441,6 +585,7 @@ export function openFfiBackend(
       rollback.unref();
       preupdateCb?.unref();
       walCb?.unref();
+      traceCb?.unref();
 
       if (pre && preupdateCb) {
         pre.sqlite3_preupdate_hook(handle, preupdateCb.pointer, null);
@@ -450,6 +595,14 @@ export function openFfiBackend(
       lib.symbols.sqlite3_rollback_hook(handle, rollback.pointer, null);
       if (wal && walCb) {
         wal.symbols.sqlite3_wal_hook(handle, walCb.pointer, null);
+      }
+      if (trace && traceCb) {
+        trace.symbols.sqlite3_trace_v2(
+          handle,
+          traceMask,
+          traceCb.pointer,
+          null,
+        );
       }
 
       return {
@@ -463,14 +616,23 @@ export function openFfiBackend(
               lib.symbols.sqlite3_rollback_hook(handle, null, null);
               pre?.sqlite3_preupdate_hook(handle, null, null);
               if (walCb) wal?.symbols.sqlite3_wal_hook(handle, null, null);
+              // Unregistered while the connection is alive, which is also why
+              // SQLITE_TRACE_CLOSE is not offered: it only fires if we are
+              // still registered when sqlite3_close runs.
+              if (traceCb) {
+                trace?.symbols.sqlite3_trace_v2(handle, 0, null, null);
+              }
             }
             update.close();
             commit.close();
             rollback.close();
             preupdateCb?.close();
             walCb?.close();
+            traceCb?.close();
             lib.close();
             wal?.close();
+            trace?.close();
+            normalize?.close();
           }),
       };
     },

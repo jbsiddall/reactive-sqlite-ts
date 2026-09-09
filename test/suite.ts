@@ -122,7 +122,10 @@ function record(db: Db, options = {}) {
       // preupdate is deliberately not recorded here: these scenarios are about
       // the commit lifecycle, and the preupdate scenarios below collect their
       // own events.
-      if (e.type === "preupdate" || e.type === "wal") return;
+      if (
+        e.type === "preupdate" || e.type === "wal" ||
+        e.type === "statement" || e.type === "profile" || e.type === "row"
+      ) return;
       log.push(
         e.type === "change"
           ? { type: "change", n: 1 }
@@ -1344,8 +1347,9 @@ const SEMANTIC: Record<string, () => void> = {
       commit: () => false,
       rollback: () => {},
       wal: () => {},
+      trace: () => {},
       fail: () => {},
-    }, { walCheckpointThreshold: null });
+    }, { walCheckpointThreshold: null, trace: [], traceSql: "statement" });
     db.exec("INSERT INTO t VALUES (1, 'a')");
     db.exec("INSERT INTO t VALUES (2, 'b')");
     check("  both rows handed over", handed, 2);
@@ -1370,8 +1374,9 @@ const SEMANTIC: Record<string, () => void> = {
       commit: () => false,
       rollback: () => {},
       wal: () => {},
+      trace: () => {},
       fail: () => {},
-    }, { walCheckpointThreshold: null });
+    }, { walCheckpointThreshold: null, trace: [], traceSql: "statement" });
     at.detach(true);
     detachedThenClosed.close();
     check("  close() after detach()", true, true);
@@ -1388,8 +1393,9 @@ const SEMANTIC: Record<string, () => void> = {
       commit: () => false,
       rollback: () => {},
       wal: () => {},
+      trace: () => {},
       fail: () => {},
-    }, { walCheckpointThreshold: null });
+    }, { walCheckpointThreshold: null, trace: [], traceSql: "statement" });
     at.detach(true);
     at.detach(true);
     check("  survived a second detach", true, true);
@@ -1539,6 +1545,205 @@ const SEMANTIC: Record<string, () => void> = {
     );
     chatty.db.close();
     removeDb(chatty.path);
+  },
+
+  "trace: statement and profile events, with the unexpanded SQL"() {
+    const db = memory();
+    const seen: string[] = [];
+    withEvents(
+      db,
+      (e) => {
+        if (e.type === "statement") seen.push(`stmt ${e.sql}`);
+        if (e.type === "profile") seen.push(`profile ${e.nanos >= 0n}`);
+      },
+      LIB,
+      { trace: true },
+    );
+    const ins = db.prepare("INSERT INTO t VALUES (?, ?)");
+    ins.run(1, "secret-value");
+    ins.finalize();
+    check(
+      "  the parameter stayed a placeholder",
+      seen.some((l) => l === "stmt INSERT INTO t VALUES (?, ?)"),
+      true,
+    );
+    check(
+      "  nothing leaked the value",
+      seen.some((l) => l.includes("secret-value")),
+      false,
+    );
+    check(
+      "  and it was profiled",
+      seen.some((l) => l === "profile true"),
+      true,
+    );
+    db.close();
+  },
+
+  "trace: row is off unless asked for"() {
+    const db = memory();
+    db.exec("INSERT INTO t VALUES (1, 'a')");
+    db.exec("INSERT INTO t VALUES (2, 'b')");
+    let rowsDefault = 0;
+    const a = withEvents(
+      db,
+      (e) => {
+        if (e.type === "row") rowsDefault++;
+      },
+      LIB,
+      { trace: true },
+    );
+    db.prepare("SELECT * FROM t").all();
+    a.dispose();
+    check("  not in the default mask", rowsDefault, 0);
+
+    let rowsAsked = 0;
+    withEvents(
+      db,
+      (e) => {
+        if (e.type === "row") rowsAsked++;
+      },
+      LIB,
+      { trace: ["row"] },
+    );
+    db.prepare("SELECT * FROM t").all();
+    check("  one per result row when asked", rowsAsked, 2);
+    db.close();
+  },
+
+  "trace: with-parameter-values inlines what statement mode hides"() {
+    const db = memory();
+    const seen: string[] = [];
+    withEvents(
+      db,
+      (e) => {
+        if (e.type === "statement") seen.push(e.sql);
+      },
+      LIB,
+      { trace: ["statement"], sql: "with-parameter-values" },
+    );
+    const ins = db.prepare("INSERT INTO t VALUES (?, ?)");
+    ins.run(1, "hunter2");
+    ins.finalize();
+    check(
+      "  the bound value is in the log, by explicit request",
+      seen.some((l) => l.includes("'hunter2'")),
+      true,
+    );
+    db.close();
+  },
+
+  "trace: normalized is refused rather than downgraded when absent"() {
+    const caps = probeCapabilities(LIB);
+    if (caps.normalizedSql) {
+      const db = memory();
+      const seen: string[] = [];
+      withEvents(
+        db,
+        (e) => {
+          if (e.type === "statement") seen.push(e.sql);
+        },
+        LIB,
+        { trace: ["statement"], sql: "normalized" },
+      );
+      // An inline literal, which "statement" would log verbatim.
+      db.exec("INSERT INTO t VALUES (1, 'inline-secret')");
+      check(
+        "  the inline literal was scrubbed",
+        seen.some((l) => l.includes("inline-secret")),
+        false,
+      );
+      check(
+        "  and a placeholder is there",
+        seen.some((l) => l.includes("?")),
+        true,
+      );
+      db.close();
+    } else {
+      let message = "";
+      try {
+        withEvents(memory(), () => {}, LIB, {
+          trace: ["statement"],
+          sql: "normalized",
+        });
+      } catch (e) {
+        message = msg(e);
+      }
+      check(
+        "  refused, naming the compile flag",
+        message.includes("SQLITE_ENABLE_NORMALIZE"),
+        true,
+      );
+      console.log(
+        `  SKIP  normalized-sql behaviour — ${LIB} lacks SQLITE_ENABLE_NORMALIZE`,
+      );
+    }
+  },
+
+  "trace: statement mode does NOT hide a literal written inline"() {
+    // The finding that makes "normalized" the only private mode: the default
+    // protects bound parameters, and nothing else.
+    const db = memory();
+    const seen: string[] = [];
+    withEvents(
+      db,
+      (e) => {
+        if (e.type === "statement") seen.push(e.sql);
+      },
+      LIB,
+      { trace: ["statement"] },
+    );
+    db.exec("INSERT INTO t VALUES (1, 'inline-secret')");
+    check(
+      "  an inline literal is logged verbatim",
+      seen.some((l) => l.includes("inline-secret")),
+      true,
+    );
+    db.close();
+  },
+
+  "trace: displacement is detected, and these shapes are not false positives"() {
+    const db = memory();
+    const errs: string[] = [];
+    withEvents(db, () => {}, LIB, {
+      trace: true,
+      onListenerError: (e) => errs.push(msg(e)),
+    });
+    // Every shape that legitimately produces no STMT trace. None of them may
+    // be mistaken for displacement, which is why detection keys on a COMMIT.
+    db.exec("");
+    db.exec("-- just a comment");
+    db.exec("   ");
+    try {
+      db.exec("SELEC 1");
+    } catch { /* fails to prepare, so never traces */ }
+    db.exec("INSERT INTO t VALUES (1, 'a')");
+    db.exec("INSERT INTO t VALUES (2, 'b')");
+    check("  no false positive", errs.length, 0);
+    db.close();
+  },
+
+  "a thenable from a trace listener can never be a verdict"() {
+    const db = memory();
+    const warned = captureWarnings();
+    try {
+      const tracer = (e: DbEvent) =>
+        e.type === "statement" ? Promise.resolve(false) : undefined;
+      withEvents(db, tracer, LIB, { trace: ["statement"] });
+      for (let i = 0; i < 3; i++) {
+        db.exec(`INSERT INTO t VALUES (${i}, 'v${i}')`);
+      }
+    } finally {
+      warned.stop();
+    }
+    check(
+      "  warned once, by name",
+      warned.lines.length === 1 &&
+        (warned.lines[0]?.includes("tracer") ?? false),
+      true,
+    );
+    check("  and nothing was vetoed", rows(db), 3);
+    db.close();
   },
 
   "an opcode outside the documented three is delivered as 'unknown'"() {

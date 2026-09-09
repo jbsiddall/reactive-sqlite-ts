@@ -16,6 +16,23 @@ import type { Capabilities, RowValue } from "./hooks.ts";
 /** SQLite's own opcodes, as both sides of the seam must agree on them. */
 export const SQLITE_DELETE = 9, SQLITE_INSERT = 18, SQLITE_UPDATE = 23;
 
+/** Which trace classes to install. Mirrors the SQLITE_TRACE_* mask. */
+export type TraceEvent = "statement" | "profile" | "row";
+
+/** How the SQL text of a traced statement is rendered. */
+export type TraceSql = "statement" | "normalized" | "with-parameter-values";
+
+/** One trace callback, already read out of SQLite's memory. */
+export type RawTrace = {
+  kind: TraceEvent;
+  /** As the chosen {@linkcode TraceSql} mode renders it. */
+  sql: string;
+  /** True when SQLite reported an SQL comment marking a trigger subprogram. */
+  trigger: boolean;
+  /** Nanoseconds the statement took. Only on `"profile"`. */
+  nanos: bigint | null;
+};
+
 /** One WAL commit, as sqlite3_wal_hook reports it. */
 export type RawWal = {
   db: string;
@@ -72,6 +89,12 @@ export type BackendHandlers = {
    * so a backend must always report success whatever this does.
    */
   wal(read: () => RawWal): void;
+  /**
+   * A trace callback. SQLite currently ignores the return value and asks
+   * implementations to return zero for future compatibility, so a backend must
+   * do that whatever this does.
+   */
+  trace(read: () => RawTrace): void;
   /** `true` turns the COMMIT into a ROLLBACK. */
   commit(): boolean;
   rollback(): void;
@@ -84,6 +107,9 @@ export type BackendHandlers = {
 };
 
 export type AttachOptions = {
+  /** Trace classes to install. Empty means no trace callback is registered. */
+  trace: readonly TraceEvent[];
+  traceSql: TraceSql;
   /**
    * Frames after which the backend checkpoints from inside the WAL hook,
    * replicating what SQLite's own hook did before ours displaced it. `null`

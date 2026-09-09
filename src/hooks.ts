@@ -100,7 +100,15 @@
  *   check).
  */
 import type { Database } from "@db/sqlite";
-import type { Backend, RawChange, RawPreUpdate, RawWal } from "./backend.ts";
+import type {
+  Backend,
+  RawChange,
+  RawPreUpdate,
+  RawTrace,
+  RawWal,
+  TraceEvent,
+  TraceSql,
+} from "./backend.ts";
 import { SQLITE_DELETE, SQLITE_INSERT, SQLITE_UPDATE } from "./backend.ts";
 import { openFfiBackend, probeFfi } from "./backend_ffi.ts";
 
@@ -274,7 +282,25 @@ export type DbEvent =
    * already committed, and a non-OK return would only make the provoking
    * statement report an error.
    */
-  | { type: "wal"; db: string; frames: number };
+  | { type: "wal"; db: string; frames: number }
+  /**
+   * A prepared statement began running, finished, or produced a row —
+   * whichever of {@linkcode EventOptions.trace} was asked for. Cannot veto:
+   * SQLite ignores a trace callback's return value.
+   */
+  | ({ type: "statement" } & Traced)
+  | ({ type: "profile" } & Traced & { nanos: bigint })
+  | ({ type: "row" } & Traced);
+
+/** What every trace event carries. */
+export type Traced = {
+  /** Rendered per {@linkcode EventOptions.sql}. Never expanded by default. */
+  sql: string;
+  /** SQLite reported an SQL comment marking a trigger subprogram. */
+  trigger: boolean;
+  /** Nanoseconds the statement took. Only meaningful on `"profile"`. */
+  nanos: bigint | null;
+};
 
 export type Listener = (e: DbEvent) => unknown;
 
@@ -291,6 +317,27 @@ export type EventOptions = {
    * as SQLite did it. `"caller"` hands the job over — choose it and **you are
    * responsible for periodic checkpoints or your WAL grows without bound**.
    */
+  /**
+   * Which trace events to deliver. Omitted means no trace callback is
+   * registered at all; `true` means `["statement", "profile"]`, which cost
+   * about 1% on a read path. `"row"` fires once per RESULT ROW and measured
+   * nearly 3x on a row-heavy SELECT — never include it by accident.
+   */
+  trace?: true | readonly TraceEvent[];
+  /**
+   * How a traced statement's SQL is rendered. The default is the same on every
+   * library, capable or not, so that what you log cannot change with the build.
+   *
+   * - `"statement"` (default) — SQLite's unexpanded text. It protects **bound
+   *   parameters only**: a literal written directly into the SQL string is
+   *   logged verbatim. The safe default, not the safe choice.
+   * - `"normalized"` — literals replaced, so nothing a caller wrote survives.
+   *   The only private mode. Needs {@linkcode Capabilities.normalizedSql}, and
+   *   asking for it without that throws rather than quietly giving you
+   *   `"statement"`. SQLite calls the normalisation unspecified: do not parse it.
+   * - `"with-parameter-values"` — every bound value inlined. Never private.
+   */
+  sql?: TraceSql;
   checkpoint?: "preserve" | "caller";
   /**
    * Frames after which to checkpoint, overriding whatever is in force at
@@ -337,6 +384,13 @@ export type Capabilities = {
   readonly preupdateUnavailable?: string;
   /** sqlite3_wal_hook: WAL commit events. False on a build made with SQLITE_OMIT_WAL. */
   readonly wal: boolean;
+  /** sqlite3_trace_v2: statement, profile and row events. */
+  readonly trace: boolean;
+  /**
+   * sqlite3_normalized_sql, needed for `sql: "normalized"`. Off in stock
+   * distribution builds, which do not set SQLITE_ENABLE_NORMALIZE.
+   */
+  readonly normalizedSql: boolean;
 };
 
 /** A single listener's registration. `dispose()` is idempotent. */
@@ -686,7 +740,34 @@ function attach(
     return b;
   };
 
+  let sawStatementTrace = false;
+  let traceDisplaced = false;
   let walDisplaced = false;
+
+  /**
+   * A commit necessarily ran at least one statement, and a statement that runs
+   * always produces a STMT trace — verified across every shape reachable here.
+   * So a commit with no STMT trace since the last one means something called
+   * sqlite3_trace_v2 and replaced us. Keyed on a COMMIT rather than on any
+   * statement because an empty, comment-only or unparseable statement produces
+   * no trace legitimately, and a detector that cries wolf is worse than none.
+   *
+   * Reported, never re-installed: the caller asked for their own callback.
+   */
+  const checkTraceHook = () => {
+    if (traceDisplaced || !tracesStatements) return;
+    if (sawStatementTrace) {
+      sawStatementTrace = false;
+      return;
+    }
+    traceDisplaced = true;
+    errors.push({
+      error: new SqliteHooksError(
+        "a transaction committed without reaching our trace callback, so something called sqlite3_trace_v2 on this connection and replaced it: no further statement, profile or row events will arrive. Re-attach to get them back.",
+      ),
+      event: { type: "change", change: NO_ROW },
+    });
+  };
   /**
    * `PRAGMA wal_autocheckpoint` reads 0 while our hook is installed, so any
    * other value means something re-registered SQLite's — which removes ours
@@ -724,7 +805,10 @@ function attach(
     }
     // Once per commit, not per statement: a pragma read is ~1.4us against a
     // commit's ~105us, but there is no reason to pay it on a bare SELECT.
-    if (drained) checkWalHook();
+    if (drained) {
+      checkWalHook();
+      checkTraceHook();
+    }
   };
 
   const describe = (e: unknown) => e instanceof Error ? e.message : String(e);
@@ -881,6 +965,29 @@ function attach(
    * enforces the seam's "must never throw" contract on this side: a listener
    * error is recorded and reported from JS, never unwound through C.
    */
+  const traceKinds: readonly TraceEvent[] = options.trace === undefined
+    ? []
+    : options.trace === true
+    ? ["statement", "profile"]
+    : options.trace;
+  const traceSql: TraceSql = options.sql ?? "statement";
+  if (traceKinds.length > 0 && !capabilities.trace) {
+    backend.close();
+    throw new SqliteHooksError(
+      "this libsqlite3 does not export sqlite3_trace_v2, so trace events cannot be delivered",
+    );
+  }
+  // Refused rather than quietly downgraded to "statement": a caller who asked
+  // for the private mode and silently got the one that logs inline literals
+  // would be wrong invisibly.
+  if (traceSql === "normalized" && !capabilities.normalizedSql) {
+    backend.close();
+    throw new SqliteHooksError(
+      'sql: "normalized" needs a libsqlite3 built with SQLITE_ENABLE_NORMALIZE, and this one is not. Stock distribution builds do not set it.',
+    );
+  }
+  const tracesStatements = traceKinds.includes("statement");
+
   // Read BEFORE the hook is installed: once ours is registered the pragma
   // reports 0, because SQLite considers auto-checkpointing off — we are doing
   // it. This ordering is load-bearing, not convenience.
@@ -1008,6 +1115,27 @@ function attach(
         dispatch({ type: "wal", db: raw.db, frames: raw.frames });
       }),
 
+    trace: (read: () => RawTrace) =>
+      inFfi(undefined, () => {
+        const raw = read();
+        const { sql, trigger } = raw;
+        if (raw.kind === "profile") {
+          dispatch({
+            type: "profile",
+            sql,
+            trigger,
+            nanos: raw.nanos ?? 0n,
+          });
+          return;
+        }
+        if (raw.kind === "row") {
+          dispatch({ type: "row", sql, trigger, nanos: null });
+          return;
+        }
+        sawStatementTrace = true;
+        dispatch({ type: "statement", sql, trigger, nanos: null });
+      }),
+
     // The seam's other direction: an error raised BELOW it, before any handler
     // ran. Recorded like any listener error rather than crossing back into C.
     fail: (error: unknown) =>
@@ -1026,7 +1154,11 @@ function attach(
         // exactly as invisible here as it is on the commit path.
         dispatch({ type: "rollback", ...b });
       }),
-  }, { walCheckpointThreshold: checkpointThreshold });
+  }, {
+    walCheckpointThreshold: checkpointThreshold,
+    trace: traceKinds,
+    traceSql,
+  });
 
   let torn = false;
   reg.teardown = () => {

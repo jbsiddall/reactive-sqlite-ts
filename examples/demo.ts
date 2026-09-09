@@ -39,6 +39,9 @@ let lastBatch = 0;
 withEvents(db, (e: DbEvent) => {
   // per-row noise; the batched events are the interesting ones
   if (e.type === "change" || e.type === "preupdate") return undefined;
+  if (e.type === "statement" || e.type === "profile" || e.type === "row") {
+    return undefined;
+  }
   if (e.type === "wal") {
     console.log(`   [wal] ${e.db}, ${e.frames} frames`);
     return undefined;

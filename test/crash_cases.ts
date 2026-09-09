@@ -1002,6 +1002,31 @@ export const CASES: Record<string, CrashCase> = {
     },
   },
 
+  "trace-close-ordering": {
+    code: 0,
+    match: "survived",
+    why:
+      "SQLITE_TRACE_CLOSE only fires if the callback is still registered when sqlite3_close runs, and we deliberately unregister while the connection is alive. This pins that ordering: a future change that left the callback registered would be freeing something SQLite still holds.",
+    run() {
+      const db = fresh();
+      let statements = 0;
+      const sub = withEvents(
+        db,
+        (e) => {
+          if (e.type === "statement") statements++;
+        },
+        LIB,
+        { trace: ["statement", "profile", "row"] },
+      );
+      db.exec("INSERT INTO t VALUES (1, 'a')");
+      db.prepare("SELECT * FROM t").all();
+      sub.dispose();
+      db.exec("INSERT INTO t VALUES (2, 'b')");
+      db.close();
+      console.log(statements > 0 ? "survived" : "FAIL no statement events");
+    },
+  },
+
   "property-no-permutation-crashes": {
     code: 0,
     match: "survived",

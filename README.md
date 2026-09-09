@@ -151,7 +151,7 @@ return value can change what the database does.
 | Rollback                    | `sqlite3_rollback_hook`    | no  | yes  | no                         |                                                          |
 | Commit landed               | — (synthesised)            | no  | yes  | n/a, already happened      | No C hook: commit hook runs _before_ commit              |
 | WAL commit written          | `sqlite3_wal_hook`         | no  | yes  | **no** — see note below    | Displaces auto-checkpointing; we replicate it            |
-| 📅 Statement lifecycle      | `sqlite3_trace_v2`         | yes | yes  | no                         |                                                          |
+| Statement lifecycle         | `sqlite3_trace_v2`         | yes | yes  | no — return value ignored  | `row` fires per result row and measured ~3x; opt in      |
 | 📅 Statement progress       | `sqlite3_progress_handler` | —   | —    | **yes** → aborts stmt      | Fires during execution                                   |
 | 📅 Lock contention          | `sqlite3_busy_handler`     | —   | —    | **yes** → retry or busy    | Fires during execution                                   |
 | 📅 Unknown collation needed | `sqlite3_collation_needed` | yes | no   | no; supplies the collation | Fires when a statement names an unregistered collation   |
@@ -200,7 +200,7 @@ wa-sqlite has had no npm release since January 2024.
 | `rollback_hook`                  | yes                         | not in a release; PR #1337 open       | no                                      | no           | no                                      | no                      | yes         |
 | post-commit (synthesised)        | yes                         | no                                    | no                                      | no           | no                                      | no                      | no          |
 | `wal_hook`                       | yes                         | no                                    | no                                      | no           | no                                      | no                      | no          |
-| `trace_v2` / profile             | 📅                          | `verbose` option logs each SQL string | `diagnostics_channel` `sqlite.db.query` | no           | yes — `trace` and `profile` events      | no                      | yes         |
+| `trace_v2` / profile             | yes                         | `verbose` option logs each SQL string | `diagnostics_channel` `sqlite.db.query` | no           | yes — `trace` and `profile` events      | no                      | yes         |
 | `progress_handler`               | 📅                          | no                                    | no                                      | no           | no                                      | no                      | yes         |
 | busy handler / timeout           | 📅 handler                  | `timeout` option                      | `timeout` option                        | no           | `configure("busyTimeout")`              | no                      | yes, both   |
 | `collation_needed`               | 📅                          | no                                    | no                                      | no           | no                                      | no                      | yes         |
@@ -378,6 +378,77 @@ value that is not a valid error code is undefined behaviour. This library
 therefore always returns `SQLITE_OK`, whatever a listener does, and the `wal`
 event is a **void contract**: your return value is ignored, exactly as for
 `change`, `preupdate`, `postcommit` and `rollback`.
+
+### Tracing, and what ends up in your logs
+
+`trace` opts in to statement, profile and row events. It is off unless you ask,
+because it changes what your listener receives and because one of the three is
+expensive:
+
+```ts
+withEvents(db, listener, LIB, { trace: true }); // statement + profile
+withEvents(db, listener, LIB, { trace: ["statement"] }); // just the SQL
+```
+
+`trace: true` is `["statement", "profile"]`, which measured **+1.1%** on a
+read-heavy workload — free, in practice. `"row"` fires once per **result row**
+and measured **2.95x** on a `SELECT` of 100,000 rows. It is never in the default
+mask; include it deliberately and for a short time.
+
+SQLite ignores a trace callback's return value today and asks implementations to
+return zero so it can start using it later, so the trace events are a **void
+contract**: your return value is discarded whatever it is.
+
+`SQLITE_TRACE_CLOSE` is deliberately **not** offered. It only fires if the
+callback is still registered when `sqlite3_close()` runs, and this library
+unregisters every callback while the connection is still alive — which is why
+using a closed connection throws here instead of crashing. Keeping a callback
+registered across the close to deliver one event would trade that guarantee for
+information you already have earlier: `db.close()` is intercepted, and your
+subscription is disposed there, while the connection still works.
+
+#### What the SQL text contains, which is not what "unexpanded" suggests
+
+```ts
+withEvents(db, listener, LIB, { trace: true, sql: "statement" });
+```
+
+| `sql`                     | `SELECT * FROM users WHERE tok = ? AND id > 0`, bound to `'s3cret'` | Private?              |
+| ------------------------- | ------------------------------------------------------------------- | --------------------- |
+| `"statement"` _(default)_ | `SELECT * FROM users WHERE tok = ? AND id > 0`                      | bound parameters only |
+| `"normalized"`            | `SELECT*FROM users WHERE tok=?AND id>?;`                            | yes                   |
+| `"with-parameter-values"` | `SELECT * FROM users WHERE tok = 's3cret' AND id > 0`               | no, and says so       |
+
+**`"statement"` protects bound parameters only.** A literal written directly
+into the SQL string is logged verbatim — look at the `0` surviving in the table
+above, and imagine it were a token. It is the safe _default_, not the safe
+_choice_: choosing it for privacy reasons would be wrong in a way you could not
+see from the option's name.
+
+**`"normalized"` is the only genuinely private mode.** It replaces every
+literal, bound or inline, which also makes it the right one for telemetry —
+expanded SQL is actively bad for grouping, since every distinct parameter value
+produces a distinct string. It needs a `libsqlite3` built with
+`SQLITE_ENABLE_NORMALIZE`, which stock distribution builds do not set; check
+`capabilities.normalizedSql` first. Asking for it without that **throws** rather
+than quietly giving you `"statement"`, because a privacy mode that silently
+downgrades is worse than one that is absent. SQLite calls the normalisation
+"unspecified and subject to change", so read it, do not parse it.
+
+**`"with-parameter-values"` inlines every bound value.** Local debugging only.
+The default is `"statement"` on every library, capable or not, so that what you
+log never changes with the build.
+
+#### If something else takes the trace callback
+
+A connection has one trace callback, and calling `sqlite3_trace_v2` yourself
+replaces ours — after which no statement, profile or row events arrive. There is
+no way to read back what is installed, so this is detected indirectly: a
+transaction that commits must have run a statement, and a statement that runs
+always traces, so a commit with no statement trace means we were replaced. It is
+reported through `onListenerError` once and never repaired, because you asked
+for your own callback. The inference needs `"statement"` in the mask; it is not
+attempted otherwise.
 
 ### WAL mode, checkpointing, and what attaching would otherwise cost you
 

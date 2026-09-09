@@ -38,6 +38,42 @@ Compiled libraries are not committed. `.gitignore` excludes them deliberately:
 they are per-platform, unreviewable in a diff, and reproducible from the recipe
 above.
 
+## Capability ledger: which tests depend on which library
+
+Some behaviour exists only if the loaded `libsqlite3` was compiled with the
+right flag, so those tests take a different branch on a different library. A
+test that has only ever run against a library _lacking_ the capability has
+proved the fallback works and nothing else, so this table records which library
+each one actually went green against.
+
+Two libraries are reachable here. The **system** library is whatever
+`DENO_SQLITE_PATH` points at — on Debian and Ubuntu, SQLite 3.45.1, which
+carries every hook symbol this project uses except `sqlite3_normalized_sql`. The
+**vendored** library is built by `deno task vendor:build` (SQLite 3.53.4 at the
+time of writing, 23 flags, roughly a minute, nothing but `cc` needed) and has
+all of them. The build output is gitignored and never committed.
+
+| Capability      | Gated on                       | Tests                                                               | Green against                                                                        |
+| --------------- | ------------------------------ | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `preupdate`     | `SQLITE_ENABLE_PREUPDATE_HOOK` | every `preupdate:` scenario, the validation suite, `withValidation` | **system 3.45.1** and **vendored 3.53.4** — both have it                             |
+| `wal`           | not `SQLITE_OMIT_WAL`          | every `wal` scenario, `wal-hook-lifetime`                           | **system 3.45.1** and **vendored 3.53.4**                                            |
+| `trace`         | not `SQLITE_OMIT_TRACE`        | every `trace:` scenario, `trace-close-ordering`                     | **system 3.45.1** and **vendored 3.53.4**                                            |
+| `normalizedSql` | `SQLITE_ENABLE_NORMALIZE`      | `trace: normalized is refused rather than downgraded when absent`   | **vendored 3.53.4** for the present branch; **system 3.45.1** for the refusal branch |
+
+The gated test prints a visible `SKIP` line naming the library when it takes the
+absent branch, so a run that quietly proved nothing is not mistakable for a run
+that proved something.
+
+### The one gap that remains
+
+The **absent-capability branches** — "preupdate unavailable",
+`preupdate:
+"required"` refusing, and `trace` being absent entirely — have never
+run against a library that genuinely lacks those symbols, because both libraries
+reachable here have them. The honest fixture for those is the prebuilt library
+`@db/sqlite` downloads when `DENO_SQLITE_PATH` is unset, which carries a much
+smaller symbol set. Not wired up.
+
 ## Changes to the FFI or native layer need out-of-process crash tests
 
 Anything that touches `Deno.dlopen`, an `UnsafeCallback`, a borrowed `sqlite3*`,
