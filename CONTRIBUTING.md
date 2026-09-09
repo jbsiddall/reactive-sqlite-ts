@@ -86,6 +86,30 @@ If a future hook fires from somewhere other than the bytecode engine — a
 background thread, or an unlock-notify callback — this reasoning does not
 transfer and the set must be re-examined.
 
+**That condition has already been met once, by `sqlite3_busy_handler`.** It
+fires during lock acquisition rather than from a suspended engine mid-row, and
+SQLite genuinely permits a busy callback to use the connection: a
+`prepare("SELECT 1").get()` from inside one returns with no error. So it is not
+covered by the argument above, and it was decided rather than derived. **We
+refuse it anyway.** Allowing the one exception would make "no hook may touch the
+connection" — the assumption behind `inFfi`, `reg.inHook`, `guard()` and the
+re-entrancy fix — hold for four callbacks and stop at the fifth, which is the
+defect shape this project has closed seven times. The practical argument stands
+alone too: the failure it prevents is a deadlock, and there is no way to bound
+one. The refusal message explains this, so it reads as a limitation rather than
+a bug.
+
+Measured, with a real 2 ms dwell inside our callbacks so a lock attempt could
+occur if one could: 3 of our callbacks, 4 busy invocations, zero overlap. (An
+earlier probe reported zero from a flag that was set and cleared on the same
+line, which meant nothing; this is the corrected run.) The reverse direction —
+one of ours firing while a busy handler is on the stack — is reachable only
+through the listener's own re-entrant call, which is exactly what the refusal
+above prevents.
+
+`set_authorizer` fires at prepare time and should be checked against this same
+question rather than assumed to match either group.
+
 ### The one gap that remains
 
 The **absent-capability branches** — "preupdate unavailable",

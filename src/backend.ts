@@ -98,6 +98,12 @@ export type BackendHandlers = {
   /** `true` turns the COMMIT into a ROLLBACK. */
   commit(): boolean;
   /**
+   * A table is locked. `true` means the caller has already waited and wants
+   * SQLite to retry; `false` means give up, and SQLITE_BUSY reaches the
+   * application. `tries` is SQLite's own count for this locking event.
+   */
+  busy(tries: number): boolean;
+  /**
    * A progress tick. `true` interrupts the running statement — and inside an
    * explicit transaction that discards the whole transaction, so a backend
    * must never turn an internal failure into `true`.
@@ -121,6 +127,8 @@ export type AttachOptions = {
    * no progress handler at all.
    */
   progressOps: number | null;
+  /** Whether to install a busy handler at all. */
+  busy: boolean;
   /**
    * Frames after which the backend checkpoints from inside the WAL hook,
    * replicating what SQLite's own hook did before ours displaced it. `null`

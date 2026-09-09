@@ -297,7 +297,47 @@ export type DbEvent =
    * everywhere else: {@linkcode ProgressEvent.abort} is the only way to stop
    * anything.
    */
-  | ProgressEvent;
+  | ProgressEvent
+  /**
+   * Another connection holds a lock this statement needs. Nothing happens
+   * unless {@linkcode BusyEvent.retry} or {@linkcode BusyEvent.giveUp} is
+   * called, and doing nothing gives up — which is what SQLite does with no
+   * handler at all, and the only default that cannot spin forever.
+   *
+   * SQLite may decline to invoke this at all when it detects that waiting
+   * could deadlock, and return SQLITE_BUSY directly, so a listener here is
+   * not a guarantee that contention is handled.
+   */
+  | BusyEvent;
+
+export type BusyEvent = {
+  type: "busy";
+  /** SQLite's own count of previous invocations for this locking event. */
+  tries: number;
+  /**
+   * Wait `afterMs`, then let SQLite try the locked operation again.
+   *
+   * **This BLOCKS THE WHOLE PROCESS.** It is a synchronous sleep, not a
+   * scheduled delay: no timers run, no I/O completes, no other connection
+   * makes progress, and in a server every other request stops too. Prefer a
+   * few short waits with your own backoff driven by {@linkcode BusyEvent.tries}
+   * over one long one. Floored at 1 ms, because a zero wait is a busy-spin.
+   *
+   * Only effective during the event it was handed to, and only when called
+   * synchronously from the listener.
+   *
+   * **Host-dependent availability.** The wait is `Atomics.wait`, which throws
+   * on a browser main thread and is permitted only on a worker. A browser or
+   * WASM port therefore cannot offer `retry` on the main thread at all, and
+   * must make it UNAVAILABLE rather than approximate it — a `retry` that
+   * cannot block is a busy-spin, which is the failure this signature exists
+   * to prevent. This is the first API here whose availability, not merely its
+   * cost, varies by host.
+   */
+  retry: (afterMs: number) => void;
+  /** Give up: SQLITE_BUSY reaches the caller. Same as doing nothing, said out loud. */
+  giveUp: () => void;
+};
 
 export type ProgressEvent = {
   type: "progress";
@@ -354,6 +394,16 @@ export type EventOptions = {
    * process. Measured on a 50 ms statement: 1000 is free, 100 costs about
    * 12%, and 10 more than doubles execution.
    */
+  /**
+   * Deliver {@linkcode BusyEvent} when a table is locked. Off by default: with
+   * no handler SQLite returns SQLITE_BUSY immediately, which is the behaviour
+   * every existing caller already has.
+   *
+   * Installing one REPLACES any busy timeout on the connection, since
+   * `sqlite3_busy_timeout` and `PRAGMA busy_timeout` are implemented by
+   * installing a busy handler.
+   */
+  busy?: boolean;
   progress?: number;
   trace?: true | readonly TraceEvent[];
   /**
@@ -420,6 +470,8 @@ export type Capabilities = {
   readonly trace: boolean;
   /** sqlite3_progress_handler: periodic ticks during a long statement. */
   readonly progress: boolean;
+  /** sqlite3_busy_handler: a say in what happens when a table is locked. */
+  readonly busy: boolean;
   /**
    * sqlite3_normalized_sql, needed for `sql: "normalized"`. Off in stock
    * distribution builds, which do not set SQLITE_ENABLE_NORMALIZE.
@@ -674,6 +726,22 @@ function isThenable(v: unknown): v is PromiseLike<unknown> {
 const nameOf = (fn: Listener): string =>
   fn.name === "" ? "an anonymous listener" : `listener ${fn.name}`;
 
+/** A shared, never-notified slot: Atomics.wait on it is a synchronous sleep. */
+const SLEEPER = new Int32Array(new SharedArrayBuffer(4));
+
+/** Above this a single retry() stalls the process long enough to be worth saying so. */
+const LONG_WAIT_MS = 1000;
+
+let warnedLongWait = false;
+
+function warnLongBusyWait(ms: number): void {
+  if (warnedLongWait) return;
+  warnedLongWait = true;
+  console.warn(
+    `a busy listener called retry(${ms}), which blocks this entire process for ${ms}ms — no timers, no I/O, no other connection makes progress. Prefer several short waits with your own backoff on the event's tries count.`,
+  );
+}
+
 /** One warning per listener, however many events it returns from. */
 const WARNED = new WeakSet<Listener>();
 
@@ -779,6 +847,8 @@ function attach(
     return b;
   };
 
+  let noBusyDecision = false;
+  let busyDisplaced = false;
   let sawStatementTrace = false;
   let traceDisplaced = false;
   let walDisplaced = false;
@@ -836,6 +906,32 @@ function attach(
     });
   };
 
+  /**
+   * `PRAGMA busy_timeout` reads 0 while our handler is installed, because
+   * SQLite's own timeout handler is what ours replaced. A NON-ZERO reading
+   * means something called sqlite3_busy_timeout or the pragma and removed us.
+   * Zero is ambiguous — it is also what "no handler at all" reads — so only
+   * the non-zero direction is informative, which is all detection needs.
+   */
+  const checkBusyHook = () => {
+    if (busyDisplaced || !wantBusy || reg.closed || reg.detached) return;
+    let live: number | undefined;
+    try {
+      live = rawPrepare("PRAGMA busy_timeout").get<{ timeout: number }>()
+        ?.timeout;
+    } catch {
+      return;
+    }
+    if (live === undefined || live === 0) return;
+    busyDisplaced = true;
+    errors.push({
+      error: new SqliteHooksError(
+        `a busy timeout of ${live}ms was set on this connection, which installs SQLite's own busy handler and removes ours: no further busy events will arrive. Re-attach to get them back.`,
+      ),
+      event: { type: "change", change: NO_ROW },
+    });
+  };
+
   const drain = () => {
     let drained = false;
     for (let b = committed.shift(); b !== undefined; b = committed.shift()) {
@@ -847,6 +943,7 @@ function attach(
     if (drained) {
       checkWalHook();
       checkTraceHook();
+      checkBusyHook();
     }
   };
 
@@ -1026,6 +1123,13 @@ function attach(
     );
   }
   const tracesStatements = traceKinds.includes("statement");
+  const wantBusy = options.busy ?? false;
+  if (wantBusy && !capabilities.busy) {
+    backend.close();
+    throw new SqliteHooksError(
+      "this libsqlite3 does not export sqlite3_busy_handler, so busy events cannot be delivered",
+    );
+  }
   const progressOps = options.progress ?? null;
   if (progressOps !== null && !capabilities.progress) {
     backend.close();
@@ -1167,6 +1271,63 @@ function attach(
         dispatch({ type: "wal", db: raw.db, frames: raw.frames });
       }),
 
+    busy: (tries: number) =>
+      inFfi(false, () => {
+        let waitMs: number | null = null;
+        let decided = false;
+        let live = true;
+        const settle = (what: string, act: () => void) => {
+          if (!live) {
+            errors.push({
+              error: new SqliteHooksError(
+                `${what}() was kept from a busy event and called after that event had returned; it decided nothing. Call it synchronously from the listener.`,
+              ),
+              event: { type: "change", change: NO_ROW },
+            });
+            return;
+          }
+          decided = true;
+          act();
+        };
+        const event: BusyEvent = {
+          type: "busy",
+          tries,
+          retry: (afterMs: number) =>
+            settle("retry", () => {
+              // Floored: a zero wait returns straight to SQLite and spins.
+              waitMs = Math.max(1, Math.floor(afterMs));
+              if (waitMs >= LONG_WAIT_MS) warnLongBusyWait(waitMs);
+            }),
+          giveUp: () =>
+            settle("giveUp", () => {
+              waitMs = null;
+            }),
+        };
+        try {
+          dispatch(event);
+        } finally {
+          live = false;
+        }
+        if (waitMs === null) {
+          if (!decided && !noBusyDecision) {
+            // Giving up by default is correct, but "I declined" and "I did not
+            // handle this event" must not look the same to whoever reads the log.
+            noBusyDecision = true;
+            errors.push({
+              error: new SqliteHooksError(
+                "a busy event was delivered and no listener called retry() or giveUp(), so SQLITE_BUSY was returned. That is the default; call giveUp() to say it deliberately.",
+              ),
+              event: { type: "change", change: NO_ROW },
+            });
+          }
+          return false;
+        }
+        // Blocks this thread, exactly as SQLite's own busy_timeout handler
+        // does. There is no asynchronous way back into a C callback.
+        Atomics.wait(SLEEPER, 0, 0, waitMs);
+        return true;
+      }),
+
     // The fallback is FALSE, and the inversion against precommit is
     // deliberate: precommit's failure mode is a bad write landing, so its
     // catch vetoes; a progress failure that interrupted would discard the
@@ -1254,6 +1415,7 @@ function attach(
     trace: traceKinds,
     traceSql,
     progressOps,
+    busy: wantBusy,
   });
 
   let torn = false;
@@ -1283,7 +1445,7 @@ function attach(
     }
     if (reg.inHook) {
       throw new SqliteHooksError(
-        `${what} was called from inside a change/precommit/rollback listener. SQLite forbids using the connection from within its hooks. Do it from postcommit, or defer with queueMicrotask().`,
+        `${what} was called from inside a hook listener. SQLite forbids using the connection from within its hooks — and a busy listener, which SQLite alone would permit, is refused too rather than making the rule hold for four callbacks and stop at the fifth. From a busy listener it can also deadlock, and there is no way to bound that. Do it from postcommit, or defer with queueMicrotask().`,
       );
     }
   };

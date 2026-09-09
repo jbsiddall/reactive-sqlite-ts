@@ -114,6 +114,14 @@ const PROGRESS_SYMBOLS = {
   },
 } as const;
 
+/** sqlite3_busy_timeout is implemented ON TOP of this, so installing ours clears it. */
+const BUSY_SYMBOLS = {
+  sqlite3_busy_handler: {
+    parameters: ["pointer", "function", "pointer"],
+    result: "i32",
+  },
+} as const;
+
 /** Needs SQLITE_ENABLE_NORMALIZE, which stock distribution builds do not set. */
 const NORMALIZE_SYMBOLS = {
   sqlite3_normalized_sql: { parameters: ["pointer"], result: "pointer" },
@@ -129,6 +137,7 @@ type WalLib = Deno.DynamicLibrary<typeof WAL_SYMBOLS>;
 type TraceLib = Deno.DynamicLibrary<typeof TRACE_SYMBOLS>;
 type NormalizeLib = Deno.DynamicLibrary<typeof NORMALIZE_SYMBOLS>;
 type ProgressLib = Deno.DynamicLibrary<typeof PROGRESS_SYMBOLS>;
+type BusyLib = Deno.DynamicLibrary<typeof BUSY_SYMBOLS>;
 type PreSymbols = Deno.DynamicLibrary<typeof PREUPDATE_SYMBOLS>["symbols"];
 
 /** SQLITE_NULL etc., as returned by sqlite3_value_type. */
@@ -141,6 +150,7 @@ type Opened = {
   trace: TraceLib | null;
   normalize: NormalizeLib | null;
   progress: ProgressLib | null;
+  busy: BusyLib | null;
   unavailable: string;
 };
 
@@ -170,6 +180,7 @@ const capabilitiesOf = (opened: Opened): Capabilities =>
       trace: opened.trace !== null,
       normalizedSql: opened.normalize !== null,
       progress: opened.progress !== null,
+      busy: opened.busy !== null,
     }
     : {
       hooks: true,
@@ -179,6 +190,7 @@ const capabilitiesOf = (opened: Opened): Capabilities =>
       trace: opened.trace !== null,
       normalizedSql: opened.normalize !== null,
       progress: opened.progress !== null,
+      busy: opened.busy !== null,
     };
 
 /**
@@ -216,6 +228,7 @@ function openLibrary(
         trace: openOptional(libPath, TRACE_SYMBOLS),
         normalize: openOptional(libPath, NORMALIZE_SYMBOLS),
         progress: openOptional(libPath, PROGRESS_SYMBOLS),
+        busy: openOptional(libPath, BUSY_SYMBOLS),
         unavailable: "",
       };
     } catch (cause) {
@@ -249,6 +262,7 @@ function openLibrary(
     trace: openOptional(libPath, TRACE_SYMBOLS),
     normalize: openOptional(libPath, NORMALIZE_SYMBOLS),
     progress: openOptional(libPath, PROGRESS_SYMBOLS),
+    busy: openOptional(libPath, BUSY_SYMBOLS),
     unavailable,
   };
 }
@@ -267,6 +281,7 @@ export function probeFfi(libPath: string): Capabilities {
     opened.trace?.close();
     opened.normalize?.close();
     opened.progress?.close();
+    opened.busy?.close();
   }
 }
 
@@ -277,7 +292,7 @@ export function openFfiBackend(
   want: NonNullable<EventOptions["preupdate"]>,
 ): Backend {
   const opened = openLibrary(libPath, want);
-  const { lib, pre, wal, trace, normalize, progress } = opened;
+  const { lib, pre, wal, trace, normalize, progress, busy } = opened;
   const capabilities = capabilitiesOf(opened);
   const version = readC(lib.symbols.sqlite3_libversion());
 
@@ -468,6 +483,7 @@ export function openFfiBackend(
         trace?.close();
         normalize?.close();
         progress?.close();
+        busy?.close();
       }),
     attach(handlers: BackendHandlers, options: AttachOptions): Attachment {
       const preupdateCb = pre
@@ -572,6 +588,21 @@ export function openFfiBackend(
         )
         : null;
 
+      const busyCb = busy && options.busy
+        ? new Deno.UnsafeCallback(
+          { parameters: ["pointer", "i32"], result: "i32" } as const,
+          (_arg, tries) => {
+            let again = false;
+            safely(handlers, () => {
+              again = handlers.busy(tries);
+            });
+            // A failure below the seam gives up, which is what SQLite does
+            // with no handler at all and the only answer that cannot spin.
+            return again ? 1 : 0;
+          },
+        )
+        : null;
+
       const threshold = options.walCheckpointThreshold;
       const walCb = wal
         ? new Deno.UnsafeCallback(
@@ -618,6 +649,7 @@ export function openFfiBackend(
       walCb?.unref();
       traceCb?.unref();
       progressCb?.unref();
+      busyCb?.unref();
 
       if (pre && preupdateCb) {
         pre.sqlite3_preupdate_hook(handle, preupdateCb.pointer, null);
@@ -635,6 +667,9 @@ export function openFfiBackend(
           traceCb.pointer,
           null,
         );
+      }
+      if (busy && busyCb) {
+        busy.symbols.sqlite3_busy_handler(handle, busyCb.pointer, null);
       }
       if (progress && progressCb && options.progressOps !== null) {
         progress.symbols.sqlite3_progress_handler(
@@ -670,6 +705,9 @@ export function openFfiBackend(
                   null,
                 );
               }
+              if (busyCb) {
+                busy?.symbols.sqlite3_busy_handler(handle, null, null);
+              }
             }
             update.close();
             commit.close();
@@ -678,11 +716,13 @@ export function openFfiBackend(
             walCb?.close();
             traceCb?.close();
             progressCb?.close();
+            busyCb?.close();
             lib.close();
             wal?.close();
             trace?.close();
             normalize?.close();
             progress?.close();
+            busy?.close();
           }),
       };
     },

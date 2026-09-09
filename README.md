@@ -153,7 +153,7 @@ return value can change what the database does.
 | WAL commit written          | `sqlite3_wal_hook`         | no  | yes  | **no** — see note below    | Displaces auto-checkpointing; we replicate it            |
 | Statement lifecycle         | `sqlite3_trace_v2`         | yes | yes  | no — return value ignored  | `row` fires per result row and measured ~3x; opt in      |
 | Statement progress          | `sqlite3_progress_handler` | —   | —    | **yes** → `abort()` only   | Return value ignored; `abort()` interrupts, see below    |
-| 📅 Lock contention          | `sqlite3_busy_handler`     | —   | —    | **yes** → retry or busy    | Fires during execution                                   |
+| Lock contention             | `sqlite3_busy_handler`     | —   | —    | **yes** → `retry()` only   | Return value ignored; `retry()` BLOCKS the thread        |
 | 📅 Unknown collation needed | `sqlite3_collation_needed` | yes | no   | no; supplies the collation | Fires when a statement names an unregistered collation   |
 | 📅 Statement authorisation  | `sqlite3_set_authorizer`   | yes | no   | **yes** → `DENY`/`IGNORE`  | Prepare-time; table/column names only, no rows or values |
 
@@ -202,7 +202,7 @@ wa-sqlite has had no npm release since January 2024.
 | `wal_hook`                       | yes                         | no                                    | no                                      | no           | no                                      | no                      | no          |
 | `trace_v2` / profile             | yes                         | `verbose` option logs each SQL string | `diagnostics_channel` `sqlite.db.query` | no           | yes — `trace` and `profile` events      | no                      | yes         |
 | `progress_handler`               | yes                         | no                                    | no                                      | no           | no                                      | no                      | yes         |
-| busy handler / timeout           | 📅 handler                  | `timeout` option                      | `timeout` option                        | no           | `configure("busyTimeout")`              | no                      | yes, both   |
+| busy handler / timeout           | yes — handler               | `timeout` option                      | `timeout` option                        | no           | `configure("busyTimeout")`              | no                      | yes, both   |
 | `collation_needed`               | 📅                          | no                                    | no                                      | no           | no                                      | no                      | yes         |
 | authorizer                       | 📅                          | no                                    | yes — `setAuthorizer`                   | no           | no                                      | no                      | yes         |
 | session / changesets / patchsets | no                          | no                                    | yes — `createSession`, `applyChangeset` | no           | no                                      | no                      | yes         |
@@ -378,6 +378,73 @@ value that is not a valid error code is undefined behaviour. This library
 therefore always returns `SQLITE_OK`, whatever a listener does, and the `wal`
 event is a **void contract**: your return value is ignored, exactly as for
 `change`, `preupdate`, `postcommit` and `rollback`.
+
+### Lock contention, and why `retry` blocks
+
+`busy: true` delivers an event when another connection holds a lock this
+statement needs. With no handler at all — the default, and what SQLite does —
+`SQLITE_BUSY` reaches the caller immediately.
+
+```ts
+withEvents(
+  db,
+  (e) => {
+    if (e.type !== "busy") return;
+    if (e.tries < 5) e.retry(10 * e.tries); // back off using SQLite's own count
+    else e.giveUp();
+  },
+  LIB,
+  { busy: true },
+);
+```
+
+**Nothing happens unless you call `retry()` or `giveUp()`.** The event's return
+value is ignored, as everywhere but `precommit`, and **doing nothing gives up**.
+That default is the point: a listener written `async () => { ... }` returns a
+Promise, a Promise is truthy, and a library that passed the return value through
+to SQLite would retry forever — a process pinned at 100% CPU that never returns.
+Measured with such an implementation and an async listener: 1786 retries in 2
+seconds, and it only stopped because the test forced it to. Returning a
+thenable, returning a truthy value and throwing all end in `SQLITE_BUSY` and the
+process making progress. Doing nothing is also reported through
+`onListenerError`, so "I declined" and "I did not handle this event" do not look
+the same in a log.
+
+**`retry(afterMs)` blocks the entire process.** It is a synchronous sleep, not a
+scheduled delay: no timers run, no I/O completes, no other connection makes
+progress, and in a server every other request stops for the duration. It reads
+like an async delay at the call site and is not one. Prefer several short waits
+with your own backoff on `tries` over one long one; a single wait above a second
+draws a one-time warning. The delay is required and floored at 1 ms, because a
+zero wait returns straight to SQLite and busy-spins — SQLite's own timeout
+handler sleeps for exactly this reason, and a JavaScript handler that returns
+immediately was measured at 294,000 retries per second.
+
+The wait uses `Atomics.wait`, which is available on Deno's main thread but
+**throws on a browser main thread**. A browser or WASM port cannot offer `retry`
+outside a worker, and must make it unavailable rather than approximate it: a
+`retry` that cannot block is the busy-spin. It is the first thing here whose
+availability, rather than only its cost, depends on the host.
+
+`busy` is not a guarantee that contention is handled. SQLite may decline to
+invoke the handler at all when it decides that waiting could deadlock, and
+return `SQLITE_BUSY` directly, so a caller must still expect it.
+
+A listener must not touch the connection from a `busy` event. SQLite alone among
+the hooks permits this, and this library refuses it anyway: one exception would
+make "no hook may touch the connection" hold for four callbacks and stop at the
+fifth, and from a busy listener it can deadlock with no way to bound it. The
+refusal says so.
+
+#### If something else takes the busy handler
+
+`sqlite3_busy_timeout` and `PRAGMA busy_timeout` are implemented by installing a
+busy handler, so setting either **replaces ours** and busy events stop. Unlike
+the progress handler this is detectable: `PRAGMA busy_timeout` reads `0` while
+ours is installed, so any non-zero reading means we were displaced. It is
+reported once through `onListenerError` and never repaired. Reading `0` is
+ambiguous — it is also what "no handler at all" reads — so only the non-zero
+direction says anything, which is all detection needs.
 
 ### Progress ticks, and what an abort actually costs
 

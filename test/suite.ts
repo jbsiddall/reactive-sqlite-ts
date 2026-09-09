@@ -67,16 +67,32 @@ const FLAGS = [
   "--allow-net",
 ];
 const CASE_SCRIPT = new URL("./crash_cases.ts", import.meta.url).pathname;
+/** Generous enough for the slowest legitimate case, short enough to catch a hang. */
+const CASE_TIMEOUT_MS = 60_000;
 
 /** Run one crash case in a child process and assert on how it died. */
 async function runCase(name: string): Promise<void> {
   const expected = CASES[name]!;
-  const out = await new Deno.Command(Deno.execPath(), {
+  // Bounded, because a HANG is a real failure mode here — a busy handler that
+  // retries without end never returns, and an unbounded await would make the
+  // suite hang with it rather than report it.
+  const child = new Deno.Command(Deno.execPath(), {
     args: ["run", ...FLAGS, CASE_SCRIPT, name],
     env: { DENO_SQLITE_PATH: LIB },
     stdout: "piped",
     stderr: "piped",
-  }).output();
+  }).spawn();
+  const killer = setTimeout(() => {
+    try {
+      child.kill("SIGKILL");
+    } catch { /* already gone */ }
+  }, CASE_TIMEOUT_MS);
+  const out = await child.output();
+  clearTimeout(killer);
+  if (out.signal === "SIGKILL") {
+    fail(name, `HUNG: still running after ${CASE_TIMEOUT_MS}ms`);
+    return;
+  }
   const text = new TextDecoder().decode(out.stdout) +
     new TextDecoder().decode(out.stderr);
   const code = out.code;
@@ -125,7 +141,7 @@ function record(db: Db, options = {}) {
       if (
         e.type === "preupdate" || e.type === "wal" ||
         e.type === "statement" || e.type === "profile" || e.type === "row" ||
-        e.type === "progress"
+        e.type === "progress" || e.type === "busy"
       ) return;
       log.push(
         e.type === "change"
@@ -235,6 +251,19 @@ const fill = (db: Db, n: number) => {
     ins.finalize();
   }
 };
+
+/** Two connections to one file, with the first holding a write lock. */
+function contended(): { held: Db; other: Db; path: string } {
+  const path = `${WAL_DIR}/busy-${contendedSeq++}.db`;
+  removeDb(path);
+  const held = new Database(path);
+  held.exec("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)");
+  const other = new Database(path);
+  held.exec("BEGIN IMMEDIATE");
+  held.exec("INSERT INTO t VALUES (1, 'held')");
+  return { held, other, path };
+}
+let contendedSeq = 0;
 
 /** A statement long enough that a progress handler can actually reach it. */
 const HEAVY_ROWS = 300_000;
@@ -1355,12 +1384,14 @@ const SEMANTIC: Record<string, () => void> = {
       wal: () => {},
       trace: () => {},
       progress: () => false,
+      busy: () => false,
       fail: () => {},
     }, {
       walCheckpointThreshold: null,
       trace: [],
       traceSql: "statement",
       progressOps: null,
+      busy: false,
     });
     db.exec("INSERT INTO t VALUES (1, 'a')");
     db.exec("INSERT INTO t VALUES (2, 'b')");
@@ -1388,12 +1419,14 @@ const SEMANTIC: Record<string, () => void> = {
       wal: () => {},
       trace: () => {},
       progress: () => false,
+      busy: () => false,
       fail: () => {},
     }, {
       walCheckpointThreshold: null,
       trace: [],
       traceSql: "statement",
       progressOps: null,
+      busy: false,
     });
     at.detach(true);
     detachedThenClosed.close();
@@ -1413,12 +1446,14 @@ const SEMANTIC: Record<string, () => void> = {
       wal: () => {},
       trace: () => {},
       progress: () => false,
+      busy: () => false,
       fail: () => {},
     }, {
       walCheckpointThreshold: null,
       trace: [],
       traceSql: "statement",
       progressOps: null,
+      busy: false,
     });
     at.detach(true);
     at.detach(true);
@@ -1982,6 +2017,197 @@ const SEMANTIC: Record<string, () => void> = {
     }
     check("  and nothing crashed", true, true);
     db.close();
+  },
+
+  "busy: nothing but retry() waits, and doing nothing gives up"() {
+    // A thenable, a truthy value, a throw and an empty listener must all end
+    // in SQLITE_BUSY. Passing a return value through would spin forever.
+    for (
+      const [label, listener] of [
+        ["a thenable", () => Promise.resolve(true)],
+        ["a truthy value", () => 1],
+        ["a throw", () => {
+          throw new Error("from the busy listener");
+        }],
+        ["no decision", () => undefined],
+      ] as const
+    ) {
+      const { held, other, path } = contended();
+      let outcome = "";
+      const started = performance.now();
+      withEvents(
+        other,
+        (e) => e.type === "busy" ? listener() : undefined,
+        LIB,
+        {
+          busy: true,
+          onListenerError: () => {},
+        },
+      );
+      try {
+        other.exec("INSERT INTO t VALUES (2, 'from the other connection')");
+      } catch (e) {
+        outcome = msg(e);
+      }
+      const elapsed = performance.now() - started;
+      check(
+        `  ${label}: the caller got SQLITE_BUSY`,
+        outcome,
+        "database is locked",
+      );
+      check(`  ${label}: and it did not spin`, elapsed < 1000, true);
+      held.exec("ROLLBACK");
+      other.close();
+      held.close();
+      removeDb(path);
+    }
+  },
+
+  "busy: retry() actually waits, and giving up is distinguishable"() {
+    const { held, other, path } = contended();
+    const errs: string[] = [];
+    let tries = 0;
+    withEvents(
+      other,
+      (e) => {
+        if (e.type === "busy") {
+          tries = e.tries;
+          if (e.tries < 3) e.retry(20);
+          else e.giveUp();
+        }
+      },
+      LIB,
+      { busy: true, onListenerError: (e) => errs.push(msg(e)) },
+    );
+    const started = performance.now();
+    let outcome = "";
+    try {
+      other.exec("INSERT INTO t VALUES (2, 'from the other connection')");
+    } catch (e) {
+      outcome = msg(e);
+    }
+    const elapsed = performance.now() - started;
+    check("  it retried three times", tries, 3);
+    check("  and actually slept between them", elapsed >= 55, true);
+    check("  before giving up", outcome, "database is locked");
+    check(
+      "  giveUp() is not reported as an unhandled event",
+      errs.some((e) => e.includes("no listener called retry()")),
+      false,
+    );
+    held.exec("ROLLBACK");
+    other.close();
+    held.close();
+    removeDb(path);
+  },
+
+  "busy: doing nothing is reported, so it does not look like a decision"() {
+    const { held, other, path } = contended();
+    const errs: string[] = [];
+    withEvents(other, () => {}, LIB, {
+      busy: true,
+      onListenerError: (e) => errs.push(msg(e)),
+    });
+    try {
+      other.exec("INSERT INTO t VALUES (2, 'x')");
+    } catch { /* SQLITE_BUSY, as expected */ }
+    check(
+      "  the silence was reported",
+      errs.some((e) => e.includes("no listener called retry() or giveUp()")),
+      true,
+    );
+    held.exec("ROLLBACK");
+    other.close();
+    held.close();
+    removeDb(path);
+  },
+
+  "busy: a stashed retry() decides nothing and is reported"() {
+    const { held, other, path } = contended();
+    const errs: string[] = [];
+    const stashed: Array<(ms: number) => void> = [];
+    withEvents(
+      other,
+      (e) => {
+        if (e.type === "busy" && stashed.length === 0) stashed.push(e.retry);
+      },
+      LIB,
+      { busy: true, onListenerError: (e) => errs.push(msg(e)) },
+    );
+    try {
+      other.exec("INSERT INTO t VALUES (2, 'x')");
+    } catch { /* SQLITE_BUSY */ }
+    const late = stashed[0];
+    check("  we captured one", late !== undefined, true);
+    late?.(5);
+    other.exec("SELECT 1"); // a boundary, so queued listener errors flush
+    check(
+      "  calling it late decided nothing and was reported",
+      errs.some((e) => e.includes("decided nothing")),
+      true,
+    );
+    held.exec("ROLLBACK");
+    other.close();
+    held.close();
+    removeDb(path);
+  },
+
+  "busy: touching the connection from a busy listener is refused"() {
+    // SQLite permits it here, uniquely among the hooks. This library refuses
+    // it anyway, because one exception to "no hook may touch the connection"
+    // would make the guarantee hold for four callbacks and stop at the fifth.
+    const { held, other, path } = contended();
+    const errs: string[] = [];
+    withEvents(
+      other,
+      (e) => {
+        if (e.type === "busy") other.prepare("SELECT 1").get();
+      },
+      LIB,
+      { busy: true, onListenerError: (e) => errs.push(msg(e)) },
+    );
+    try {
+      other.exec("INSERT INTO t VALUES (2, 'x')");
+    } catch { /* SQLITE_BUSY */ }
+    check(
+      "  refused, and the message explains why",
+      errs.some((e) =>
+        e.includes("stop at the fifth") && e.includes("deadlock")
+      ),
+      true,
+    );
+    held.exec("ROLLBACK");
+    other.close();
+    held.close();
+    removeDb(path);
+  },
+
+  "busy: a busy timeout set afterwards displaces us, and is reported"() {
+    const { held, other, path } = contended();
+    const errs: string[] = [];
+    withEvents(
+      other,
+      (e) => {
+        if (e.type === "busy") e.giveUp();
+      },
+      LIB,
+      { busy: true, onListenerError: (e) => errs.push(msg(e)) },
+    );
+    held.exec("ROLLBACK");
+    other.exec("INSERT INTO t VALUES (3, 'a commit, so the drain runs')");
+    other.exec("PRAGMA busy_timeout = 2500");
+    other.exec("INSERT INTO t VALUES (4, 'another commit')");
+    check(
+      "  detected and reported",
+      errs.some((e) => e.includes("removes ours")),
+      true,
+    );
+    const before = errs.length;
+    other.exec("INSERT INTO t VALUES (5, 'and again')");
+    check("  reported once, not per commit", errs.length, before);
+    other.close();
+    held.close();
+    removeDb(path);
   },
 
   "an opcode outside the documented three is delivered as 'unknown'"() {

@@ -487,7 +487,7 @@ export const CASES: Record<string, CrashCase> = {
 
   "listener-writes-in-change": {
     code: 1,
-    match: "from inside a change/precommit/rollback listener",
+    match: "from inside a hook listener",
     why:
       "A re-entrant write recurses into the same hook; SQLite forbids using the connection there.",
     run() {
@@ -499,7 +499,7 @@ export const CASES: Record<string, CrashCase> = {
 
   "listener-reads-in-precommit": {
     code: 1,
-    match: "from inside a change/precommit/rollback listener",
+    match: "from inside a hook listener",
     why:
       "sqlite3_prepare_v2/step 'modify their database connection' — reads are forbidden in hooks too.",
     run() {
@@ -511,7 +511,7 @@ export const CASES: Record<string, CrashCase> = {
 
   "listener-begins-transaction-in-change": {
     code: 1,
-    match: "from inside a change/precommit/rollback listener",
+    match: "from inside a hook listener",
     why: "A nested BEGIN from inside a hook corrupts the transaction state.",
     run() {
       const db = fresh();
@@ -756,7 +756,7 @@ export const CASES: Record<string, CrashCase> = {
 
   "preupdate-listener-writes": {
     code: 1,
-    match: "from inside a change/precommit/rollback listener",
+    match: "from inside a hook listener",
     why:
       "preupdate runs inside an FFI hook like the others: the connection is off limits there too.",
     run() {
@@ -1057,6 +1057,44 @@ export const CASES: Record<string, CrashCase> = {
       db.exec("INSERT INTO t VALUES (3, 'c')");
       db.close();
       console.log(ticks > 2 ? "survived" : "FAIL never ticked");
+    },
+  },
+
+  "busy-retry-then-teardown": {
+    code: 1,
+    match: "database is locked",
+    why:
+      "A busy handler that retries blocks the thread inside a C callback. Contend for real, retry with delays, give up, then dispose and close. The characteristic failure here is a HANG, which the runner bounds and reports as a failure rather than waiting for.",
+    run() {
+      const dir = Deno.makeTempDirSync({ prefix: "reactive-sqlite-busy-" });
+      const path = `${dir}/contended.db`;
+      const held = new Database(path);
+      held.exec("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)");
+      const other = new Database(path);
+      held.exec("BEGIN IMMEDIATE");
+      held.exec("INSERT INTO t VALUES (1, 'held')");
+      let tries = 0;
+      const sub = withEvents(
+        other,
+        (e) => {
+          if (e.type === "busy") {
+            tries = e.tries;
+            if (e.tries < 4) e.retry(5);
+            else e.giveUp();
+          }
+        },
+        LIB,
+        { busy: true, onListenerError: () => {} },
+      );
+      try {
+        other.exec("INSERT INTO t VALUES (2, 'blocked')");
+      } finally {
+        console.log(`tried ${tries} times`);
+        sub.dispose();
+        held.exec("ROLLBACK");
+        other.close();
+        held.close();
+      }
     },
   },
 
