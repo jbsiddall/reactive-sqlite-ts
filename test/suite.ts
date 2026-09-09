@@ -180,6 +180,19 @@ const DB_METHODS = ["exec", "run", "prepare", "transaction", "close"] as const;
 const STMT_METHODS = ["run", "get", "all", "values", "value"] as const;
 const TX_VARIANTS = ["default", "deferred", "immediate", "exclusive"] as const;
 
+const rows = (db: Db): number =>
+  db.prepare("SELECT count(*) c FROM t").get<{ c: number }>()?.c ?? -1;
+
+/** Collect console.warn until stop(); the warnings are the assertion. */
+function captureWarnings(): { lines: string[]; stop: () => void } {
+  const lines: string[] = [];
+  const original = console.warn;
+  console.warn = (...args: unknown[]) => {
+    lines.push(args.map((a) => `${a}`).join(" "));
+  };
+  return { lines, stop: () => console.warn = original };
+}
+
 const ownFunction = (obj: object, name: string): boolean =>
   Object.hasOwn(obj, name) && typeof Reflect.get(obj, name) === "function";
 
@@ -1081,6 +1094,97 @@ const SEMANTIC: Record<string, () => void> = {
       message = (e as Error).message;
     }
     check("  refused", message.includes("cannot work with preupdate"), true);
+  },
+
+  "an async precommit listener refuses the commit instead of permitting it"() {
+    const db = memory();
+    const seen: unknown[] = [];
+    withEvents(
+      db,
+      (e) => e.type === "precommit" ? Promise.resolve(false) : undefined,
+      LIB,
+      { onListenerError: (error) => seen.push(error) },
+    );
+    let threw = false;
+    try {
+      db.exec("INSERT INTO t VALUES (1, 'a')");
+    } catch {
+      threw = true;
+    }
+    check("  the write failed", threw, true);
+    check("  no row survived", rows(db), 0);
+    check("  reported as a listener error", seen.length, 1);
+    check(
+      "  said why",
+      seen.some((e) => `${e}`.includes("returned a Promise from precommit")),
+      true,
+    );
+    db.close();
+  },
+
+  "a thenable that is not a Promise is refused too"() {
+    const db = memory();
+    withEvents(
+      db,
+      (e) => e.type === "precommit" ? { then: () => false } : undefined,
+      LIB,
+      { onListenerError: () => {} },
+    );
+    let threw = false;
+    try {
+      db.exec("INSERT INTO t VALUES (1, 'a')");
+    } catch {
+      threw = true;
+    }
+    check("  the write failed", threw, true);
+    check("  no row survived", rows(db), 0);
+    db.close();
+  },
+
+  "returning from a void-contract event warns once, by name"() {
+    const db = memory();
+    const warned = captureWarnings();
+    try {
+      const chattyListener = (e: DbEvent) =>
+        e.type === "change" ? 1 : undefined;
+      withEvents(db, chattyListener, LIB);
+      db.exec("INSERT INTO t VALUES (1, 'a')");
+      db.exec("INSERT INTO t VALUES (2, 'b')");
+      db.exec("INSERT INTO t VALUES (3, 'c')");
+    } finally {
+      warned.stop();
+    }
+    check("  warned once for nine events", warned.lines.length, 1);
+    check(
+      "  named the listener",
+      warned.lines[0]?.includes("chattyListener"),
+      true,
+    );
+    db.close();
+  },
+
+  "a legitimate precommit verdict is never warned about"() {
+    const db = memory();
+    const warned = captureWarnings();
+    try {
+      const vetoer = (e: DbEvent) => e.type === "precommit" ? false : undefined;
+      const sub = withEvents(db, vetoer, LIB, { onListenerError: () => {} });
+      for (const id of [1, 2, 3]) {
+        try {
+          db.exec(`INSERT INTO t VALUES (${id}, 'a')`);
+        } catch { /* vetoed, as asked */ }
+      }
+      sub.dispose();
+      const accepter = (e: DbEvent) =>
+        e.type === "precommit" ? true : undefined;
+      withEvents(db, accepter, LIB);
+      db.exec("INSERT INTO t VALUES (4, 'd')");
+    } finally {
+      warned.stop();
+    }
+    check("  silent on correct usage", warned.lines, []);
+    check("  the veto still held, the accept still landed", rows(db), 1);
+    db.close();
   },
 
   "driver internals: statement methods are own, Database methods are not"() {

@@ -656,6 +656,30 @@ function subscription(
   };
 }
 
+/** Cross-realm safe: a thenable need not be an `instanceof Promise`. */
+function isThenable(v: unknown): v is PromiseLike<unknown> {
+  if (v === null || (typeof v !== "object" && typeof v !== "function")) {
+    return false;
+  }
+  return typeof Reflect.get(v, "then") === "function";
+}
+
+const nameOf = (fn: Listener): string =>
+  fn.name === "" ? "an anonymous listener" : `listener ${fn.name}`;
+
+/** One warning per listener, however many events it returns from. */
+const WARNED = new WeakSet<Listener>();
+
+function warnIgnoredReturn(l: Listener, type: DbEvent["type"]): void {
+  if (WARNED.has(l)) return;
+  WARNED.add(l);
+  console.warn(
+    `${
+      nameOf(l)
+    } returned a value from a "${type}" event, where the return value is ignored (only precommit reads one) — and if the listener is async it is never awaited, so its errors are swallowed and its work does not finish before the commit.`,
+  );
+}
+
 function attach(
   db: Database,
   opened: OpenedLibrary,
@@ -704,7 +728,18 @@ function attach(
     try {
       for (const l of [...reg.listeners]) {
         try {
-          if (l(event) === false && event.type === "precommit") veto = true;
+          const returned = l(event);
+          if (event.type !== "precommit") {
+            if (returned !== undefined) warnIgnoredReturn(l, event.type);
+          } else if (isThenable(returned)) {
+            // A pending Promise is not `false`, so an async veto would be read
+            // as consent. Refuse the commit rather than fail open.
+            throw new SqliteHooksError(
+              `${
+                nameOf(l)
+              } returned a Promise from precommit, so its verdict cannot be read before the commit decision; the commit was refused. Make the listener synchronous.`,
+            );
+          } else if (returned === false) veto = true;
         } catch (error) {
           errors.push({ error, event });
           if (event.type === "precommit") veto = true;
@@ -1360,6 +1395,9 @@ export function withValidation(
           } catch (error) {
             // A validator that throws is refusing the row, not failing us.
             verdict = error instanceof Error ? error.message : String(error);
+          }
+          if (isThenable(verdict)) {
+            verdict = "validator returned a Promise; make it synchronous";
           }
           if (verdict === false) verdict = "rejected by validation";
           if (typeof verdict === "string") {

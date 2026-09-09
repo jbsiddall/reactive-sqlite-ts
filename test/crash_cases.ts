@@ -926,6 +926,19 @@ export const CASES: Record<string, CrashCase> = {
     },
   },
 
+  "async-precommit-veto": {
+    code: 1,
+    match: "returned a Promise from precommit",
+    why:
+      "A never-settling Promise returned from inside SQLite's commit hook: the commit must be refused, and the process must neither segfault nor hang waiting on it.",
+    run() {
+      const db = fresh();
+      on(db, "precommit", () => new Promise<boolean>(() => {}));
+      db.exec("INSERT INTO t VALUES (1, 'a')");
+      console.log("unreachable");
+    },
+  },
+
   "no-dispose-still-exits": {
     code: 0,
     match: "done",
