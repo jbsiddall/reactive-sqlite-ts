@@ -628,6 +628,202 @@ async function classify(
   return { branch, state, because };
 }
 
+/**
+ * What the pinned not-exercisable count says about a run.
+ *
+ * Split out and returned as data rather than printed where it is computed,
+ * because the four cases mean four different things and the sentence a human
+ * reads at 2am is the deliverable, not the exit status. The fixtures below
+ * assert the TEXT. A control that watches the alarm sound without listening to
+ * what it says leaves the whole operator-facing half unverified — which is how
+ * a message naming the wrong direction, and prescribing the remedy for a
+ * different table, sat behind four passing controls.
+ */
+type CountVerdict =
+  | { readonly kind: "agrees" }
+  | { readonly kind: "unpinned"; readonly text: string }
+  | { readonly kind: "above"; readonly text: string }
+  | { readonly kind: "below"; readonly text: string };
+
+function countVerdict(
+  version: string,
+  pinned: number | undefined,
+  measured: number,
+): CountVerdict {
+  if (pinned === undefined) {
+    if (measured === 0) return { kind: "agrees" };
+    return {
+      kind: "unpinned",
+      text:
+        `SQLite ${version} is not in NOT_EXERCISABLE, and an unrecorded library must check everything it records — ${measured} ${
+          measured === 1 ? "row is" : "rows are"
+        } not exercisable on it. Measure the number and add ["${version}", ${measured}] to NOT_EXERCISABLE deliberately, once you know which rows and why.`,
+    };
+  }
+  if (measured === pinned) return { kind: "agrees" };
+  if (measured > pinned) {
+    return {
+      kind: "above",
+      text:
+        `SQLite ${version}: NOT_EXERCISABLE pins ${pinned} not-exercisable rows, this run measured ${measured} — MORE than recorded. Rows this library used to exercise are no longer exercised by anything, and without the count that would have been a per-row note under an exit 0. Find out which rows and why BEFORE raising the pin.`,
+    };
+  }
+  return {
+    kind: "below",
+    text:
+      `SQLite ${version}: NOT_EXERCISABLE pins ${pinned} not-exercisable rows, this run measured ${measured} — FEWER than recorded. This is the good direction or a pin that was never true here: something that could not be exercised on this library now can. Confirm which, then lower the NOT_EXERCISABLE entry to ${measured}.`,
+  };
+}
+
+/**
+ * The remedy for one branch whose measured state is not the recorded one.
+ *
+ * Carried per line rather than printed once beneath the list, because the
+ * entries fire for opposite reasons and one blanket instruction is wrong for
+ * half of its readers.
+ */
+function expectedRemedy(want: State, measured: State): string {
+  if (want === "none") {
+    return `newly exercised, which is good news — record it by setting this branch in EXPECTED to ${measured}`;
+  }
+  if (measured === "none") {
+    return "it STOPPED being exercised — find out what stopped reaching it before recording the new state";
+  }
+  return "the state changed without the branch becoming unexercised — establish which evidence moved before recording it";
+}
+
+const COUNT_MESSAGE_FIXTURES: readonly {
+  readonly name: string;
+  readonly pinned: number | undefined;
+  readonly measured: number;
+  readonly kind: CountVerdict["kind"];
+  readonly must: readonly string[];
+}[] = [
+  {
+    name: "a pin the run agrees with is not drift",
+    pinned: 1,
+    measured: 1,
+    kind: "agrees",
+    must: [],
+  },
+  {
+    name: "an unlisted library that still checks everything is not drift",
+    pinned: undefined,
+    measured: 0,
+    kind: "agrees",
+    must: [],
+  },
+  {
+    name: "more rows than pinned is named as MORE and sent to the right table",
+    pinned: 0,
+    measured: 1,
+    kind: "above",
+    must: ["MORE than recorded", "NOT_EXERCISABLE"],
+  },
+  {
+    name: "fewer rows than pinned is named as FEWER and not as decay",
+    pinned: 1,
+    measured: 0,
+    kind: "below",
+    must: [
+      "FEWER than recorded",
+      "good direction",
+      "lower the NOT_EXERCISABLE",
+    ],
+  },
+  {
+    name: "an unlisted library that stopped checking asks for a measurement",
+    pinned: undefined,
+    measured: 2,
+    kind: "unpinned",
+    must: ["not in NOT_EXERCISABLE", "Measure the number"],
+  },
+];
+
+const REMEDY_FIXTURES: readonly {
+  readonly name: string;
+  readonly want: State;
+  readonly measured: State;
+  readonly must: string;
+}[] = [
+  {
+    name: "a branch that became exercised is told to update EXPECTED",
+    want: "none",
+    measured: "absent",
+    must: "EXPECTED",
+  },
+  {
+    name: "a branch that stopped being exercised is told to find out why first",
+    want: "absent",
+    measured: "none",
+    must: "STOPPED",
+  },
+  {
+    name: "a state that moved sideways is not called either of those",
+    want: "absent",
+    measured: "simulated",
+    must: "without the branch becoming unexercised",
+  },
+];
+
+/**
+ * Assert what the drift messages SAY, not merely that drift was detected.
+ *
+ * The count messages must never mention EXPECTED and the per-branch remedies
+ * must never mention NOT_EXERCISABLE: those are two separate pins, and a
+ * reader sent to the wrong one edits a table that cannot affect the line they
+ * are reading, watches nothing improve, and concludes the tooling is noisy.
+ */
+function driftMessagesHold(): boolean {
+  let ok = true;
+  const say = (good: boolean, what: string, detail = "") => {
+    if (good) {
+      console.log(`  pass  ${what}`);
+    } else {
+      ok = false;
+      console.error(`  FAIL  ${what}${detail === "" ? "" : ` — ${detail}`}`);
+    }
+  };
+  for (const f of COUNT_MESSAGE_FIXTURES) {
+    const v = countVerdict("9.9.9", f.pinned, f.measured);
+    if (v.kind !== f.kind) {
+      say(false, `message: ${f.name}`, `kind was ${v.kind}, wanted ${f.kind}`);
+      continue;
+    }
+    if (v.kind === "agrees") {
+      say(true, `message: ${f.name}`);
+      continue;
+    }
+    const missing = f.must.filter((m) => !v.text.includes(m));
+    if (missing.length > 0) {
+      say(false, `message: ${f.name}`, `never said ${missing.join(", ")}`);
+    } else if (v.text.includes("EXPECTED")) {
+      say(
+        false,
+        `message: ${f.name}`,
+        "sent the reader to EXPECTED, which no count drift is fixed by",
+      );
+    } else {
+      say(true, `message: ${f.name}`);
+    }
+  }
+  for (const f of REMEDY_FIXTURES) {
+    const text = expectedRemedy(f.want, f.measured);
+    if (!text.includes(f.must)) {
+      say(false, `message: ${f.name}`, `said instead: ${text}`);
+    } else if (text.includes("NOT_EXERCISABLE")) {
+      say(
+        false,
+        `message: ${f.name}`,
+        "sent the reader to NOT_EXERCISABLE, which no state drift is fixed by",
+      );
+    } else {
+      say(true, `message: ${f.name}`);
+    }
+  }
+  return ok;
+}
+
 const LABEL: Record<State, string> = {
   absent: "yes, against real absence",
   simulated: "ONLY SIMULATED",
@@ -639,6 +835,15 @@ async function main(): Promise<void> {
   // First, and needing nothing: the decision function must give each of its
   // four answers on inputs whose right answer is known. If it cannot, no row
   // it produces below is worth reading.
+  console.log("drift message controls");
+  if (!driftMessagesHold()) {
+    console.error(
+      "\nThe report is withheld: a drift message names the wrong direction or the wrong pin. The exit code is not the deliverable — the sentence a human acts on is, and this one would send them to a table that cannot affect what they are reading.",
+    );
+    Deno.exit(1);
+  }
+  console.log("");
+
   console.log("classifier decision controls");
   if (!decisionControlsHold()) {
     console.error(
@@ -809,52 +1014,64 @@ async function main(): Promise<void> {
     );
   }
   if (!Deno.args.includes("--check")) return;
-  const drift: string[] = [];
 
-  // The pinned count, checked before the per-row drift below. Per-row notes
-  // degrade quietly by design; the count is where that degradation is loud.
-  const pinned = NOT_EXERCISABLE.get(version);
-  if (pinned === undefined) {
-    if (unmeasured.length !== 0) {
-      drift.push(
-        `SQLite ${version} is not in NOT_EXERCISABLE, and an unrecorded library must check everything it records — ${unmeasured.length} rows are not exercisable on it. Measure the number and pin it deliberately.`,
-      );
-    }
-  } else if (unmeasured.length !== pinned) {
-    drift.push(
-      `not-exercisable rows on SQLite ${version}: NOT_EXERCISABLE pins ${pinned}, measured ${unmeasured.length}. This is a finding, not a longer footnote — more rows than recorded means the audit has stopped checking things and still exited 0.`,
-    );
-  }
+  // Two pins, two drifts, two reports. They are kept apart on purpose: the
+  // advice for one is the wrong advice for the other, and the only way that
+  // cannot drift back together is for neither block to be able to reach the
+  // other's closing sentence.
+  const count = countVerdict(
+    version,
+    NOT_EXERCISABLE.get(version),
+    unmeasured.length,
+  );
+  const stateDrift: string[] = [];
 
   for (const row of rows) {
     const want = EXPECTED.get(row.branch.capability);
     if (want === undefined) {
-      drift.push(`${row.branch.capability}: not in EXPECTED at all`);
+      stateDrift.push(
+        `${row.branch.capability}: not in EXPECTED at all — add it with the state this run measured, ${row.state}`,
+      );
     } else if (want === "absent" && !canBeAbsent(row.branch)) {
       console.log(
         `${row.branch.capability}: EXPECTED says absent, but ${libPath} HAS the capability, so absence is not exercisable here — measured ${row.state}, not counted as drift`,
       );
     } else if (want !== row.state) {
-      drift.push(
-        `${row.branch.capability}: EXPECTED says ${want}, measured ${row.state}`,
+      stateDrift.push(
+        `${row.branch.capability}: EXPECTED says ${want}, measured ${row.state} — ${
+          expectedRemedy(want, row.state)
+        }`,
       );
     }
   }
   for (const capability of EXPECTED.keys()) {
     if (!rows.some((r) => r.branch.capability === capability)) {
-      drift.push(
-        `${capability}: in EXPECTED but no branch was measured for it`,
+      stateDrift.push(
+        `${capability}: in EXPECTED but no branch was measured for it — either the branch was deleted, in which case drop the EXPECTED entry, or it was not found, which is a bug in BRANCHES`,
       );
     }
   }
-  if (drift.length > 0) {
-    console.error("\ncoverage drifted from what is recorded:\n");
-    for (const d of drift) console.error(`  ${d}`);
+
+  let failing = false;
+  if (count.kind !== "agrees") {
+    failing = true;
     console.error(
-      "\nIf a branch is newly exercised that is good news -- update EXPECTED to record it. If one stopped being exercised, find out why.",
+      "\nthe not-exercisable COUNT drifted from NOT_EXERCISABLE:\n",
     );
-    Deno.exit(1);
+    console.error(`  ${count.text}`);
+    console.error(
+      "\nNOT_EXERCISABLE is the pin to attend to for the line above. EXPECTED records which STATE each branch is in and is not involved here: editing it will not change this line.",
+    );
   }
+  if (stateDrift.length > 0) {
+    failing = true;
+    console.error("\ncoverage drifted from the states EXPECTED records:\n");
+    for (const d of stateDrift) console.error(`  ${d}`);
+    console.error(
+      "\nEXPECTED is the pin to attend to for the lines above, and each carries its own remedy: they fire for opposite reasons, and one instruction for all of them is wrong for half of its readers.",
+    );
+  }
+  if (failing) Deno.exit(1);
   console.log("every branch is in the state EXPECTED records — OK");
 }
 
