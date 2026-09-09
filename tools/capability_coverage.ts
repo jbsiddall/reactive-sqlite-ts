@@ -840,7 +840,7 @@ async function main(): Promise<void> {
     console.error(
       "\nThe report is withheld: a drift message names the wrong direction or the wrong pin. The exit code is not the deliverable — the sentence a human acts on is, and this one would send them to a table that cannot affect what they are reading.",
     );
-    Deno.exit(1);
+    leave(1);
   }
   console.log("");
 
@@ -849,7 +849,7 @@ async function main(): Promise<void> {
     console.error(
       "\nThe report is withheld: the classifier decided a synthetic case wrongly, and every real row would come out of the same decision.",
     );
-    Deno.exit(1);
+    leave(1);
   }
   console.log("");
 
@@ -861,7 +861,7 @@ async function main(): Promise<void> {
     console.error(
       "\nThe report is withheld: the mutate-and-re-run pipeline did not do what every row below assumes it did.",
     );
-    Deno.exit(1);
+    leave(1);
   }
   console.log("");
 
@@ -870,7 +870,7 @@ async function main(): Promise<void> {
     console.error(
       "DENO_SQLITE_PATH must be set to the libsqlite3 the suite runs against.",
     );
-    Deno.exit(2);
+    leave(2);
   }
   const caps = probeCapabilities(libPath);
 
@@ -899,7 +899,7 @@ async function main(): Promise<void> {
     console.error(
       "the suite fails before any mutation; nothing measured here would mean anything",
     );
-    Deno.exit(2);
+    leave(2);
   }
 
   const rows: Row[] = [];
@@ -911,7 +911,7 @@ async function main(): Promise<void> {
     console.error(
       "classified ZERO branches. A table of no rows reads as 'nothing uncovered', so this is a failure, not a clean report.",
     );
-    Deno.exit(2);
+    leave(2);
   }
 
   // The controls, before anything else is trusted.
@@ -962,7 +962,7 @@ async function main(): Promise<void> {
     console.error(
       "\nThe report is withheld: a wrong control means every other row came out of the same broken machinery. Fix the classifier, do not adjust the expectation.",
     );
-    Deno.exit(1);
+    leave(1);
   }
 
   const width = Math.max(...rows.map((r) => r.branch.capability.length));
@@ -1071,8 +1071,123 @@ async function main(): Promise<void> {
       "\nEXPECTED is the pin to attend to for the lines above, and each carries its own remedy: they fire for opposite reasons, and one instruction for all of them is wrong for half of its readers.",
     );
   }
-  if (failing) Deno.exit(1);
+  if (failing) leave(1);
   console.log("every branch is in the state EXPECTED records — OK");
 }
 
-if (import.meta.main) await main();
+/**
+ * Did this run leave a file in `src/` mutated?
+ *
+ * The audit rewrites a refusal to `false` in the real `src/` file, re-runs the
+ * suite and restores it. When that restore does not happen, the library is
+ * left on disk with a live `if (false)` where a refusal should be — and
+ * MEASURED here on both libraries, six of the seven refusal branches are in
+ * state `none`, which is precisely the statement that removing them breaks no
+ * test. So `deno task check` passes and the whole suite passes with the
+ * mutation still in place. Nothing downstream catches it. The only thing that
+ * did catch it once was a human staging explicit paths instead of everything,
+ * and that is discipline rather than a mechanism.
+ *
+ * It compares the CONTENT of `git diff -- src/`, taken before the run and
+ * again at every exit, not `git status`. Two reasons. A developer who was
+ * already mid-edit in `src/` must not be shouted at for their own work — only
+ * a CHANGE between the two snapshots is this run's doing. And `git status`
+ * reports a file as modified purely because its mtime moved, even when the
+ * bytes are identical (observed after a `git checkout --` on a neighbouring
+ * file), so a status-based guard would cry wolf on a file this tool never
+ * wrote to.
+ *
+ * A guard that quietly does nothing when it cannot run is worse than none, so
+ * a `git` that fails to execute is itself reported and fails the run.
+ */
+function srcDiff(): string {
+  try {
+    const out = new Deno.Command("git", {
+      args: ["diff", "--", "src/"],
+      cwd: ROOT,
+      stdout: "piped",
+      stderr: "piped",
+    }).outputSync();
+    if (out.code !== 0) {
+      return `GUARD-UNAVAILABLE: git diff exited ${out.code}: ${
+        new TextDecoder().decode(out.stderr).trim().slice(-300)
+      }`;
+    }
+    return new TextDecoder().decode(out.stdout);
+  } catch (e) {
+    return `GUARD-UNAVAILABLE: git could not be run: ${String(e)}`;
+  }
+}
+
+/** `src/` as it stood before this run touched anything. */
+let srcBefore: string | null = null;
+
+/** Set once the guard has actually been consulted, for the backstop below. */
+let guardRan = false;
+
+/**
+ * Compare `src/` against the snapshot and complain if this run moved it.
+ *
+ * Returns the exit code to leave with: 3 when the guard fires, so it is
+ * distinguishable from the audit's own 1 (drift) and 2 (cannot run).
+ */
+function guardSources(intended: number): number {
+  guardRan = true;
+  const after = srcDiff();
+  if (srcBefore === null) {
+    console.error(
+      "\nGUARD: no `src/` snapshot was taken before this run, so whether it left the library mutated is unknown. Treating that as a failure rather than a pass.",
+    );
+    return 3;
+  }
+  if (
+    after.startsWith("GUARD-UNAVAILABLE:") ||
+    srcBefore.startsWith("GUARD-UNAVAILABLE:")
+  ) {
+    console.error(
+      `\nGUARD: could not check whether this run left \`src/\` mutated. ${
+        after.startsWith("GUARD-UNAVAILABLE:") ? after : srcBefore
+      }`,
+    );
+    return 3;
+  }
+  if (after === srcBefore) return intended;
+  console.error(
+    "\nGUARD: this run CHANGED `src/` and did not put it back. The audit mutates a refusal to `false` in the real source and restores it afterwards; a leftover mutation type-checks and passes the whole suite, because six of the seven refusals are exercised by nothing. Restore it before committing:\n\n  git diff -- src/\n  git checkout -- src/\n",
+  );
+  return 3;
+}
+
+/** Every deliberate exit goes through here so none of them skips the guard. */
+function leave(code: number): never {
+  Deno.exit(guardSources(code));
+}
+
+if (import.meta.main) {
+  srcBefore = srcDiff();
+  // Backstop for an exit path added later that forgets `leave`: `unload` fires
+  // on a normal exit, on `Deno.exit` and on an uncaught throw. It cannot change
+  // the exit code, which is why it is a backstop and not the mechanism.
+  addEventListener("unload", () => {
+    if (!guardRan) {
+      console.error(
+        "\nGUARD DID NOT RUN: this run exited by a path that skips the `src/` check, so whether it left the library mutated was never established. Route that exit through `leave`.",
+      );
+    }
+  });
+  try {
+    await main();
+  } catch (e) {
+    const code = guardSources(0);
+    if (code === 0) throw e;
+    // An uncaught throw forces exit code 1 and `Deno.exitCode` cannot override
+    // it, so rethrowing here would print the guard and then report the ordinary
+    // failure code. Print the error ourselves and leave with the guard's 3: a
+    // run that crashed AND left the library mutated must not be told apart from
+    // one that merely crashed.
+    console.error(e instanceof Error ? e.stack ?? e.message : String(e));
+    Deno.exit(code);
+  }
+  const code = guardSources(0);
+  if (code !== 0) Deno.exitCode = code;
+}

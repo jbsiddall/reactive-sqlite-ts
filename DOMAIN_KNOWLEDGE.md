@@ -706,6 +706,36 @@ not-exercisable rows than recorded means the audit has quietly stopped checking
 things while still exiting 0, which is exactly the failure a count catches and a
 per-row footnote does not.
 
+### A leftover mutation in `src/` is invisible to everything downstream (2026-09-09)
+
+**MEASURED, on both libraries.** Six of the seven capability-refusal branches
+are in state `none` — which is exactly the statement that deleting the refusal
+breaks no test. `tools/capability_coverage.ts` establishes that by rewriting
+each refusal to `false` in the real `src/` file, re-running the suite and
+restoring the file. When a restore does not happen, the library is left on disk
+with a live `if (false)` where a refusal should be, and nothing catches it: the
+type-checker passes and all 441 tests pass with the mutation still in place.
+Observed for real once — a control run that deliberately disabled the restore
+left `src/hooks.ts` mutated, and the only thing that kept it out of a commit was
+a human staging explicit paths rather than everything.
+
+That is a standing property of this codebase, not a fact about that control
+script, and it is not what the guard fixes. The guard catches the accident and
+leaves the property intact: `tools/capability_coverage.ts` snapshots the CONTENT
+of `git diff -- src/` before it starts, compares at every exit — the eight
+deliberate exits, a normal return and an uncaught throw — and exits **3** when
+this run moved `src/` and did not put it back. Content, not `git status`: a
+status-based check reports a file as modified purely because its mtime moved
+(observed after a `git checkout --` on a neighbouring file), and comparing two
+snapshots is also what lets a developer already mid-edit in `src/` run the audit
+without being shouted at for their own work.
+
+Two limits worth knowing before relying on it. A `git` that cannot be run is
+reported and fails the run rather than being skipped, because a guard that
+quietly does nothing is worse than none. And the `unload` backstop, which names
+an exit path added later that forgot to route through `leave`, can only PRINT:
+Deno does not let an `unload` handler change the exit code.
+
 ### `deno publish --dry-run` refuses a graph it cannot ship (2026-09-09, Deno 2.9.6)
 
 **MEASURED.** Adding `src/format.ts` to `publish.exclude` in `deno.json`, while
