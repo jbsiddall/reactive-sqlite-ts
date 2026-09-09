@@ -37,6 +37,19 @@
  * the same broken machinery. Finding ZERO branches is likewise a failure and
  * never a clean report -- an empty table reads as "nothing uncovered".
  *
+ * Those two controls need a real library, and between them they can only ever
+ * elicit states 1 and 3. State 2 they cannot reach at all: no library
+ * reachable from this repository has a capability whose absence one of our
+ * options can fake, so `simulated` is a defined state that nothing measured
+ * here occupies. The judgement is therefore split out — {@linkcode decide},
+ * four evidence values in, one state out — and driven by synthetic inputs
+ * covering all four, so the `simulated` verdict is watched happening rather
+ * than reasoned about. `decide` is the function the real path calls, not a
+ * copy of it; a copy would keep passing after the real one diverged. The split
+ * buys the DECISION and nothing more: the mutate, type-check and re-run
+ * machinery that produces the evidence is still exercised only by running this
+ * against a real library.
+ *
  *   deno task test:capability-coverage
  *
  * Needs a libsqlite3 (see //libsqlite3) plus --allow-run to re-run the suite.
@@ -208,6 +221,178 @@ async function suitePasses(libPath: string): Promise<boolean> {
   return code === 0;
 }
 
+/**
+ * Everything the classifier is allowed to reason from, once a mutation has
+ * been applied and the suite has been re-run.
+ *
+ * Deliberately four plain values rather than the branch, the capabilities and
+ * a library path: the DECISION does not depend on which branch this is or what
+ * is on disk, and stating that as a type is what makes it drivable by inputs
+ * no machine here can produce — a `simulated` verdict among them, which no
+ * library reachable from this repository can currently elicit.
+ */
+interface Evidence {
+  /** Did the mutated source still type-check? */
+  readonly compiles: boolean;
+  /** Did the semantic suite still pass with the refusal removed? */
+  readonly passed: boolean;
+  /** Does the library the suite ran against actually have the capability? */
+  readonly hasCapability: boolean;
+  /** An option that fakes the absence, or null when none exists. */
+  readonly simulator: string | null;
+}
+
+/**
+ * The classifier's decision, and nothing else.
+ *
+ * ## What this covers, and what it does not
+ *
+ * This is the judgement — four states out of four evidence values. It is NOT
+ * the mutate-and-re-run machinery that produces the evidence: rewriting the
+ * `if`, type-checking the result and re-running the suite are still exercised
+ * only by running the real thing against a real library. Splitting the two
+ * buys one thing, and it is worth saying plainly what: the `simulated` verdict
+ * can now be seen to happen. It is a defined state that NOTHING in this
+ * repository currently occupies — no library reachable here has a capability
+ * whose absence an option can fake — so before this it was a branch reasoned
+ * about and never observed.
+ */
+function decide(e: Evidence): { state: State; because: string } {
+  // Checked before the suite result is believed, and in this order: a mutation
+  // that does not COMPILE makes the suite fail for a reason that has nothing
+  // to do with the branch, and that failure would read as "something reached
+  // it". That is the dangerous direction — it invents coverage.
+  if (!e.compiles) {
+    return {
+      state: "unclassifiable",
+      because:
+        "the mutated source does not type-check, so the suite result says nothing",
+    };
+  }
+  if (e.passed) {
+    return { state: "none", because: "removing the refusal broke no test" };
+  }
+  if (!e.hasCapability) {
+    return {
+      state: "absent",
+      because: "the test library genuinely lacks the symbol",
+    };
+  }
+  return {
+    state: "simulated",
+    because: e.simulator === null
+      ? "the test library HAS the symbol, so absence was faked — by what is unclear"
+      : `the test library HAS the symbol; reached via ${e.simulator}`,
+  };
+}
+
+/**
+ * Synthetic evidence covering all four states, plus the one distinction inside
+ * `simulated` that a reader acts on.
+ *
+ * These run on every invocation, before the library is even looked at, because
+ * they need nothing: no SQLite, no mutation, no suite. A decision function
+ * nobody has watched produce each of its four answers is a decision function
+ * whose answers are asserted rather than known.
+ */
+const DECISION_FIXTURES: readonly {
+  readonly name: string;
+  readonly evidence: Evidence;
+  readonly state: State;
+  readonly because?: string;
+}[] = [
+  {
+    name: "a mutation that does not compile decides nothing",
+    evidence: {
+      compiles: false,
+      passed: false,
+      hasCapability: false,
+      simulator: null,
+    },
+    state: "unclassifiable",
+  },
+  {
+    name: "compiling but the suite still passes: nothing reached the refusal",
+    evidence: {
+      compiles: true,
+      passed: true,
+      hasCapability: false,
+      simulator: null,
+    },
+    state: "none",
+  },
+  {
+    name: "a passing suite outranks the capability: still `none`, not `absent`",
+    evidence: {
+      compiles: true,
+      passed: true,
+      hasCapability: true,
+      simulator: 'preupdate: "off"',
+    },
+    state: "none",
+  },
+  {
+    name: "the suite fails and the library lacks the symbol: real absence",
+    evidence: {
+      compiles: true,
+      passed: false,
+      hasCapability: false,
+      simulator: null,
+    },
+    state: "absent",
+  },
+  {
+    name: "the suite fails but the library HAS the symbol: only simulated",
+    evidence: {
+      compiles: true,
+      passed: false,
+      hasCapability: true,
+      simulator: 'preupdate: "off"',
+    },
+    state: "simulated",
+    because: 'reached via preupdate: "off"',
+  },
+  {
+    name: "simulated with no known simulator says so rather than naming one",
+    evidence: {
+      compiles: true,
+      passed: false,
+      hasCapability: true,
+      simulator: null,
+    },
+    state: "simulated",
+    because: "by what is unclear",
+  },
+];
+
+/**
+ * Run the fixtures. True when every one held.
+ *
+ * Failure withholds the whole report for the same reason a failed control
+ * does: a decision function that gets a synthetic case wrong got the real
+ * rows wrong by the same means.
+ */
+function decisionControlsHold(): boolean {
+  let bad = 0;
+  for (const f of DECISION_FIXTURES) {
+    const got = decide(f.evidence);
+    const wrongState = got.state !== f.state;
+    const wrongWhy = f.because !== undefined &&
+      !got.because.includes(f.because);
+    if (wrongState || wrongWhy) {
+      bad++;
+      console.error(
+        `  decision fixture "${f.name}": expected ${f.state}${
+          f.because === undefined ? "" : ` (${f.because})`
+        }, got ${got.state} (${got.because})`,
+      );
+    } else {
+      console.log(`  pass  decision: ${f.name}`);
+    }
+  }
+  return bad === 0;
+}
+
 async function classify(
   branch: Branch,
   caps: Capabilities,
@@ -245,36 +430,15 @@ async function classify(
   } finally {
     await Deno.writeTextFile(path, original);
   }
-  if (!compiles) {
-    return {
-      branch,
-      state: "unclassifiable",
-      because:
-        "the mutated source does not type-check, so the suite result says nothing",
-    };
-  }
-  if (passed) {
-    return {
-      branch,
-      state: "none",
-      because: "removing the refusal broke no test",
-    };
-  }
-  const has = caps[branch.capability] === true;
-  if (!has) {
-    return {
-      branch,
-      state: "absent",
-      because: "the test library genuinely lacks the symbol",
-    };
-  }
-  return {
-    branch,
-    state: "simulated",
-    because: branch.simulator === null
-      ? "the test library HAS the symbol, so absence was faked — by what is unclear"
-      : `the test library HAS the symbol; reached via ${branch.simulator}`,
-  };
+  // The same function the fixtures above drive. Not a copy of it: a copy
+  // would let the fixtures go on passing after the real path diverged.
+  const { state, because } = decide({
+    compiles,
+    passed,
+    hasCapability: caps[branch.capability] === true,
+    simulator: branch.simulator,
+  });
+  return { branch, state, because };
 }
 
 const LABEL: Record<State, string> = {
@@ -285,6 +449,18 @@ const LABEL: Record<State, string> = {
 };
 
 async function main(): Promise<void> {
+  // First, and needing nothing: the decision function must give each of its
+  // four answers on inputs whose right answer is known. If it cannot, no row
+  // it produces below is worth reading.
+  console.log("classifier decision controls");
+  if (!decisionControlsHold()) {
+    console.error(
+      "\nThe report is withheld: the classifier decided a synthetic case wrongly, and every real row would come out of the same decision.",
+    );
+    Deno.exit(1);
+  }
+  console.log("");
+
   const libPath = Deno.env.get("DENO_SQLITE_PATH");
   if (libPath === undefined || libPath === "") {
     console.error(
@@ -375,6 +551,17 @@ async function main(): Promise<void> {
   console.log(
     `${rows.length} refusal branches; ${covered.length} exercised against a library that genuinely lacks the capability.`,
   );
+  if (!rows.some((r) => r.state === "simulated")) {
+    // Worth saying out loud rather than leaving as an absent row: `simulated`
+    // is a defined state that nothing here occupies. It is not that simulation
+    // was ruled out — it is that no library reachable from this repository has
+    // a capability whose absence one of our options can fake, so the state has
+    // never been produced by a measurement. The fixtures above are the only
+    // place it is seen at all.
+    console.log(
+      "No branch classified ONLY SIMULATED. That state is defined and currently occupied by nothing measured here; the decision controls above are where it is exercised.",
+    );
+  }
   if (!Deno.args.includes("--check")) return;
   const drift: string[] = [];
   for (const row of rows) {
