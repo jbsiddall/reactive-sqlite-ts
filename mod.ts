@@ -42,4 +42,6 @@ export type {
   Validator,
 } from "./src/hooks.ts";
 
+export { formatEvent, jsonReplacer } from "./src/format.ts";
+
 export { resolveLibPath } from "./src/lib_path.ts";

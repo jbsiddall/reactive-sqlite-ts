@@ -86,6 +86,25 @@ rejection, use a `BEFORE` trigger whose `WHEN` clause calls a registered JS
 function and whose body is `RAISE(IGNORE)`: that skips just the offending row
 and lets the rest of the transaction commit.
 
+### Logging an event
+
+`JSON.stringify(event)` throws: an INTEGER always decodes to a `bigint`, and
+`JSON.stringify` refuses those. Use `formatEvent`, or pass `jsonReplacer` to
+your own stringify call:
+
+```ts
+import { formatEvent, jsonReplacer } from "@jbsiddall/reactive-sqlite";
+
+withEvents(db, (e) => console.log(formatEvent(e, 2)), LIB);
+JSON.stringify(batch, jsonReplacer); // when you need your own call
+```
+
+A `bigint` prints as its decimal digits in a string — always, never a number
+when it happens to fit, because that would make the JavaScript type depend on
+the value. A blob prints as SQLite's own `x'00ff80'` literal, which reads
+sensibly and pastes back into SQL. This is a debugging aid, not a decoder: it
+renders the raw values, it does not interpret them.
+
 ### `op` is open at the edge, and `opcode` is what arrived
 
 Every change carries both our reading of what happened and the raw value SQLite

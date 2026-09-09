@@ -31,6 +31,7 @@ const {
   withEvents,
   withValidation,
 } = await import("../src/hooks.ts");
+const { formatEvent, jsonReplacer } = await import("../src/format.ts");
 type DbEvent = import("../src/hooks.ts").DbEvent;
 type PreUpdate = import("../src/hooks.ts").PreUpdate;
 type RowValue = import("../src/hooks.ts").RowValue;
@@ -1221,6 +1222,58 @@ const SEMANTIC: Record<string, () => void> = {
     }
     check("  silent on correct usage", warned.lines, []);
     check("  the veto still held, the accept still landed", rows(db), 1);
+    db.close();
+  },
+
+  "formatEvent round-trips a rowid past 2^53 and a blob"() {
+    const db = types();
+    const pre = preupdates(db);
+    // 2^53 + 1: the first integer a number-if-safe serialiser would round.
+    db.exec(
+      "INSERT INTO v VALUES (9007199254740993, 'a', 1.5, x'00ff80', 42)",
+    );
+    const row = pre[0];
+    if (row === undefined) {
+      fail("formatEvent round-trip", "no preupdate event");
+      db.close();
+      return;
+    }
+    const event: DbEvent = { type: "preupdate", ...row };
+
+    let plainThrew = "";
+    try {
+      JSON.stringify(event);
+    } catch (e) {
+      plainThrew = name_(e);
+    }
+    check("  JSON.stringify alone throws", plainThrew, "TypeError");
+
+    const text = formatEvent(event);
+    const seen = JSON.parse(text);
+    check("  parses back", typeof seen === "object" && seen !== null, true);
+    check("  rowid exact, as digits", `${seen.newRowid}`, "9007199254740993");
+    check(
+      "  and not rounded",
+      `${seen.newRowid}` === `${Number(9007199254740993)}`,
+      false,
+    );
+    check("  blob is readable", `${seen.new.b}`, "x'00ff80'");
+    check("  text is untouched", `${seen.new.s}`, "a");
+    check("  real is untouched", seen.new.r, 1.5);
+    db.close();
+  },
+
+  "jsonReplacer works with a caller's own JSON.stringify"() {
+    const db = memory();
+    const events: DbEvent[] = [];
+    withEvents(db, (e) => void events.push(e), LIB, { preupdate: "off" });
+    db.exec("INSERT INTO t VALUES (9007199254740993, 'a')");
+    const change = events.find((e) => e.type === "change");
+    check("  a change arrived", change !== undefined, true);
+    const text = JSON.stringify(change, jsonReplacer, 2);
+    const seen = JSON.parse(text);
+    check("  valid JSON", typeof seen, "object");
+    check("  rowid exact", `${seen.change.rowid}`, "9007199254740993");
     db.close();
   },
 
