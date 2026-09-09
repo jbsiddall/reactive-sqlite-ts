@@ -13,6 +13,7 @@
  *     --allow-net test/crash_cases.ts dispose-in-listener
  */
 import { resolveLibPath } from "../src/lib_path.ts";
+import { runHardProperty } from "./hard_properties.ts";
 
 const LIB = resolveLibPath();
 const { Database } = await import("@db/sqlite");
@@ -21,6 +22,9 @@ type PreUpdate = import("../src/hooks.ts").PreUpdate;
 type DbEvent = import("../src/hooks.ts").DbEvent;
 type Listener = import("../src/hooks.ts").Listener;
 type Db = InstanceType<typeof Database>;
+
+/** Kept modest so the crash matrix stays quick; raise it for a soak run. */
+const HARD_RUNS = Number(Deno.env.get("HARD_RUNS") ?? 150);
 
 export type CrashCase = {
   /** What the child process must exit with. Never 139. */
@@ -948,6 +952,16 @@ export const CASES: Record<string, CrashCase> = {
       on(db, "precommit", () => new Promise<boolean>(() => {}));
       db.exec("INSERT INTO t VALUES (1, 'a')");
       console.log("unreachable");
+    },
+  },
+
+  "property-no-permutation-crashes": {
+    code: 0,
+    match: "survived",
+    why:
+      "The hard invariant: fast-check generates permutations of attach/dispose/close/transaction/veto/blob-write and no sequence may segfault. Judged on exit code, out of process, so a crash can never read as a pass.",
+    run() {
+      runHardProperty(HARD_RUNS);
     },
   },
 

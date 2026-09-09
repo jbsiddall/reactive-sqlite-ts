@@ -20,6 +20,7 @@
  */
 import { resolveLibPath } from "../src/lib_path.ts";
 import { CASES } from "./crash_cases.ts";
+import { PROPERTIES, PROPERTY_RUNS, PROPERTY_SEED } from "./properties.ts";
 
 const LIB = resolveLibPath();
 const { Database } = await import("@db/sqlite");
@@ -28,6 +29,7 @@ const { SqliteHooksError, probeCapabilities, withEvents, withValidation } =
 type DbEvent = import("../src/hooks.ts").DbEvent;
 type PreUpdate = import("../src/hooks.ts").PreUpdate;
 type RowValue = import("../src/hooks.ts").RowValue;
+type Change = import("../src/hooks.ts").Change;
 type Db = InstanceType<typeof Database>;
 
 let passed = 0;
@@ -1217,6 +1219,29 @@ const SEMANTIC: Record<string, () => void> = {
     db.close();
   },
 
+  "our update hook is still the one SQLite has installed, not the driver's"() {
+    // SQLite keeps ONE update hook per connection. @db/sqlite 0.13.0 declares
+    // sqlite3_update_hook without calling it; if a release ever calls it, ours
+    // is displaced and every change event stops with no error anywhere. Only a
+    // real write proves otherwise — a symbol still looks fine when displaced.
+    const db = memory();
+    const seen: Change[] = [];
+    withEvents(db, (e) => {
+      if (e.type === "change") seen.push(e.change);
+    }, LIB);
+    db.exec("INSERT INTO t VALUES (1, 'a')");
+    db.prepare("INSERT INTO t VALUES (?, ?)").run(2, "b");
+    db.transaction(() => {
+      db.exec("UPDATE t SET v = 'c' WHERE id = 1");
+    })();
+    check(
+      "  every write reached our hook",
+      seen.map((c) => `${c.op} ${c.db}.${c.table} ${c.rowid}`),
+      ["insert main.t 1", "insert main.t 2", "update main.t 1"],
+    );
+    db.close();
+  },
+
   "driver internals: statement methods are own, Database methods are not"() {
     const db = memory();
     const stmt = db.prepare("SELECT * FROM t");
@@ -1284,6 +1309,22 @@ if (runSemantic) {
       fn();
     } catch (e) {
       fail(name, `threw ${e instanceof Error ? e.stack : e}`);
+    }
+  }
+
+  // Soft properties: a failure here is a semantics bug, never a crash. The
+  // hard "no permutation may segfault" invariant lives in the crash matrix.
+  console.log(
+    `\nsoft property suite (${
+      Object.keys(PROPERTIES).length
+    } properties x ${PROPERTY_RUNS} runs, seed ${PROPERTY_SEED})`,
+  );
+  for (const [name, fn] of Object.entries(PROPERTIES)) {
+    try {
+      fn();
+      pass(name);
+    } catch (e) {
+      fail(name, `falsified — replay with FC_SEED=${PROPERTY_SEED}: ${msg(e)}`);
     }
   }
 }

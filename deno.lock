@@ -10,7 +10,8 @@
     "jsr:@std/path@1": "1.1.6",
     "jsr:@std/path@1.0": "1.0.9",
     "jsr:@std/path@1.1.6": "1.1.6",
-    "jsr:@std/path@^1.1.5": "1.1.6"
+    "jsr:@std/path@^1.1.5": "1.1.6",
+    "npm:fast-check@4.9.0": "4.9.0"
   },
   "jsr": {
     "@db/sqlite@0.13.0": {
@@ -53,6 +54,17 @@
       "dependencies": [
         "jsr:@std/internal"
       ]
+    }
+  },
+  "npm": {
+    "fast-check@4.9.0": {
+      "integrity": "sha512-7ms6T7SybUev/PQITciI0yLM2pOSFy5zpG8Ty7tQofcVaQUvrMXp6CBwqF6fThLCLOrfBtuHAtwq6Yu4XPCllg==",
+      "dependencies": [
+        "pure-rand"
+      ]
+    },
+    "pure-rand@8.4.2": {
+      "integrity": "sha512-vvuOGgcuPJAirlHvuQw1TrOiw7ptaIXXmIbNuiNOY6lNGJJH49PQ1Kj4nd783nPdQhQdicgOjVI2yI/9BD6/Ng=="
     }
   },
   "workspace": {
