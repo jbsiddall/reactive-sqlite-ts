@@ -30,6 +30,10 @@
       "description": "The crash matrix: every case runs in its OWN child process and is asserted on its exit code, so a genuine segfault (139) can never be mistaken for a pass. --allow-run is unscoped because the child is Deno.execPath(), known only at runtime; the only program spawned is this same Deno binary running test/crash_cases.ts.",
       "command": "deno run --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write --allow-net --allow-run test/suite.ts crash"
     },
+    "test:publish": {
+      "description": "Assert what the published package actually contains — LICENSE and NOTICE present, test/ and tools/ absent. Spawns `deno publish --dry-run`, which validates without uploading. --allow-run is unscoped because the child is Deno.execPath(), known only at runtime.",
+      "command": "deno run --allow-run --allow-read --allow-env test/publish_manifest.ts"
+    },
     "demo": {
       "description": "Run the demo in examples/: every commit-lifecycle event, the precommit veto, batching and the preupdate row values, against a real database. Not a test; needs --allow-ffi and a libsqlite3 (see //libsqlite3).",
       "command": "deno run --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write --allow-net examples/demo.ts"

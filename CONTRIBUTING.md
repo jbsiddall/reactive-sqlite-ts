@@ -110,6 +110,20 @@ above prevents.
 `set_authorizer` fires at prepare time and should be checked against this same
 question rather than assumed to match either group.
 
+### When a hook needs a verification phase before it is built
+
+Two triggers, either one sufficient:
+
+1. **It has a live verdict** — the callback's return value changes what SQLite
+   does. `precommit`, `progress`, `busy` and `authorize` all qualify; `wal` and
+   `trace` do not.
+2. **Its purpose requires an operation the guard refuses.** A hook whose
+   documented use is to call back into the connection collides with the rule
+   behind `inFfi`, `reg.inHook` and `guard()`, and that is a design question
+   rather than a build detail. `collation_needed` is the case: SQLite's
+   documented design has the callback register the collation by calling
+   `sqlite3_create_collation` on the connection, from inside the callback.
+
 ### A hook can observe the library itself
 
 `set_authorizer` surfaced a defect class nothing before it could have: **our own
@@ -149,6 +163,12 @@ knowable now rather than after it is built:
 3. **The schema argument is sometimes null.** `SELECT count(*) FROM t` reports
    the table with an empty column name and a null schema. A key built from
    authorize events cannot always be a full `(schema, table)` pair.
+
+4. **An observation made at prepare time is not a claim about execute time.**
+   The finding above was wrong in its first form for exactly this reason: a
+   probe that stopped at `prepare` reported a cleaner world than the one that
+   exists, confidently. A probe that exercises less than the real path will do
+   that every time.
 
 Also: collect around the `prepare`, not the whole call. Executing a write to a
 virtual table authorizes its shadow tables too, because FTS5 prepares its own

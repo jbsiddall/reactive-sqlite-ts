@@ -129,3 +129,9 @@ jobs:
       # code, so a real segfault (139) cannot be reported as a pass.
       - name: Crash matrix
         run: deno task test:crash
+
+      # What actually ships. Asserts on the file list deno publish reports,
+      # not on the exclude patterns, so a rule that catches LICENSE or NOTICE
+      # by accident fails here rather than in a published package.
+      - name: Publish manifest
+        run: deno task test:publish
