@@ -107,6 +107,150 @@ return value can change what the database does.
 | 📅 Unknown collation needed | `sqlite3_collation_needed` | yes | no   | no; supplies the collation | Fires when a statement names an unregistered collation   |
 | 📅 Statement authorisation  | `sqlite3_set_authorizer`   | yes | no   | **yes** → `DENY`/`IGNORE`  | Prepare-time; table/column names only, no rows or values |
 
+## This library versus the other SQLite bindings
+
+A different question from the table above: not "what does SQLite allow" but
+"which binding should you reach for". This library is not a SQLite driver. It is
+a hook layer on top of [`@db/sqlite`](https://jsr.io/@db/sqlite), so wherever a
+row below says _via `@db/sqlite`_ the feature is the driver's, available to you
+because you are still holding the driver's `Database`, and unaffected by
+anything here.
+
+Legend: 📅 roadmap in this library, not implemented — same convention as the
+capability table above.
+
+Versions checked on 2026-09-09, against each project's own documentation, type
+definitions or source: better-sqlite3 13.0.3 (npm, 2026-08-05) · `node:sqlite`
+as documented in `doc/api/sqlite.md` on `nodejs/node@main`, Stability "1.2 -
+Release candidate" · `bun:sqlite` per `bun-types` 1.4.2 and bun.com/docs ·
+`sqlite3` (node-sqlite3) 6.0.1 (npm, 2026-03-12) · `@db/sqlite` 0.13.0 (JSR,
+2025-11-18) · `@sqlite.org/sqlite-wasm` 3.53.4-build1 (npm, 2026-09-08) · sql.js
+1.14.2 (npm, 2026-08-14) · wa-sqlite 1.0.0 (npm, 2024-01-05).
+
+How a "no" was reached, because absence of mention is not evidence: for
+better-sqlite3, `node:sqlite`, `sqlite3` and `@db/sqlite` a "no" means the C
+symbol is absent from the library's own source or FFI symbol table, which is
+checkable; for `bun:sqlite` it means the capability is in neither bun.com/docs
+nor the `bun-types` type definitions, which enumerate the whole `Database` class
+— Bun's own source was not read. Whether the two Node native addons load under
+Deno's or Bun's Node compatibility layer was not tested either way.
+
+Two caveats before the cells. node-sqlite3's README opens with "This repository
+is currently unmaintained. We will not update any of its issues or pull
+requests", so treat it as legacy even though npm releases still appear.
+wa-sqlite has had no npm release since January 2024.
+
+### Change notification and control
+
+| C hook / feature                 | reactive-sqlite             | better-sqlite3                        | `node:sqlite`                           | `bun:sqlite` | `sqlite3`                               | `@db/sqlite`            | sqlite-wasm |
+| -------------------------------- | --------------------------- | ------------------------------------- | --------------------------------------- | ------------ | --------------------------------------- | ----------------------- | ----------- |
+| `update_hook` (row ins/upd/del)  | yes                         | not in a release; PR #1337 open       | no                                      | no           | yes — `db.on("change")`, async delivery | symbol declared, no API | yes         |
+| `preupdate_hook` (old/new)       | yes, where the build has it | no; bundled build omits the flag      | no                                      | no           | no                                      | no                      | yes         |
+| `commit_hook`                    | yes, and can veto           | not in a release; PR #1337 open       | no                                      | no           | no                                      | no                      | yes         |
+| `rollback_hook`                  | yes                         | not in a release; PR #1337 open       | no                                      | no           | no                                      | no                      | yes         |
+| post-commit (synthesised)        | yes                         | no                                    | no                                      | no           | no                                      | no                      | no          |
+| `wal_hook`                       | 📅                          | no                                    | no                                      | no           | no                                      | no                      | no          |
+| `trace_v2` / profile             | 📅                          | `verbose` option logs each SQL string | `diagnostics_channel` `sqlite.db.query` | no           | yes — `trace` and `profile` events      | no                      | yes         |
+| `progress_handler`               | 📅                          | no                                    | no                                      | no           | no                                      | no                      | yes         |
+| busy handler / timeout           | 📅 handler                  | `timeout` option                      | `timeout` option                        | no           | `configure("busyTimeout")`              | no                      | yes, both   |
+| `collation_needed`               | 📅                          | no                                    | no                                      | no           | no                                      | no                      | yes         |
+| authorizer                       | 📅                          | no                                    | yes — `setAuthorizer`                   | no           | no                                      | no                      | yes         |
+| session / changesets / patchsets | no                          | no                                    | yes — `createSession`, `applyChangeset` | no           | no                                      | no                      | yes         |
+
+Any of these can set `PRAGMA busy_timeout`; that row is about the C-level
+handler or a constructor option. "sqlite-wasm" here means the C API the official
+build exposes to JavaScript, which you drive yourself — there is no
+`db.onUpdate(...)` convenience wrapper, and a callback must be installed as a
+WASM function pointer.
+
+### Extending SQLite, and moving data in and out
+
+| Feature                   | reactive-sqlite  | better-sqlite3              | `node:sqlite`             | `bun:sqlite` | `sqlite3`         | `@db/sqlite`     | sqlite-wasm                  |
+| ------------------------- | ---------------- | --------------------------- | ------------------------- | ------------ | ----------------- | ---------------- | ---------------------------- |
+| Scalar functions          | via `@db/sqlite` | yes                         | yes                       | no           | no                | yes              | yes                          |
+| Aggregates                | via `@db/sqlite` | yes                         | yes                       | no           | no                | yes              | yes                          |
+| Window functions          | no               | yes — `aggregate.inverse`   | yes — `aggregate.inverse` | no           | no                | no               | yes                          |
+| Virtual tables            | no               | yes — `db.table`, read-only | no                        | no           | no                | no               | yes — `create_module`        |
+| Custom collations         | no               | no                          | no                        | no           | no                | no               | yes                          |
+| Incremental BLOB I/O      | via `@db/sqlite` | no                          | no                        | no           | no                | yes — `openBlob` | no — `blob_open` not exposed |
+| Backup API                | via `@db/sqlite` | yes — async, with progress  | yes — `sqlite.backup`     | no           | yes — `db.backup` | yes              | no                           |
+| `serialize`/`deserialize` | no               | yes                         | yes                       | yes          | no                | no               | yes                          |
+| Loadable extensions       | via `@db/sqlite` | yes                         | yes                       | yes          | yes               | yes              | no — WASM                    |
+
+node-sqlite3's `db.serialize()` is unrelated: it serialises _query execution
+order_, not the database. It has no `sqlite3_serialize`.
+
+### Runtime and API shape
+
+|                         | reactive-sqlite                           | better-sqlite3         | `node:sqlite`                    | `bun:sqlite`   | `sqlite3`              | `@db/sqlite`                               | sqlite-wasm                 |
+| ----------------------- | ----------------------------------------- | ---------------------- | -------------------------------- | -------------- | ---------------------- | ------------------------------------------ | --------------------------- |
+| API                     | sync                                      | sync                   | sync                             | sync           | async, callbacks       | sync                                       | sync; worker API is async   |
+| Runtimes                | Deno                                      | Node                   | Node ≥ 22.5; Deno ≥ 2.2 (subset) | Bun            | Node                   | Deno                                       | browser; Node build shipped |
+| Where SQLite comes from | your `libsqlite3`, via `DENO_SQLITE_PATH` | native addon, prebuilt | built into Node                  | built into Bun | native addon, prebuilt | prebuilt downloaded, or `DENO_SQLITE_PATH` | compiled into the WASM      |
+| Sandbox cost            | `--allow-ffi` (whole-process)             | n/a                    | n/a                              | n/a            | n/a                    | `--allow-ffi` (whole-process)              | none                        |
+| Status                  | pre-1.0, unpublished                      | stable                 | Release candidate                | stable         | unmaintained repo      | 0.13.0                                     | tracks SQLite releases      |
+
+### Values, in and out
+
+Where people get surprised first. Reading: every one of these returns `null` for
+SQL `NULL`, `string` for TEXT and a JS number for REAL, so only the awkward
+cases are listed.
+
+|                    | reactive-sqlite                                        | better-sqlite3                            | `node:sqlite`                                        | `bun:sqlite`                              | `sqlite3`                | `@db/sqlite`                                                     | sqlite-wasm                                              |
+| ------------------ | ------------------------------------------------------ | ----------------------------------------- | ---------------------------------------------------- | ----------------------------------------- | ------------------------ | ---------------------------------------------------------------- | -------------------------------------------------------- |
+| bind `boolean`     | via driver → INTEGER 1/0                               | throws                                    | INTEGER 1/0                                          | INTEGER 1/0                               | INTEGER 1/0              | INTEGER 1/0                                                      | INTEGER 1/0                                              |
+| bind `Date`        | via driver → ISO 8601 TEXT                             | throws                                    | throws                                               | not in the types                          | REAL, epoch milliseconds | ISO 8601 TEXT                                                    | not accepted                                             |
+| bind `bigint`      | via driver → INTEGER                                   | INTEGER; range error past 64 bits         | INTEGER; range error past 64 bits                    | INTEGER                                   | not accepted             | INTEGER                                                          | INTEGER                                                  |
+| bind bytes         | via driver → `Uint8Array`                              | `Buffer`                                  | TypedArray, DataView, ArrayBuffer, SharedArrayBuffer | TypedArray                                | `Buffer`                 | `Uint8Array`                                                     | `Uint8Array`, `Int8Array`, `ArrayBuffer`                 |
+| bind `undefined`   | via driver → NULL                                      | NULL                                      | NULL                                                 | not in the types                          | not accepted             | NULL                                                             | NULL                                                     |
+| bind other objects | via driver → JSON TEXT                                 | throws                                    | throws                                               | not in the types                          | `String(value)` TEXT     | JSON TEXT                                                        | not accepted                                             |
+| read INTEGER       | `bigint` in `preupdate` events; driver rules elsewhere | `number`, or `bigint` with `safeIntegers` | `number`, or `bigint` with `readBigInts`             | `number`, or `bigint` with `safeIntegers` | `number` always          | 32-bit `number` by default; `number`/`bigint` with `int64: true` | `number`; over 53 bits needs BigInt support or it throws |
+| read BLOB          | `Uint8Array` copy                                      | `Buffer`                                  | `Uint8Array`                                         | `Uint8Array`                              | `Buffer`                 | `Uint8Array`                                                     | `Uint8Array`                                             |
+
+Two traps worth spelling out. better-sqlite3 binds every JS number with
+`sqlite3_bind_double`, so an integral number is stored as REAL unless the
+column's affinity converts it. `@db/sqlite` reads INTEGER columns with
+`sqlite3_column_int` unless you pass `int64: true` — its own doc says "integers
+larger than 32 bit will be inaccurate" — and it parses TEXT carrying SQLite's
+JSON subtype into objects unless you pass `parseJson: false`. Both apply to code
+using this library, since the driver is doing the reading.
+
+### The three WASM builds
+
+They are not interchangeable.
+
+|                   | `@sqlite.org/sqlite-wasm`             | sql.js                                | wa-sqlite                                                                  |
+| ----------------- | ------------------------------------- | ------------------------------------- | -------------------------------------------------------------------------- |
+| Who builds it     | the SQLite project                    | community                             | community                                                                  |
+| Hooks             | the whole C API, `preupdate` included | `updateHook` only                     | `update_hook` only                                                         |
+| Authorizer        | yes                                   | no                                    | yes — `set_authorizer`                                                     |
+| Progress handler  | yes                                   | no                                    | yes — `progress_handler`                                                   |
+| Functions         | scalar, aggregate, window             | `create_function`, `create_aggregate` | scalar and aggregate via `create_function`                                 |
+| Virtual tables    | yes                                   | no                                    | yes — `create_module`                                                      |
+| Session extension | yes                                   | no                                    | no                                                                         |
+| API               | sync, plus async worker/OPFS          | sync                                  | async — `step`, `prepare_v2` return promises, and VFS methods may be async |
+| Persistence       | OPFS, needs COOP/COEP headers         | in memory; `export()` a file          | pluggable VFS, IndexedDB and OPFS examples                                 |
+| `bigint` binding  | INTEGER                               | bound as TEXT                         | `bind_int64`                                                               |
+| Last npm release  | 2026-09-08                            | 2026-08-14                            | 2024-01-05                                                                 |
+
+### When not to use this library
+
+If you are on Node today and do not need change notification, use
+better-sqlite3: it is mature, published, needs no environment variable, and
+gives you window functions, virtual tables, backup and `serialize` that this
+library does not. If you want a builtin with no native dependency at all, and
+changesets rather than live events, `node:sqlite` already ships in Node and in
+Deno. If you need the browser, the WASM builds are the only option, and the
+official `@sqlite.org/sqlite-wasm` exposes more of SQLite than anything else
+here — including `preupdate_hook` and the session extension — at the cost of
+driving the C API yourself. If you are on Bun, `bun:sqlite` is the only builtin,
+and none of the hooks exist there at all.
+
+Reach for this library when you are on Deno, want row and commit events with the
+actual column values, want a commit you can veto from JavaScript, and can live
+with pre-1.0 churn, an unpublished package, `--allow-ffi` and supplying your own
+`libsqlite3`.
+
 ## Coverage
 
 Each batch carries a `coverage`: `"complete"` (every row present), `"truncated"`
