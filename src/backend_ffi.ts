@@ -14,7 +14,13 @@ import type {
   RawTrace,
   TraceSql,
 } from "./backend.ts";
-import { SQLITE_DELETE, SQLITE_INSERT } from "./backend.ts";
+import {
+  AUTH_DENY,
+  AUTH_IGNORE,
+  AUTH_OK,
+  SQLITE_DELETE,
+  SQLITE_INSERT,
+} from "./backend.ts";
 import type { Capabilities, EventOptions, RowValue } from "./hooks.ts";
 // A runtime cycle with hooks.ts, safe because neither reference is evaluated
 // at module-evaluation time. If a third module ever appears, this class moves
@@ -23,6 +29,10 @@ import { SqliteHooksError } from "./hooks.ts";
 
 const readC = (p: Deno.PointerValue) =>
   p === null ? "" : new Deno.UnsafePointerView(p).getCString();
+
+/** A NULL argument and an empty string are different observations; keep both. */
+const readOrNull = (p: Deno.PointerValue): string | null =>
+  p === null ? null : new Deno.UnsafePointerView(p).getCString();
 
 const SYMBOLS = {
   sqlite3_update_hook: {
@@ -122,6 +132,14 @@ const BUSY_SYMBOLS = {
   },
 } as const;
 
+/** One authorizer per connection; the setter returns an rc, not the previous one. */
+const AUTH_SYMBOLS = {
+  sqlite3_set_authorizer: {
+    parameters: ["pointer", "function", "pointer"],
+    result: "i32",
+  },
+} as const;
+
 /** Needs SQLITE_ENABLE_NORMALIZE, which stock distribution builds do not set. */
 const NORMALIZE_SYMBOLS = {
   sqlite3_normalized_sql: { parameters: ["pointer"], result: "pointer" },
@@ -138,6 +156,7 @@ type TraceLib = Deno.DynamicLibrary<typeof TRACE_SYMBOLS>;
 type NormalizeLib = Deno.DynamicLibrary<typeof NORMALIZE_SYMBOLS>;
 type ProgressLib = Deno.DynamicLibrary<typeof PROGRESS_SYMBOLS>;
 type BusyLib = Deno.DynamicLibrary<typeof BUSY_SYMBOLS>;
+type AuthLib = Deno.DynamicLibrary<typeof AUTH_SYMBOLS>;
 type PreSymbols = Deno.DynamicLibrary<typeof PREUPDATE_SYMBOLS>["symbols"];
 
 /** SQLITE_NULL etc., as returned by sqlite3_value_type. */
@@ -151,6 +170,7 @@ type Opened = {
   normalize: NormalizeLib | null;
   progress: ProgressLib | null;
   busy: BusyLib | null;
+  auth: AuthLib | null;
   unavailable: string;
 };
 
@@ -181,6 +201,7 @@ const capabilitiesOf = (opened: Opened): Capabilities =>
       normalizedSql: opened.normalize !== null,
       progress: opened.progress !== null,
       busy: opened.busy !== null,
+      authorize: opened.auth !== null,
     }
     : {
       hooks: true,
@@ -191,6 +212,7 @@ const capabilitiesOf = (opened: Opened): Capabilities =>
       normalizedSql: opened.normalize !== null,
       progress: opened.progress !== null,
       busy: opened.busy !== null,
+      authorize: opened.auth !== null,
     };
 
 /**
@@ -229,6 +251,7 @@ function openLibrary(
         normalize: openOptional(libPath, NORMALIZE_SYMBOLS),
         progress: openOptional(libPath, PROGRESS_SYMBOLS),
         busy: openOptional(libPath, BUSY_SYMBOLS),
+        auth: openOptional(libPath, AUTH_SYMBOLS),
         unavailable: "",
       };
     } catch (cause) {
@@ -263,6 +286,7 @@ function openLibrary(
     normalize: openOptional(libPath, NORMALIZE_SYMBOLS),
     progress: openOptional(libPath, PROGRESS_SYMBOLS),
     busy: openOptional(libPath, BUSY_SYMBOLS),
+    auth: openOptional(libPath, AUTH_SYMBOLS),
     unavailable,
   };
 }
@@ -282,6 +306,7 @@ export function probeFfi(libPath: string): Capabilities {
     opened.normalize?.close();
     opened.progress?.close();
     opened.busy?.close();
+    opened.auth?.close();
   }
 }
 
@@ -292,7 +317,7 @@ export function openFfiBackend(
   want: NonNullable<EventOptions["preupdate"]>,
 ): Backend {
   const opened = openLibrary(libPath, want);
-  const { lib, pre, wal, trace, normalize, progress, busy } = opened;
+  const { lib, pre, wal, trace, normalize, progress, busy, auth } = opened;
   const capabilities = capabilitiesOf(opened);
   const version = readC(lib.symbols.sqlite3_libversion());
 
@@ -484,6 +509,7 @@ export function openFfiBackend(
         normalize?.close();
         progress?.close();
         busy?.close();
+        auth?.close();
       }),
     attach(handlers: BackendHandlers, options: AttachOptions): Attachment {
       const preupdateCb = pre
@@ -603,6 +629,39 @@ export function openFfiBackend(
         )
         : null;
 
+      const authCb = auth && options.authorize
+        ? new Deno.UnsafeCallback(
+          {
+            parameters: [
+              "pointer",
+              "i32",
+              "pointer",
+              "pointer",
+              "pointer",
+              "pointer",
+            ],
+            result: "i32",
+          } as const,
+          (_p, actionCode, a1, a2, a3, a4) => {
+            let verdict = AUTH_OK;
+            safely(handlers, () => {
+              verdict = handlers.authorize(() => ({
+                actionCode,
+                arg1: readOrNull(a1),
+                arg2: readOrNull(a2),
+                arg3: readOrNull(a3),
+                arg4: readOrNull(a4),
+              }));
+            });
+            // A failure below the seam allows: denying by default would fail
+            // every prepare on the connection.
+            return verdict === AUTH_DENY || verdict === AUTH_IGNORE
+              ? verdict
+              : AUTH_OK;
+          },
+        )
+        : null;
+
       const threshold = options.walCheckpointThreshold;
       const walCb = wal
         ? new Deno.UnsafeCallback(
@@ -650,6 +709,7 @@ export function openFfiBackend(
       traceCb?.unref();
       progressCb?.unref();
       busyCb?.unref();
+      authCb?.unref();
 
       if (pre && preupdateCb) {
         pre.sqlite3_preupdate_hook(handle, preupdateCb.pointer, null);
@@ -670,6 +730,9 @@ export function openFfiBackend(
       }
       if (busy && busyCb) {
         busy.symbols.sqlite3_busy_handler(handle, busyCb.pointer, null);
+      }
+      if (auth && authCb) {
+        auth.symbols.sqlite3_set_authorizer(handle, authCb.pointer, null);
       }
       if (progress && progressCb && options.progressOps !== null) {
         progress.symbols.sqlite3_progress_handler(
@@ -708,6 +771,9 @@ export function openFfiBackend(
               if (busyCb) {
                 busy?.symbols.sqlite3_busy_handler(handle, null, null);
               }
+              if (authCb) {
+                auth?.symbols.sqlite3_set_authorizer(handle, null, null);
+              }
             }
             update.close();
             commit.close();
@@ -717,12 +783,14 @@ export function openFfiBackend(
             traceCb?.close();
             progressCb?.close();
             busyCb?.close();
+            authCb?.close();
             lib.close();
             wal?.close();
             trace?.close();
             normalize?.close();
             progress?.close();
             busy?.close();
+            auth?.close();
           }),
       };
     },

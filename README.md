@@ -143,19 +143,19 @@ return value can change what the database does.
 
 📅 = roadmap, not yet implemented.
 
-| Event                       | C hook                     | Pre | Post | Veto                       | Notes                                                    |
-| --------------------------- | -------------------------- | --- | ---- | -------------------------- | -------------------------------------------------------- |
-| Row insert/update/delete    | `sqlite3_update_hook`      | —   | —    | no (returns `void`)        | SQLite documents the timing as undefined; see limits     |
-| Row change with old/new     | `sqlite3_preupdate_hook`   | yes | no   | no (returns `void`)        | Needs `SQLITE_ENABLE_PREUPDATE_HOOK`                     |
-| Commit                      | `sqlite3_commit_hook`      | yes | no   | **yes** → rollback         | Scope is the whole transaction, not one row              |
-| Rollback                    | `sqlite3_rollback_hook`    | no  | yes  | no                         |                                                          |
-| Commit landed               | — (synthesised)            | no  | yes  | n/a, already happened      | No C hook: commit hook runs _before_ commit              |
-| WAL commit written          | `sqlite3_wal_hook`         | no  | yes  | **no** — see note below    | Displaces auto-checkpointing; we replicate it            |
-| Statement lifecycle         | `sqlite3_trace_v2`         | yes | yes  | no — return value ignored  | `row` fires per result row and measured ~3x; opt in      |
-| Statement progress          | `sqlite3_progress_handler` | —   | —    | **yes** → `abort()` only   | Return value ignored; `abort()` interrupts, see below    |
-| Lock contention             | `sqlite3_busy_handler`     | —   | —    | **yes** → `retry()` only   | Return value ignored; `retry()` BLOCKS the thread        |
-| 📅 Unknown collation needed | `sqlite3_collation_needed` | yes | no   | no; supplies the collation | Fires when a statement names an unregistered collation   |
-| 📅 Statement authorisation  | `sqlite3_set_authorizer`   | yes | no   | **yes** → `DENY`/`IGNORE`  | Prepare-time; table/column names only, no rows or values |
+| Event                       | C hook                     | Pre | Post | Veto                          | Notes                                                  |
+| --------------------------- | -------------------------- | --- | ---- | ----------------------------- | ------------------------------------------------------ |
+| Row insert/update/delete    | `sqlite3_update_hook`      | —   | —    | no (returns `void`)           | SQLite documents the timing as undefined; see limits   |
+| Row change with old/new     | `sqlite3_preupdate_hook`   | yes | no   | no (returns `void`)           | Needs `SQLITE_ENABLE_PREUPDATE_HOOK`                   |
+| Commit                      | `sqlite3_commit_hook`      | yes | no   | **yes** → rollback            | Scope is the whole transaction, not one row            |
+| Rollback                    | `sqlite3_rollback_hook`    | no  | yes  | no                            |                                                        |
+| Commit landed               | — (synthesised)            | no  | yes  | n/a, already happened         | No C hook: commit hook runs _before_ commit            |
+| WAL commit written          | `sqlite3_wal_hook`         | no  | yes  | **no** — see note below       | Displaces auto-checkpointing; we replicate it          |
+| Statement lifecycle         | `sqlite3_trace_v2`         | yes | yes  | no — return value ignored     | `row` fires per result row and measured ~3x; opt in    |
+| Statement progress          | `sqlite3_progress_handler` | —   | —    | **yes** → `abort()` only      | Return value ignored; `abort()` interrupts, see below  |
+| Lock contention             | `sqlite3_busy_handler`     | —   | —    | **yes** → `retry()` only      | Return value ignored; `retry()` BLOCKS the thread      |
+| 📅 Unknown collation needed | `sqlite3_collation_needed` | yes | no   | no; supplies the collation    | Fires when a statement names an unregistered collation |
+| Statement authorisation     | `sqlite3_set_authorizer`   | yes | no   | **yes** → `deny()`/`ignore()` | Compile-time; +49%; `ignore()` NULLs a column silently |
 
 ## This library versus the other SQLite bindings
 
@@ -204,7 +204,7 @@ wa-sqlite has had no npm release since January 2024.
 | `progress_handler`               | yes                         | no                                    | no                                      | no           | no                                      | no                      | yes         |
 | busy handler / timeout           | yes — handler               | `timeout` option                      | `timeout` option                        | no           | `configure("busyTimeout")`              | no                      | yes, both   |
 | `collation_needed`               | 📅                          | no                                    | no                                      | no           | no                                      | no                      | yes         |
-| authorizer                       | 📅                          | no                                    | yes — `setAuthorizer`                   | no           | no                                      | no                      | yes         |
+| authorizer                       | yes                         | no                                    | yes — `setAuthorizer`                   | no           | no                                      | no                      | yes         |
 | session / changesets / patchsets | no                          | no                                    | yes — `createSession`, `applyChangeset` | no           | no                                      | no                      | yes         |
 
 Any of these can set `PRAGMA busy_timeout`; that row is about the C-level
@@ -378,6 +378,110 @@ value that is not a valid error code is undefined behaviour. This library
 therefore always returns `SQLITE_OK`, whatever a listener does, and the `wal`
 event is a **void contract**: your return value is ignored, exactly as for
 `change`, `preupdate`, `postcommit` and `rollback`.
+
+### Authorizing statements as SQLite compiles them
+
+`authorize: true` delivers an event for each action inside a statement while
+SQLite compiles it — the tables and columns it reads, the functions it calls,
+the transactions it opens.
+
+```ts
+withEvents(
+  db,
+  (e) => {
+    if (e.type !== "authorize") return;
+    if (e.action === "read" && e.arg2 === "password_hash") e.deny();
+  },
+  LIB,
+  { authorize: true },
+);
+```
+
+**It is the most expensive hook here: a no-op authorizer measured +49%** on a
+prepare-heavy workload (10,000 prepares of an eight-column SELECT, 94.4 ms
+against 140.7 ms). The charge is per PREPARE, not per step or per row, so code
+that prepares once and steps many times pays it once and code that prepares in a
+loop pays half again.
+
+**Doing nothing allows.** The return value is ignored, as everywhere but
+`precommit`, and `deny()` and `ignore()` are explicit acts. That default is
+forced: denying on silence would fail every statement on the connection. A
+listener returning a thenable would otherwise be catastrophic here — a Promise
+is truthy, truthy coerces to `SQLITE_DENY`, and an async authorizer would reject
+every statement the process prepares. Returning a thenable, returning a truthy
+value and throwing all allow; a throw is reported and still allows. The first
+decision wins: a second `deny()` after an `ignore()` is reported and ignored,
+and so is a call kept and made after the event returned.
+
+#### `deny()` is loud; `ignore()` is silent, and that is the hazard
+
+| act        | what the caller sees                                     |
+| ---------- | -------------------------------------------------------- |
+| `deny()`   | the prepare fails: `access to t.secret is prohibited`    |
+| `ignore()` | **the query succeeds** and that column comes back `NULL` |
+
+Nothing in the result distinguishes an ignored column from a genuinely null one.
+`ignore()` is the right tool for hiding a column from an untrusted reader and
+the wrong one for anything the caller needs to know about. Prefer `deny()`
+unless you specifically want the silence.
+
+#### Virtual tables: this hook sees what the row events cannot
+
+The row events report writes to FTS5's _shadow_ tables — `ft_content`,
+`ft_docsize`, `ft_data`, `ft_idx` — and never the virtual table `ft`. The
+authorizer is the mirror image: preparing
+`SELECT body FROM ft WHERE ft MATCH
+'hello'` reports `ft` and no shadow table at
+all. Neither source alone can tell you that a query depends on a virtual table.
+
+One asymmetry to know if you collect these: _executing_ a write to a virtual
+table also authorizes its shadow tables, because FTS5 prepares its own
+statements against them. Collect around the `prepare`, not around the whole
+call.
+
+#### Action codes are open at the edge
+
+`action` is a string union with an `"unknown"` member, and `actionCode` carries
+SQLite's raw number. SQLite can add action codes, so a code this library does
+not yet name arrives as `"unknown"` with the number intact rather than being
+dropped — the same treatment, and the same reason, as an unrecognised row
+opcode. `action` and `actionCode` therefore disagree for any such code.
+
+The four detail strings are reported exactly as SQLite gives them. A `null` is
+not the same observation as an empty string — `SELECT count(*) FROM t` reports
+the table with an empty column name — so neither is normalised away, and what
+each argument means depends on the action.
+
+#### Statements this library issues are not delivered
+
+Three statements are suppressed, because they are ours rather than yours:
+
+- `PRAGMA wal_autocheckpoint` — the WAL displacement check
+- `PRAGMA busy_timeout` — the busy displacement check
+- `PRAGMA database_list` and the `sqlite_schema` join behind `preupdate` column
+  names
+
+That list is complete as of this version, and it grows only if this library
+starts issuing more. The suppression is bracketed around our own call sites,
+never matched against SQL text, so **a statement you issue yourself is always
+delivered** — including a `PRAGMA busy_timeout` identical to ours.
+
+#### Displacement is detected at attach, and not after
+
+A connection has one authorizer, and installing ours replaces any other. At
+attach we prepare one statement of our own choosing and confirm a callback
+arrives; if none does, something else already holds the authorizer and that is
+reported. **Displacement that happens after attach we cannot detect.** There is
+no pragma — `PRAGMA authorizer` returns no rows, but so does
+`PRAGMA definitely_not_a_pragma`, because SQLite ignores unknown pragmas
+silently — and `sqlite3_set_authorizer` returns a result code rather than the
+previous callback. Nothing is inferred from a statement not producing a
+callback, because empty, comment-only and unparseable statements legitimately
+produce none.
+
+Note also that SQLite re-prepares a statement after a schema change, from inside
+`sqlite3_step`, so authorize events can arrive during what your code experiences
+as a read rather than a compile.
 
 ### Lock contention, and why `retry` blocks
 
@@ -674,11 +778,15 @@ be.
 ### Keying a cache by table
 
 If you build invalidation on these events, key it on the **(schema, table)
-pair**, not on a string you joined them into. Quoted SQLite identifiers are
-arbitrary text — `ATTACH ':memory:' AS "a b"` is legal, and so is
-`CREATE TABLE "b c"` — so schema `a b` with table `c` and schema `a` with table
-`b c` collide under any single-character separator. Whatever character you pick
-can appear in a name.
+pair** where you have both — but note that `authorize` events do not always
+carry a schema. `SELECT count(*) FROM t` reports the table with an _empty_
+column name and a _null_ schema, and a join produced the same for one side. So a
+map built from authorizer events needs a key that tolerates a missing schema,
+while the row events always carry one. Whatever you choose, do not join them
+into a string. Quoted SQLite identifiers are arbitrary text —
+`ATTACH ':memory:' AS "a b"` is legal, and so is `CREATE TABLE "b c"` — so
+schema `a b` with table `c` and schema `a` with table `b c` collide under any
+single-character separator. Whatever character you pick can appear in a name.
 
 ## Portability
 

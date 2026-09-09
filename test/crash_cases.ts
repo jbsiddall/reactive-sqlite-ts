@@ -1098,6 +1098,39 @@ export const CASES: Record<string, CrashCase> = {
     },
   },
 
+  "authorize-deny-then-teardown": {
+    code: 0,
+    match: "survived",
+    why:
+      "The authorizer fires during compilation, not from the bytecode engine, and a deny unwinds a prepare that is half built. Deny, then compile more, then dispose while live, then close.",
+    run() {
+      const db = fresh();
+      db.exec("INSERT INTO t VALUES (1, 'a')");
+      let denials = 0;
+      const sub = withEvents(
+        db,
+        (e) => {
+          if (e.type === "authorize" && e.action === "read" && e.arg2 === "v") {
+            denials++;
+            e.deny();
+          }
+        },
+        LIB,
+        { authorize: true, onListenerError: () => {} },
+      );
+      for (let i = 0; i < 50; i++) {
+        try {
+          db.prepare("SELECT v FROM t").finalize();
+        } catch { /* denied, which is the point */ }
+      }
+      db.prepare("SELECT id FROM t").finalize();
+      sub.dispose();
+      db.prepare("SELECT v FROM t").finalize();
+      db.close();
+      console.log(denials > 0 ? "survived" : "FAIL never denied");
+    },
+  },
+
   "property-no-permutation-crashes": {
     code: 0,
     match: "survived",

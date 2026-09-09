@@ -33,6 +33,22 @@ export type RawTrace = {
   nanos: bigint | null;
 };
 
+/**
+ * One authorizer callback, already read out of SQLite's memory. The four
+ * arguments mean different things per action code, and a NULL is distinct from
+ * an empty string, so both are preserved exactly.
+ */
+export type RawAuthorize = {
+  actionCode: number;
+  arg1: string | null;
+  arg2: string | null;
+  arg3: string | null;
+  arg4: string | null;
+};
+
+/** SQLITE_OK / SQLITE_DENY / SQLITE_IGNORE, and nothing else is legal. */
+export const AUTH_OK = 0, AUTH_DENY = 1, AUTH_IGNORE = 2;
+
 /** One WAL commit, as sqlite3_wal_hook reports it. */
 export type RawWal = {
   db: string;
@@ -104,6 +120,12 @@ export type BackendHandlers = {
    */
   busy(tries: number): boolean;
   /**
+   * A compile-time authorization check. MUST return one of AUTH_OK,
+   * AUTH_DENY or AUTH_IGNORE: SQLite fails the prepare with "authorizer
+   * malfunction" on anything else, so this is never arithmetic on a value.
+   */
+  authorize(read: () => RawAuthorize): number;
+  /**
    * A progress tick. `true` interrupts the running statement — and inside an
    * explicit transaction that discards the whole transaction, so a backend
    * must never turn an internal failure into `true`.
@@ -129,6 +151,8 @@ export type AttachOptions = {
   progressOps: number | null;
   /** Whether to install a busy handler at all. */
   busy: boolean;
+  /** Whether to install an authorizer at all. */
+  authorize: boolean;
   /**
    * Frames after which the backend checkpoints from inside the WAL hook,
    * replicating what SQLite's own hook did before ours displaced it. `null`

@@ -110,6 +110,51 @@ above prevents.
 `set_authorizer` fires at prepare time and should be checked against this same
 question rather than assumed to match either group.
 
+### A hook can observe the library itself
+
+`set_authorizer` surfaced a defect class nothing before it could have: **our own
+instrumentation became visible through the hook we were adding.** The
+displacement checks from the WAL and busy chunks issue
+`PRAGMA
+wal_autocheckpoint` and `PRAGMA busy_timeout`, and `preupdate` reads the
+schema — all through `rawPrepare`, all of which fire the authorizer. Measured
+before any suppression existed: one `INSERT` produced three authorizer
+callbacks, two of them ours, dispatched from inside `drain()`.
+
+So the question to ask of every future hook is: **does this hook observe US?**
+Every hook before this one reported on data changes or on statement execution,
+and the library's own probes were invisible to them. Anything that reports on
+compilation, on connection state, or on I/O can see the library working.
+
+The suppression is bracketed around our own call sites — a flag set by a small
+`ours()` wrapper — and never matched against SQL text. A text filter would also
+swallow a caller's identical statement, and the caller would have no way to
+learn why their `PRAGMA busy_timeout` never arrived. A filter keyed on what we
+did is verifiable; one keyed on what a statement looks like is not. A test
+asserts that the caller's own `PRAGMA busy_timeout` IS still delivered, so the
+suppression cannot quietly widen later.
+
+### Attribution hazards for a query-to-tables map
+
+Recorded here because the live-query path will need them, and all three are
+knowable now rather than after it is built:
+
+1. **Re-prepare arrives during a step.** SQLite re-prepares on `SQLITE_SCHEMA`
+   inside `sqlite3_step`, so authorize callbacks can arrive with no prepare
+   bracket open. Measured: after `ALTER TABLE`, re-running a prepared statement
+   produced 13 authorizer callbacks.
+2. **The library's own statements are in the stream** unless suppressed, and
+   they arrive from inside the drain. That is handled today; anything added
+   later that issues SQL must be bracketed the same way.
+3. **The schema argument is sometimes null.** `SELECT count(*) FROM t` reports
+   the table with an empty column name and a null schema. A key built from
+   authorize events cannot always be a full `(schema, table)` pair.
+
+Also: collect around the `prepare`, not the whole call. Executing a write to a
+virtual table authorizes its shadow tables too, because FTS5 prepares its own
+statements against them, whereas preparing a read of it names only the virtual
+table.
+
 ### The one gap that remains
 
 The **absent-capability branches** — "preupdate unavailable",

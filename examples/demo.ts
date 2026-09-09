@@ -43,6 +43,7 @@ withEvents(db, (e: DbEvent) => {
     return undefined;
   }
   if (e.type === "progress" || e.type === "busy") return undefined;
+  if (e.type === "authorize") return undefined;
   if (e.type === "wal") {
     console.log(`   [wal] ${e.db}, ${e.frames} frames`);
     return undefined;

@@ -25,6 +25,7 @@ import { PROPERTIES, PROPERTY_RUNS, PROPERTY_SEED } from "./properties.ts";
 const LIB = resolveLibPath();
 const { Database } = await import("@db/sqlite");
 const {
+  actionFor,
   opFor,
   probeCapabilities,
   SqliteHooksError,
@@ -82,14 +83,18 @@ async function runCase(name: string): Promise<void> {
     stdout: "piped",
     stderr: "piped",
   }).spawn();
+  let timedOut = false;
   const killer = setTimeout(() => {
+    timedOut = true;
     try {
       child.kill("SIGKILL");
     } catch { /* already gone */ }
   }, CASE_TIMEOUT_MS);
   const out = await child.output();
   clearTimeout(killer);
-  if (out.signal === "SIGKILL") {
+  // Keyed on the timer, not on the signal: a SIGKILL from anywhere else — an
+  // OOM kill, say — is a crash and must be diagnosed as one.
+  if (timedOut) {
     fail(name, `HUNG: still running after ${CASE_TIMEOUT_MS}ms`);
     return;
   }
@@ -141,7 +146,8 @@ function record(db: Db, options = {}) {
       if (
         e.type === "preupdate" || e.type === "wal" ||
         e.type === "statement" || e.type === "profile" || e.type === "row" ||
-        e.type === "progress" || e.type === "busy"
+        e.type === "progress" || e.type === "busy" ||
+        e.type === "authorize"
       ) return;
       log.push(
         e.type === "change"
@@ -1385,6 +1391,7 @@ const SEMANTIC: Record<string, () => void> = {
       trace: () => {},
       progress: () => false,
       busy: () => false,
+      authorize: () => 0,
       fail: () => {},
     }, {
       walCheckpointThreshold: null,
@@ -1392,6 +1399,7 @@ const SEMANTIC: Record<string, () => void> = {
       traceSql: "statement",
       progressOps: null,
       busy: false,
+      authorize: false,
     });
     db.exec("INSERT INTO t VALUES (1, 'a')");
     db.exec("INSERT INTO t VALUES (2, 'b')");
@@ -1420,6 +1428,7 @@ const SEMANTIC: Record<string, () => void> = {
       trace: () => {},
       progress: () => false,
       busy: () => false,
+      authorize: () => 0,
       fail: () => {},
     }, {
       walCheckpointThreshold: null,
@@ -1427,6 +1436,7 @@ const SEMANTIC: Record<string, () => void> = {
       traceSql: "statement",
       progressOps: null,
       busy: false,
+      authorize: false,
     });
     at.detach(true);
     detachedThenClosed.close();
@@ -1447,6 +1457,7 @@ const SEMANTIC: Record<string, () => void> = {
       trace: () => {},
       progress: () => false,
       busy: () => false,
+      authorize: () => 0,
       fail: () => {},
     }, {
       walCheckpointThreshold: null,
@@ -1454,6 +1465,7 @@ const SEMANTIC: Record<string, () => void> = {
       traceSql: "statement",
       progressOps: null,
       busy: false,
+      authorize: false,
     });
     at.detach(true);
     at.detach(true);
@@ -2172,7 +2184,7 @@ const SEMANTIC: Record<string, () => void> = {
     check(
       "  refused, and the message explains why",
       errs.some((e) =>
-        e.includes("stop at the fifth") && e.includes("deadlock")
+        e.includes("stop at the sixth") && e.includes("deadlock")
       ),
       true,
     );
@@ -2208,6 +2220,264 @@ const SEMANTIC: Record<string, () => void> = {
     other.close();
     held.close();
     removeDb(path);
+  },
+
+  "authorize: the authorizer names the virtual table the write hooks never do"() {
+    // The evidence the live-query path rests on. update_hook reports FTS5's
+    // shadow tables and never `ft`; the authorizer reports `ft` and never a
+    // shadow table. Neither source is sufficient alone.
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE plain(id INTEGER PRIMARY KEY, body TEXT)");
+    db.exec("CREATE VIRTUAL TABLE ft USING fts5(body)");
+    let collecting = false;
+    const duringPrepare: string[] = [];
+    const duringExecution: string[] = [];
+    const written: string[] = [];
+    withEvents(
+      db,
+      (e) => {
+        if (e.type === "authorize" && e.arg1 !== null) {
+          (collecting ? duringPrepare : duringExecution).push(e.arg1);
+        }
+        if (e.type === "change") written.push(e.change.table);
+      },
+      LIB,
+      { authorize: true },
+    );
+    db.exec("INSERT INTO ft(body) VALUES ('hello world')");
+    collecting = true;
+    db.prepare("SELECT body FROM ft WHERE ft MATCH 'hello'").finalize();
+    collecting = false;
+    check(
+      "  preparing the query names the virtual table",
+      duringPrepare.includes("ft"),
+      true,
+    );
+    check(
+      "  and no shadow table",
+      duringPrepare.some((t) => t.startsWith("ft_")),
+      false,
+    );
+    check(
+      "  while the write hooks saw only shadow tables",
+      written.length > 0 && written.every((t) => t.startsWith("ft_")),
+      true,
+    );
+    check("  and never the virtual table", written.includes("ft"), false);
+    // EXECUTING a write to a virtual table also authorizes its shadow tables,
+    // because FTS5 prepares its own statements against them. A collector must
+    // therefore bracket the prepare, not the whole call.
+    check(
+      "  executing a vtab write also authorizes its shadow tables",
+      duringExecution.some((t) => t.startsWith("ft_")),
+      true,
+    );
+    db.close();
+  },
+
+  "authorize: doing nothing allows, and no return value can decide"() {
+    // A thenable coerced to a verdict would be 1, which is DENY: an async
+    // listener would reject every statement the process prepares.
+    for (
+      const [label, listener] of [
+        ["a thenable", () => Promise.resolve(true)],
+        ["a truthy value", () => 1],
+        ["a throw", () => {
+          throw new Error("from the authorize listener");
+        }],
+        ["no decision", () => undefined],
+      ] as const
+    ) {
+      const db = memory();
+      db.exec("INSERT INTO t VALUES (1, 'a')");
+      const warned = captureWarnings();
+      let rows = -1;
+      let threw = "";
+      try {
+        withEvents(
+          db,
+          (e) => e.type === "authorize" ? listener() : undefined,
+          LIB,
+          {
+            authorize: true,
+            onListenerError: () => {},
+          },
+        );
+        rows = db.prepare("SELECT count(*) c FROM t").get<{ c: number }>()?.c ??
+          -1;
+      } catch (e) {
+        threw = msg(e);
+      } finally {
+        warned.stop();
+      }
+      check(`  ${label}: the statement compiled`, threw, "");
+      check(`  ${label}: and returned its rows`, rows, 1);
+      db.close();
+    }
+  },
+
+  "authorize: deny() rejects the statement, ignore() NULLs the column silently"() {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE t(id INTEGER PRIMARY KEY, secret TEXT, ok TEXT)");
+    db.exec("INSERT INTO t VALUES (1, 's3cret', 'fine')");
+    for (const mode of ["deny", "ignore"] as const) {
+      const sub = withEvents(
+        db,
+        (e) => {
+          if (
+            e.type === "authorize" && e.action === "read" && e.arg2 === "secret"
+          ) {
+            if (mode === "deny") e.deny();
+            else e.ignore();
+          }
+        },
+        LIB,
+        { authorize: true, onListenerError: () => {} },
+      );
+      let threw = "";
+      let secret: unknown = "unset";
+      try {
+        secret = db.prepare("SELECT secret, ok FROM t").get<
+          { secret: unknown }
+        >()
+          ?.secret;
+      } catch (e) {
+        threw = msg(e);
+      }
+      if (mode === "deny") {
+        check("  deny: the prepare failed", threw.includes("prohibited"), true);
+      } else {
+        check("  ignore: the query succeeded", threw, "");
+        check("  ignore: and the column came back NULL", secret, null);
+      }
+      sub.dispose();
+    }
+    db.close();
+  },
+
+  "authorize: the first decision wins, and a stale one is reported"() {
+    const db = memory();
+    const errs: string[] = [];
+    const stashed: Array<() => void> = [];
+    const decider = (e: DbEvent) => {
+      if (e.type === "authorize" && e.action === "read") {
+        e.ignore();
+        e.deny(); // second call: must not override
+        if (stashed.length === 0) stashed.push(e.deny);
+      }
+      return undefined;
+    };
+    db.exec("INSERT INTO t VALUES (1, 'a')");
+    withEvents(db, decider, LIB, {
+      authorize: true,
+      onListenerError: (e) => errs.push(msg(e)),
+    });
+    let threw = "";
+    try {
+      db.prepare("SELECT v FROM t").get();
+    } catch (e) {
+      threw = msg(e);
+    }
+    check("  ignore() won, so the statement compiled", threw, "");
+    check(
+      "  and the second call was reported",
+      errs.some((e) => e.includes("the first call stands")),
+      true,
+    );
+    stashed[0]?.();
+    db.exec("SELECT 1");
+    check(
+      "  a stale call decided nothing and was reported",
+      errs.some((e) => e.includes("decided nothing")),
+      true,
+    );
+    db.close();
+  },
+
+  "authorize: our own internal statements are suppressed, the caller's are not"() {
+    // Bracketed at our call sites, never matched on SQL — so a caller issuing
+    // the very same pragma still sees it.
+    const db = memory();
+    const pragmas: string[] = [];
+    withEvents(
+      db,
+      (e) => {
+        if (
+          e.type === "authorize" && e.action === "pragma" && e.arg1 !== null
+        ) {
+          pragmas.push(e.arg1);
+        }
+      },
+      LIB,
+      { authorize: true, busy: true, preupdate: "auto" },
+    );
+    db.exec("INSERT INTO t VALUES (1, 'a')"); // drives our own detector reads
+    check(
+      "  our wal_autocheckpoint read was not delivered",
+      pragmas.includes("wal_autocheckpoint"),
+      false,
+    );
+    check(
+      "  nor our busy_timeout read",
+      pragmas.includes("busy_timeout"),
+      false,
+    );
+    db.exec("PRAGMA busy_timeout");
+    check(
+      "  but the caller's identical pragma IS delivered",
+      pragmas.includes("busy_timeout"),
+      true,
+    );
+    db.close();
+  },
+
+  "authorize: a re-prepare after a schema change is still guarded"() {
+    // SQLite re-prepares on SQLITE_SCHEMA inside step(), so the callback can
+    // arrive during what the caller experiences as a read. The guard is on the
+    // callback, not on an assumption about which C call we are inside.
+    const db = memory();
+    const errs: string[] = [];
+    let duringStep = 0;
+    let stepping = false;
+    withEvents(
+      db,
+      (e) => {
+        if (e.type === "authorize") {
+          if (stepping) duringStep++;
+          if (stepping) db.prepare("SELECT 1").finalize(); // must be refused
+        }
+      },
+      LIB,
+      { authorize: true, onListenerError: (e) => errs.push(msg(e)) },
+    );
+    db.exec("INSERT INTO t VALUES (1, 'a')");
+    const reused = db.prepare("SELECT * FROM t");
+    reused.all();
+    db.exec("ALTER TABLE t ADD COLUMN extra TEXT");
+    stepping = true;
+    reused.all();
+    stepping = false;
+    reused.finalize();
+    check("  callbacks did arrive during the step", duringStep > 0, true);
+    check(
+      "  and touching the connection there was refused",
+      errs.some((e) => e.includes("stop at the sixth")),
+      true,
+    );
+    db.close();
+  },
+
+  "authorize: an unrecognised action code is delivered, not dropped"() {
+    check(
+      "  the codes SQLite names",
+      [20, 21, 18, 31].map(actionFor),
+      ["read", "select", "insert", "function"],
+    );
+    check(
+      "  anything else",
+      [0, 34, 99, -1].map(actionFor),
+      ["unknown", "unknown", "unknown", "unknown"],
+    );
   },
 
   "an opcode outside the documented three is delivered as 'unknown'"() {

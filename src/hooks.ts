@@ -109,7 +109,14 @@ import type {
   TraceEvent,
   TraceSql,
 } from "./backend.ts";
-import { SQLITE_DELETE, SQLITE_INSERT, SQLITE_UPDATE } from "./backend.ts";
+import {
+  AUTH_DENY,
+  AUTH_IGNORE,
+  AUTH_OK,
+  SQLITE_DELETE,
+  SQLITE_INSERT,
+  SQLITE_UPDATE,
+} from "./backend.ts";
 import { openFfiBackend, probeFfi } from "./backend_ffi.ts";
 
 /** One row touched by a statement, as reported by sqlite3_update_hook. */
@@ -308,7 +315,127 @@ export type DbEvent =
    * could deadlock, and return SQLITE_BUSY directly, so a listener here is
    * not a guarantee that contention is handled.
    */
-  | BusyEvent;
+  | BusyEvent
+  /**
+   * SQLite is compiling a statement and is asking whether one action within
+   * it is allowed. Delivered per action, not per statement, so a wide SELECT
+   * produces many. Doing nothing ALLOWS, which is the only default that does
+   * not break every query.
+   */
+  | AuthorizeEvent;
+
+/**
+ * The actions SQLite names today. `"unknown"` is part of the union because
+ * SQLite may add codes: an unrecognised one arrives as `"unknown"` with the
+ * number intact in {@linkcode AuthorizeEvent.actionCode}, exactly as an
+ * unrecognised row opcode does. `action` and `actionCode` therefore disagree
+ * for any code this library does not yet name.
+ */
+export type AuthorizeAction =
+  | "create_index"
+  | "create_table"
+  | "create_temp_index"
+  | "create_temp_table"
+  | "create_temp_trigger"
+  | "create_temp_view"
+  | "create_trigger"
+  | "create_view"
+  | "delete"
+  | "drop_index"
+  | "drop_table"
+  | "drop_temp_index"
+  | "drop_temp_table"
+  | "drop_temp_trigger"
+  | "drop_temp_view"
+  | "drop_trigger"
+  | "drop_view"
+  | "insert"
+  | "pragma"
+  | "read"
+  | "select"
+  | "transaction"
+  | "update"
+  | "attach"
+  | "detach"
+  | "alter_table"
+  | "reindex"
+  | "analyze"
+  | "create_vtable"
+  | "drop_vtable"
+  | "function"
+  | "savepoint"
+  | "recursive"
+  | "unknown";
+
+const ACTIONS: Record<number, AuthorizeAction> = {
+  1: "create_index",
+  2: "create_table",
+  3: "create_temp_index",
+  4: "create_temp_table",
+  5: "create_temp_trigger",
+  6: "create_temp_view",
+  7: "create_trigger",
+  8: "create_view",
+  9: "delete",
+  10: "drop_index",
+  11: "drop_table",
+  12: "drop_temp_index",
+  13: "drop_temp_table",
+  14: "drop_temp_trigger",
+  15: "drop_temp_view",
+  16: "drop_trigger",
+  17: "drop_view",
+  18: "insert",
+  19: "pragma",
+  20: "read",
+  21: "select",
+  22: "transaction",
+  23: "update",
+  24: "attach",
+  25: "detach",
+  26: "alter_table",
+  27: "reindex",
+  28: "analyze",
+  29: "create_vtable",
+  30: "drop_vtable",
+  31: "function",
+  32: "savepoint",
+  33: "recursive",
+};
+
+/** Total, like {@linkcode opFor}: every number maps, so no action is dropped. */
+export function actionFor(code: number): AuthorizeAction {
+  return ACTIONS[code] ?? "unknown";
+}
+
+export type AuthorizeEvent = {
+  type: "authorize";
+  action: AuthorizeAction;
+  /** The code as SQLite gave it, undecoded. */
+  actionCode: number;
+  /**
+   * The four detail strings. What each means depends on the action, and a
+   * `null` is NOT the same observation as an empty string — SQLite reports an
+   * empty column name for `SELECT count(*) FROM t` and a null one elsewhere —
+   * so neither is normalised away.
+   */
+  arg1: string | null;
+  arg2: string | null;
+  arg3: string | null;
+  arg4: string | null;
+  /** Reject the whole statement: the prepare fails with "not authorized". */
+  deny: () => void;
+  /**
+   * Disallow this one action but let the statement compile.
+   *
+   * **On a `"read"` this is SILENT.** The query SUCCEEDS and that column comes
+   * back as `NULL`, with nothing in the result marking it as a policy
+   * decision — a caller cannot tell an ignored column from a genuinely null
+   * one. Prefer {@linkcode AuthorizeEvent.deny} unless you specifically want
+   * that.
+   */
+  ignore: () => void;
+};
 
 export type BusyEvent = {
   type: "busy";
@@ -403,6 +530,14 @@ export type EventOptions = {
    * `sqlite3_busy_timeout` and `PRAGMA busy_timeout` are implemented by
    * installing a busy handler.
    */
+  /**
+   * Deliver {@linkcode AuthorizeEvent} while SQLite compiles statements. Off
+   * by default, and the most expensive hook here: a no-op authorizer measured
+   * **+49%** on a prepare-heavy workload. It is charged per PREPARE, not per
+   * step or per row, so a caller that prepares once and steps often pays it
+   * once.
+   */
+  authorize?: boolean;
   busy?: boolean;
   progress?: number;
   trace?: true | readonly TraceEvent[];
@@ -472,6 +607,8 @@ export type Capabilities = {
   readonly progress: boolean;
   /** sqlite3_busy_handler: a say in what happens when a table is locked. */
   readonly busy: boolean;
+  /** sqlite3_set_authorizer: compile-time authorization checks. */
+  readonly authorize: boolean;
   /**
    * sqlite3_normalized_sql, needed for `sql: "normalized"`. Off in stock
    * distribution builds, which do not set SQLITE_ENABLE_NORMALIZE.
@@ -890,9 +1027,11 @@ function attach(
     if (walDisplaced || !capabilities.wal || reg.closed || reg.detached) return;
     let live: number | undefined;
     try {
-      live = rawPrepare("PRAGMA wal_autocheckpoint").get<
-        { wal_autocheckpoint: number }
-      >()?.wal_autocheckpoint;
+      live = ours(() =>
+        rawPrepare("PRAGMA wal_autocheckpoint").get<
+          { wal_autocheckpoint: number }
+        >()?.wal_autocheckpoint
+      );
     } catch {
       return; // the connection is not answering; not our news to break
     }
@@ -917,8 +1056,9 @@ function attach(
     if (busyDisplaced || !wantBusy || reg.closed || reg.detached) return;
     let live: number | undefined;
     try {
-      live = rawPrepare("PRAGMA busy_timeout").get<{ timeout: number }>()
-        ?.timeout;
+      live = ours(() =>
+        rawPrepare("PRAGMA busy_timeout").get<{ timeout: number }>()?.timeout
+      );
     } catch {
       return;
     }
@@ -1047,6 +1187,23 @@ function attach(
   const key = (schema: string, table: string) =>
     `${schema.length}:${schema}:${table}`;
 
+  /**
+   * True while WE are preparing. Set by {@linkcode ours} around the library's
+   * own statements so an authorize listener does not see them; bracketed at
+   * the call site rather than matched on the SQL, because a text filter would
+   * also swallow a caller's identical statement.
+   */
+  let internalPrepare = false;
+  const ours = <T>(body: () => T): T => {
+    const outer = internalPrepare;
+    internalPrepare = true;
+    try {
+      return body();
+    } finally {
+      internalPrepare = outer;
+    }
+  };
+
   /** Run one uninstrumented query and release the statement rather than waiting for GC. */
   const ask = <T extends Record<string, unknown>>(
     sql: string,
@@ -1060,9 +1217,14 @@ function attach(
     }
   };
 
-  const primeSchema = () => {
-    if (!hasPreupdate || reg.closed || reg.detached) return;
-    schemaDirty = false;
+  const primeSchema = () =>
+    ours(() => {
+      if (!hasPreupdate || reg.closed || reg.detached) return;
+      schemaDirty = false;
+      primeSchemaBody();
+    });
+
+  const primeSchemaBody = () => {
     try {
       const schemas = ask<{ name: string }>("PRAGMA database_list")
         .map((r) => r.name);
@@ -1123,6 +1285,13 @@ function attach(
     );
   }
   const tracesStatements = traceKinds.includes("statement");
+  const wantAuthorize = options.authorize ?? false;
+  if (wantAuthorize && !capabilities.authorize) {
+    backend.close();
+    throw new SqliteHooksError(
+      "this libsqlite3 does not export sqlite3_set_authorizer, so authorize events cannot be delivered",
+    );
+  }
   const wantBusy = options.busy ?? false;
   if (wantBusy && !capabilities.busy) {
     backend.close();
@@ -1271,6 +1440,67 @@ function attach(
         dispatch({ type: "wal", db: raw.db, frames: raw.frames });
       }),
 
+    authorize: (read) =>
+      // The fallback ALLOWS. Denying on an internal error would fail every
+      // prepare on the connection, which is the opposite failure from
+      // precommit's and chosen for the same reason as progress's.
+      inFfi(AUTH_OK, () => {
+        // Ours, not the caller's. Bracketed at our own rawPrepare call sites
+        // rather than matched on the SQL, so it cannot swallow a caller's
+        // identical statement.
+        if (internalPrepare) return AUTH_OK;
+        const raw = read();
+        let verdict = AUTH_OK;
+        let settled = "";
+        let live = true;
+        const settle = (what: string, value: number) => {
+          const caller = running;
+          const who = caller !== null && caller.name !== ""
+            ? `listener ${caller.name}`
+            : "a listener";
+          if (!live) {
+            errors.push({
+              error: new SqliteHooksError(
+                `${who} kept ${what}() from an authorize event and called it after that event had returned; it decided nothing. Call it synchronously.`,
+              ),
+              event: { type: "change", change: NO_ROW },
+            });
+            return;
+          }
+          if (settled !== "") {
+            errors.push({
+              error: new SqliteHooksError(
+                `${who} called ${what}() after ${settled}() had already decided this authorize event; the first call stands.`,
+              ),
+              event: { type: "change", change: NO_ROW },
+            });
+            return;
+          }
+          settled = what;
+          verdict = value;
+        };
+        try {
+          dispatch({
+            type: "authorize",
+            action: actionFor(raw.actionCode),
+            actionCode: raw.actionCode,
+            arg1: raw.arg1,
+            arg2: raw.arg2,
+            arg3: raw.arg3,
+            arg4: raw.arg4,
+            deny: () => settle("deny", AUTH_DENY),
+            ignore: () => settle("ignore", AUTH_IGNORE),
+          });
+        } finally {
+          live = false;
+        }
+        // A three-way branch on latched state, never arithmetic on a listener
+        // value: SQLite fails the prepare outright on anything but 0, 1 or 2.
+        if (verdict === AUTH_DENY) return AUTH_DENY;
+        if (verdict === AUTH_IGNORE) return AUTH_IGNORE;
+        return AUTH_OK;
+      }),
+
     busy: (tries: number) =>
       inFfi(false, () => {
         let waitMs: number | null = null;
@@ -1416,7 +1646,36 @@ function attach(
     traceSql,
     progressOps,
     busy: wantBusy,
+    authorize: wantAuthorize,
   });
+
+  if (wantAuthorize) {
+    // A statement WE choose, so the shapes that legitimately authorize nothing
+    // — empty, comment-only, unparseable — are controlled rather than assumed.
+    // This detects an authorizer already installed at attach time. Displacement
+    // AFTER attach is undetectable: there is no pragma, and
+    // sqlite3_set_authorizer returns an rc rather than the previous callback.
+    let saw = false;
+    const probe = (e: DbEvent) => {
+      if (e.type === "authorize") saw = true;
+    };
+    reg.listeners.add(probe);
+    try {
+      // Deliberately NOT bracketed by ours(): suppressing it would make the
+      // probe unable to observe itself, and the caller's listener is not
+      // attached yet, so nobody else sees it.
+      rawPrepare("SELECT 1").finalize();
+    } catch { /* the probe statement is not worth failing attach over */ }
+    reg.listeners.delete(probe);
+    if (!saw) {
+      errors.push({
+        error: new SqliteHooksError(
+          "installing our authorizer did not produce a callback, so something else holds the authorizer on this connection and no authorize events will arrive.",
+        ),
+        event: { type: "change", change: NO_ROW },
+      });
+    }
+  }
 
   let torn = false;
   reg.teardown = () => {
@@ -1445,7 +1704,7 @@ function attach(
     }
     if (reg.inHook) {
       throw new SqliteHooksError(
-        `${what} was called from inside a hook listener. SQLite forbids using the connection from within its hooks — and a busy listener, which SQLite alone would permit, is refused too rather than making the rule hold for four callbacks and stop at the fifth. From a busy listener it can also deadlock, and there is no way to bound that. Do it from postcommit, or defer with queueMicrotask().`,
+        `${what} was called from inside a hook listener. SQLite forbids using the connection from within its hooks — and a busy listener, which SQLite alone would permit, is refused too rather than making the rule hold for four callbacks and stop at the sixth. From a busy listener it can also deadlock, and there is no way to bound that. Do it from postcommit, or defer with queueMicrotask().`,
       );
     }
   };
