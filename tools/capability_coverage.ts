@@ -50,6 +50,24 @@
  * machinery that produces the evidence is still exercised only by running this
  * against a real library.
  *
+ * The machinery gets a control of its own for the same reason:
+ * {@linkcode pipelineControlHolds} runs the rewrite-type-check-rerun over
+ * `tools/canary_branch.ts`, a refusal that belongs to no library, and requires
+ * its self-test to pass intact and fail disabled. So the three things a suite
+ * failure is read as evidence of — an `if` was found, the result still
+ * compiled, behaviour actually changed — are watched on every invocation
+ * rather than inferred from one library's missing SQLITE_ENABLE_NORMALIZE.
+ *
+ * That is what lets this run against a library that HAS normalize. It used to
+ * refuse outright, because that absence was the only positive control and
+ * losing it left every row resting on unvouched-for machinery. With the
+ * machinery vouched for independently, a normalize-enabled library no longer
+ * costs the audit its trustworthiness — it costs ONE ROW its reachability,
+ * which is a per-row fact and is now reported as one: `absent` requires the
+ * library to genuinely lack the symbol, so on a library that has it the row is
+ * "not exercisable here" rather than drift, and the other six rows are
+ * measured and reported instead of suppressed.
+ *
  *   deno task test:capability-coverage
  *
  * Needs a libsqlite3 (see //libsqlite3) plus --allow-run to re-run the suite.
@@ -393,6 +411,112 @@ function decisionControlsHold(): boolean {
   return bad === 0;
 }
 
+const CANARY = join(ROOT, "tools", "canary_branch.ts");
+const CANARY_MESSAGE = "CANARY: the guarded branch was taken";
+
+/** Run a script with no permissions. True when it exits 0. */
+async function scriptPasses(path: string): Promise<boolean> {
+  const { code } = await new Deno.Command(Deno.execPath(), {
+    args: ["run", path],
+    cwd: ROOT,
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+  return code === 0;
+}
+
+/**
+ * The pipeline control: rewrite-type-check-rerun, over a fixture branch that
+ * belongs to no library.
+ *
+ * The audit reads a suite failure as "something reached the refusal". That
+ * inference has three moving parts — the rewriter found an `if`, the rewritten
+ * source still compiles, and disabling the branch actually changed behaviour —
+ * and until now the only evidence all three worked was one library's missing
+ * SQLITE_ENABLE_NORMALIZE. That made a genuine measurement of one capability
+ * load-bearing for every other row, and made a normalize-enabled library a
+ * reason to refuse to run rather than a row to qualify.
+ *
+ * Here the same three parts are watched over {@linkcode canary_branch}, whose
+ * self-test passes intact and must fail disabled. It is milliseconds, so it
+ * runs every invocation. It does NOT stand in for the semantic suite: it says
+ * the rewrite works, not that the suite would have noticed.
+ */
+async function pipelineControlHolds(): Promise<boolean> {
+  const original = await Deno.readTextFile(CANARY);
+
+  // Control on the control: intact, the fixture must PASS. A fixture that
+  // fails either way proves nothing about the rewrite.
+  if (!await scriptPasses(CANARY)) {
+    console.error(
+      "  pipeline: the canary fails even INTACT; it is not a fixture",
+    );
+    return false;
+  }
+  console.log("  pass  pipeline: the canary passes intact");
+
+  const mutated = disableBranch(original, CANARY_MESSAGE);
+  if (mutated === null || mutated === original) {
+    console.error(
+      `  pipeline: the rewriter ${
+        mutated === null
+          ? "found no `if` guarding the canary"
+          : "changed nothing"
+      } — every \`none\` below would be this failure, not a finding`,
+    );
+    return false;
+  }
+  console.log("  pass  pipeline: the rewriter located and disabled the canary");
+
+  let compiles: boolean;
+  let stillPasses: boolean;
+  try {
+    await Deno.writeTextFile(CANARY, mutated);
+    compiles = await typeChecks(CANARY);
+    stillPasses = compiles ? await scriptPasses(CANARY) : true;
+  } finally {
+    await Deno.writeTextFile(CANARY, original);
+  }
+
+  const restored = await Deno.readTextFile(CANARY);
+  if (restored !== original) {
+    console.error("  pipeline: the fixture was not restored byte-for-byte");
+    return false;
+  }
+  console.log("  pass  pipeline: the fixture was restored byte-for-byte");
+
+  if (!compiles) {
+    console.error(
+      "  pipeline: the rewritten canary does not type-check, so a real branch's rewrite would be read as coverage it did not earn",
+    );
+    return false;
+  }
+  console.log("  pass  pipeline: the rewritten source still type-checks");
+
+  if (stillPasses) {
+    console.error(
+      "  pipeline: disabling the canary changed nothing observable — the rewrite is cosmetic and every `none` below is unearned",
+    );
+    return false;
+  }
+  console.log("  pass  pipeline: disabling the canary made its self-test fail");
+
+  const verdict = decide({
+    compiles: true,
+    passed: false,
+    hasCapability: false,
+    simulator: null,
+  });
+  if (verdict.state !== "absent") {
+    console.error(
+      `  pipeline: the same evidence a reached branch produces decided ${verdict.state}, not absent`,
+    );
+    return false;
+  }
+  console.log("  pass  pipeline: that evidence decides `absent` end to end");
+  return true;
+}
+
 async function classify(
   branch: Branch,
   caps: Capabilities,
@@ -461,6 +585,18 @@ async function main(): Promise<void> {
   }
   console.log("");
 
+  // Second, and needing no library either: the rewrite-type-check-rerun
+  // pipeline, watched over a fixture branch. Before this, the only evidence
+  // the pipeline worked was one library's missing SQLITE_ENABLE_NORMALIZE.
+  console.log("classifier pipeline control");
+  if (!await pipelineControlHolds()) {
+    console.error(
+      "\nThe report is withheld: the mutate-and-re-run pipeline did not do what every row below assumes it did.",
+    );
+    Deno.exit(1);
+  }
+  console.log("");
+
   const libPath = Deno.env.get("DENO_SQLITE_PATH");
   if (libPath === undefined || libPath === "") {
     console.error(
@@ -470,20 +606,23 @@ async function main(): Promise<void> {
   }
   const caps = probeCapabilities(libPath);
 
-  // The controls below are pinned to a library that LACKS
-  // SQLITE_ENABLE_NORMALIZE, because that absence is the only one reachable
-  // here and so the only positive control available. Pointed at a library
-  // that has it, the classifier would report `normalizedSql` uncovered and
-  // that would be a true measurement of the wrong thing — indistinguishable,
-  // at a glance, from the classifier being broken. Refuse up front and say
-  // which it is, rather than let the control failure below misdirect the
-  // reader into fixing a tool that is working.
-  if (caps.normalizedSql) {
-    console.error(
-      `${libPath} was built with SQLITE_ENABLE_NORMALIZE. This audit needs a library WITHOUT it — that absence is its positive control, and no other absence is reachable here. Point DENO_SQLITE_PATH at the system library and re-run.`,
-    );
-    Deno.exit(2);
-  }
+  // This used to refuse outright: `normalizedSql` was the only positive
+  // control, so a library built WITH SQLITE_ENABLE_NORMALIZE took the control
+  // away and the audit exited 2 rather than report rows produced by machinery
+  // nothing had vouched for. That refusal was right while it was the only
+  // control. It is not right any more: the decision fixtures and the pipeline
+  // control above vouch for the machinery without any library at all, so what
+  // a normalize-enabled library takes away is not the audit's trustworthiness
+  // but one ROW's reachability — and that is a per-row fact, reportable as
+  // itself. Refusing to run would now suppress six honest rows to avoid
+  // qualifying one.
+  //
+  // `absent` means the library genuinely lacks the symbol, so a library that
+  // HAS it cannot produce that state for that branch, whatever the code does.
+  // Recognised here, before anything is mutated, rather than discovered as
+  // drift afterwards.
+  const canBeAbsent = (branch: Branch): boolean =>
+    caps[branch.capability] !== true;
 
   // Before mutating anything: the suite must PASS unmutated. Otherwise every
   // row below would read "reached" for a reason that has nothing to do with
@@ -509,17 +648,33 @@ async function main(): Promise<void> {
 
   // The controls, before anything else is trusted.
   const failures: string[] = [];
+  let applicable = 0;
   for (const [capability, expected] of CONTROLS) {
     const row = rows.find((r) => r.branch.capability === capability);
     if (row === undefined) {
       failures.push(`control ${capability}: no row produced for it at all`);
       continue;
     }
+    if (expected === "absent" && !canBeAbsent(row.branch)) {
+      console.log(
+        `  control ${capability}: not exercisable on ${libPath}, which HAS the capability — skipped, not passed`,
+      );
+      continue;
+    }
+    applicable++;
     if (row.state !== expected) {
       failures.push(
         `control ${capability}: expected ${expected}, got ${row.state} (${row.because})`,
       );
     }
+  }
+  if (failures.length === 0 && applicable === 0) {
+    // Every library-dependent control was skipped. The decision and pipeline
+    // controls still held, so the machinery is vouched for — but nothing here
+    // checked the classifier against this library, and saying so is the point.
+    console.log(
+      "  no library-dependent control was exercisable on this library; the rows below rest on the decision and pipeline controls alone",
+    );
   }
   if (failures.length > 0) {
     console.error("the classifier's controls did not hold:\n");
@@ -568,6 +723,10 @@ async function main(): Promise<void> {
     const want = EXPECTED.get(row.branch.capability);
     if (want === undefined) {
       drift.push(`${row.branch.capability}: not in EXPECTED at all`);
+    } else if (want === "absent" && !canBeAbsent(row.branch)) {
+      console.log(
+        `${row.branch.capability}: EXPECTED says absent, but ${libPath} HAS the capability, so absence is not exercisable here — measured ${row.state}, not counted as drift`,
+      );
     } else if (want !== row.state) {
       drift.push(
         `${row.branch.capability}: EXPECTED says ${want}, measured ${row.state}`,

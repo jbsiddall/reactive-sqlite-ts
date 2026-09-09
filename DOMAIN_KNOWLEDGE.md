@@ -648,3 +648,26 @@ Consequence for tooling: a structural, no-library check can live in
 `tools/capability_table.ts` itself and reuse the same `ROWS` object the
 generator uses, instead of that list being moved to a third module purely to
 keep FFI out of the check.
+
+### The capability audit no longer needs a library that lacks normalize (2026-09-09)
+
+`tools/capability_coverage.ts` used to exit 2 when `DENO_SQLITE_PATH` pointed at
+a library built with `SQLITE_ENABLE_NORMALIZE`, because that absence was its
+only positive control. Measured on both libraries after giving the machinery
+controls of its own:
+
+| library         | before                  | after                                              |
+| --------------- | ----------------------- | -------------------------------------------------- |
+| system 3.45.1   | 7 branches; 1 exercised | 7 branches; 1 exercised (unchanged)                |
+| vendored 3.53.4 | exit 2, no report       | 7 branches; 0 exercised, `normalizedSql` qualified |
+
+On the vendored library the report now runs and says why the one row cannot be
+earned there — `absent` requires the library to genuinely lack the symbol — and
+the `progress` control still applies, so the run is not uncontrolled.
+
+**A measured negative worth stating:** no library reachable from this repository
+produces the `simulated` state. It is a defined outcome occupied by nothing
+measured. The only capability with a simulating option is `preupdate`, and
+nothing in the suite asks for `preupdate: "required"` under `preupdate: "off"`,
+so the branch is `none` rather than `simulated` on both libraries. The state is
+exercised only by synthetic evidence.
