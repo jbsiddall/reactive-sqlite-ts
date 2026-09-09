@@ -975,6 +975,60 @@ It is a **snapshot**, not a live view: nothing after the capture is visible to
 it, deliberately, because it is meant to be consulted from inside hook callbacks
 where issuing SQL is undefined behaviour. `map.refresh(db)` returns a new one.
 
+### Keeping the snapshot current
+
+`CREATE VIRTUAL TABLE` or `DROP` after the capture makes the snapshot wrong in
+the quiet direction — a shadow table whose owner did not exist at capture time
+resolves to `"unknown"`, so a change over it matches nothing. `watchSchema`
+decides when a new reading is taken and takes it. It is a trigger, not a policy
+engine: there is no subscription registry and nothing is re-run.
+
+```ts
+import { watchSchema, withEvents } from "jsr:@jbsiddall/reactive-sqlite";
+
+let watch;
+const sub = withEvents(db, (e) => watch.observe(e), LIB, { authorize: true });
+watch = watchSchema(db);
+
+db.exec("CREATE VIRTUAL TABLE ft USING fts5(body)");
+watch.map.resolveTable("ft_content"); // { kind: "shadow", canonical: "ft", ... }
+watch.refreshCount; // 1
+```
+
+**The signal is the authorizer's DDL action codes**, not the commit batch. The
+obvious alternative — treat `coverage: "unknown"` as "DDL happened", since
+`update_hook` does not report writes to `sqlite_schema` — is wrong for the one
+case this map exists for: `CREATE VIRTUAL TABLE ft USING fts5(body)` commits
+with `coverage: "complete"` and two changes, because creating an FTS5 table
+writes rows into `ft_data` and `ft_config`, which are ordinary tables. A watcher
+keyed on `"unknown"` misses every FTS5 creation while appearing to work on plain
+tables. SQLite's schema cookie is not usable either: reading it is a query, and
+it is per-schema, so one `PRAGMA main.schema_version` would silently suppress
+refreshes for every ATTACHed schema.
+
+What that signal misses, stated rather than assumed: **a schema change made on
+another connection to the same file produces no event here.** `refreshNow()` is
+the escape hatch. `ATTACH` and `DETACH` are reported to the authorizer but
+produce no commit at all, so they arm the watch without draining it — call
+`refreshIfArmed()` after attaching.
+
+**Refresh runs at `postcommit` or in your own code, never inside a hook.**
+Re-reading the schema issues SQL, and `change`, `precommit`, `rollback` and
+`authorize` listeners run with the connection off limits. `refreshNow()` and
+`resolveOrRefresh()` throw `SchemaWatchError` if called from there rather than
+leaving you to find out; inside those listeners, read `watch.map` and handle
+`kind: "unknown"` yourself.
+
+**`resolveOrRefresh(name)` is what to do with `kind: "unknown"`, and it is
+bounded.** A name that came back unknown might mean a stale snapshot, so it is
+worth one re-read — but a name that will never appear must not cause a re-read
+every time it is asked about, or staleness recovery becomes a hot loop that
+presents as a performance problem rather than the correctness problem it is. The
+bound is **at most one refresh per `(schema, name)` per generation**, and the
+record of what has been tried is cleared only by a DDL-triggered refresh. Asking
+about an absent name a thousand times costs one refresh; alternating between two
+absent names costs two, not a thousand.
+
 ## Portability
 
 Deno FFI over `@db/sqlite` today. Neither the event model nor the public API is

@@ -765,7 +765,31 @@ type Registration = {
  * connection, so a second `withEvents` must join the existing registration
  * rather than install its own and silently clobber the first.
  */
-const REGISTRATIONS = new WeakMap<Database, Registration>();
+// Keyed on `object` rather than `Database` so {@linkcode insideHookOf} can
+// answer for a structurally-typed connection without a type assertion; every
+// write below still passes a real Database.
+const REGISTRATIONS = new WeakMap<object, Registration>();
+
+/**
+ * Whether a SQLite callback is on the stack for this connection.
+ *
+ * The predicate behind {@linkcode SqliteHooksError} "was called from inside a
+ * hook listener", exported so that code outside this module can refuse the
+ * same route rather than discover it as undefined behaviour. True inside
+ * `change`, `preupdate`, `precommit`, `rollback`, `authorize`, `busy` and
+ * `collation` listeners; **false inside `postcommit`**, which is dispatched
+ * after the hook has returned and is where using the connection is allowed.
+ *
+ * Takes `unknown` rather than `Database` because a caller holding a
+ * structurally-typed connection should still be able to ask. A connection
+ * {@linkcode withEvents} was never attached to has no hooks on it, so there is
+ * no callback to be inside and the answer is `false`.
+ */
+export function insideHookOf(db: unknown): boolean {
+  if (typeof db !== "object" || db === null) return false;
+  const reg = REGISTRATIONS.get(db);
+  return reg !== undefined && reg.inHook;
+}
 
 /**
  * The refusal every route into SQLite from inside a listener gets. Free

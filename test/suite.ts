@@ -36,6 +36,16 @@ const { formatEvent, jsonReplacer } = await import("../src/format.ts");
 const { captureSchemaMap, SchemaMap, SchemaMapError } = await import(
   "../src/schema_map.ts"
 );
+const { isSchemaChangingAction, SchemaWatch, SchemaWatchError, watchSchema } =
+  await import("../src/schema_watch.ts");
+/**
+ * The `"unattributable-shadow"` kind carries no `canonical` on purpose, so the
+ * union forces a branch. Tests take that branch as a distinguishable STRING
+ * rather than a throw, so a scenario that starts producing it fails loudly on
+ * the value instead of on the shape.
+ */
+const canonicalOf = (r: import("../src/schema_map.ts").Resolution): string =>
+  r.kind === "unattributable-shadow" ? `UNATTRIBUTABLE ${r.name}` : r.canonical;
 const { openFfiBackend } = await import("../src/backend_ffi.ts");
 type DbEvent = import("../src/hooks.ts").DbEvent;
 type PreUpdate = import("../src/hooks.ts").PreUpdate;
@@ -3470,6 +3480,312 @@ const SEMANTIC: Record<string, () => void> = {
     );
     check("  step resolves to ft too", canonicalise(atStep), ["ft"]);
     db.close();
+  },
+
+  // ---------------------------------------------------- the schema watch
+  //
+  // The negative control is first and it asserts ZERO refreshes on a workload
+  // with no DDL in it. A watch that refreshed on every commit would pass every
+  // correctness scenario below and be a performance disaster, so this is the
+  // one that has to fail when the trigger is wrong.
+
+  "schema watch: a workload with NO DDL triggers zero refreshes"() {
+    const db = memory();
+    db.exec("CREATE VIRTUAL TABLE ft USING fts5(body)");
+    const watch = watchSchema(db);
+    const sub = withEvents(db, (e) => watch.observe(e), LIB, {
+      authorize: true,
+    });
+    // Reads, writes, a vtab write, an explicit transaction, a rollback.
+    db.exec("INSERT INTO t(v) VALUES ('a')");
+    db.exec("INSERT INTO ft(body) VALUES ('hello world')");
+    db.prepare("SELECT * FROM t").all();
+    db.prepare("SELECT body FROM ft WHERE ft MATCH 'hello'").all();
+    db.exec("BEGIN");
+    db.exec("INSERT INTO t(v) VALUES ('b')");
+    db.exec("COMMIT");
+    db.exec("BEGIN");
+    db.exec("INSERT INTO t(v) VALUES ('c')");
+    db.exec("ROLLBACK");
+    check("  is a SchemaWatch", watch instanceof SchemaWatch, true);
+    check("  refreshes", watch.refreshCount, 0);
+    check("  generation", watch.generation, 0);
+    check("  never armed", watch.armed, false);
+    // ...and the map still works, so zero refreshes is not zero function.
+    check(
+      "  map still resolves",
+      canonicalOf(watch.map.resolveTable("ft_content")),
+      "ft",
+    );
+    sub.dispose();
+    db.close();
+  },
+
+  "schema watch: a virtual table created AFTER the snapshot"() {
+    const db = memory();
+    const watch = watchSchema(db);
+    const sub = withEvents(db, (e) => watch.observe(e), LIB, {
+      authorize: true,
+    });
+    const before = watch.map;
+    check(
+      "  before: ft_content is unknown",
+      before.resolveTable("ft_content").kind,
+      "unknown",
+    );
+    check("  before: ft owns nothing", [...before.shadowsOf("ft")], []);
+
+    db.exec("CREATE VIRTUAL TABLE ft USING fts5(body)");
+
+    check("  the DDL triggered exactly one refresh", watch.refreshCount, 1);
+    check("  and a new snapshot", watch.map !== before, true);
+    // Both directions of the mismatch.
+    const after = watch.map;
+    check(
+      "  after: ft_content resolves to ft",
+      canonicalOf(after.resolveTable("ft_content")),
+      "ft",
+    );
+    check(
+      "  after: ft_data resolves to ft",
+      canonicalOf(after.resolveTable("ft_data")),
+      "ft",
+    );
+    check("  after: ft expands to its shadows", [...after.shadowsOf("ft")], [
+      "ft_config",
+      "ft_content",
+      "ft_data",
+      "ft_docsize",
+      "ft_idx",
+    ]);
+    // The old snapshot is untouched: refresh replaces, it does not mutate.
+    check(
+      "  the old snapshot is unchanged",
+      before.resolveTable("ft_content").kind,
+      "unknown",
+    );
+    sub.dispose();
+    db.close();
+  },
+
+  "schema watch: a virtual table DROPPED after the snapshot"() {
+    const db = memory();
+    db.exec("CREATE VIRTUAL TABLE ft USING fts5(body)");
+    const watch = watchSchema(db);
+    const sub = withEvents(db, (e) => watch.observe(e), LIB, {
+      authorize: true,
+    });
+    check(
+      "  before: ft_content resolves to ft",
+      canonicalOf(watch.map.resolveTable("ft_content")),
+      "ft",
+    );
+    check(
+      "  before: ft owns five shadows",
+      watch.map.shadowsOf("ft").length,
+      5,
+    );
+
+    db.exec("DROP TABLE ft");
+
+    check("  the DROP triggered exactly one refresh", watch.refreshCount, 1);
+    check(
+      "  after: ft_content is unknown",
+      watch.map.resolveTable("ft_content").kind,
+      "unknown",
+    );
+    check(
+      "  after: ft is unknown",
+      watch.map.resolveTable("ft").kind,
+      "unknown",
+    );
+    check("  after: ft owns nothing", [...watch.map.shadowsOf("ft")], []);
+    sub.dispose();
+    db.close();
+  },
+
+  "schema watch: an unknown name is refreshed for at most once"() {
+    const db = memory();
+    const watch = watchSchema(db);
+    const sub = withEvents(db, (e) => watch.observe(e), LIB, {
+      authorize: true,
+    });
+
+    // A name that will never exist. Ten lookups, one refresh: the bound is on
+    // the number of refreshes, not on the answer, which never changes.
+    const kinds: string[] = [];
+    for (let i = 0; i < 10; i++) {
+      kinds.push(watch.resolveOrRefresh("never_exists").kind);
+    }
+    check("  every answer is unknown", [...new Set(kinds)], ["unknown"]);
+    check("  refreshes for ten lookups", watch.refreshCount, 1);
+
+    // A DIFFERENT absent name is a different budget: one more, not zero.
+    watch.resolveOrRefresh("also_never");
+    watch.resolveOrRefresh("also_never");
+    check("  a second absent name costs one more", watch.refreshCount, 2);
+
+    // Alternating between two absent names must not restart either budget.
+    // A record cleared by ANY refresh rather than only by a DDL-triggered one
+    // makes this exact interleaving an unbounded loop, and it is the shape a
+    // real caller produces: two live queries, both over a table that is gone.
+    for (let i = 0; i < 8; i++) {
+      watch.resolveOrRefresh(i % 2 === 0 ? "never_exists" : "also_never");
+    }
+    check("  alternating between them adds nothing", watch.refreshCount, 2);
+
+    // Real DDL clears the record, so the same name is eligible exactly once
+    // again — and this time it is there.
+    db.exec("CREATE TABLE never_exists(x)");
+    check("  the DDL refreshed", watch.refreshCount, 3);
+    check(
+      "  the name now resolves without another refresh",
+      watch.resolveOrRefresh("never_exists").kind,
+      "table",
+    );
+    check("  a hit costs no refresh", watch.refreshCount, 3);
+
+    // And the cleared record gives an absent name one more try, not unlimited.
+    watch.resolveOrRefresh("also_never");
+    watch.resolveOrRefresh("also_never");
+    watch.resolveOrRefresh("also_never");
+    check(
+      "  one more try after DDL, then bounded again",
+      watch.refreshCount,
+      4,
+    );
+    sub.dispose();
+    db.close();
+  },
+
+  "schema watch: refreshing from inside a hook is refused, not documented"() {
+    const db = memory();
+    const watch = watchSchema(db);
+    const caught: string[] = [];
+    let fromPostcommit = 0;
+    const sub = withEvents(
+      db,
+      (e) => {
+        if (e.type === "change" || e.type === "precommit") {
+          for (const attempt of ["refreshNow", "resolveOrRefresh"]) {
+            try {
+              if (attempt === "refreshNow") watch.refreshNow();
+              else watch.resolveOrRefresh("never_exists");
+              caught.push(`${e.type}:${attempt}:NO THROW`);
+            } catch (err) {
+              caught.push(
+                `${e.type}:${attempt}:${
+                  err instanceof SchemaWatchError
+                    ? "SchemaWatchError"
+                    : String(err)
+                }`,
+              );
+            }
+          }
+        }
+        if (e.type === "postcommit") {
+          // The legal route, in the same test, so "it always throws" cannot pass.
+          watch.refreshNow();
+          fromPostcommit++;
+        }
+        if (e.type === "authorize" || e.type === "postcommit") {
+          watch.observe(e);
+        }
+      },
+      LIB,
+      { authorize: true },
+    );
+    db.exec("INSERT INTO t(v) VALUES ('a')");
+    check("  refused from change and precommit", caught, [
+      "change:refreshNow:SchemaWatchError",
+      "change:resolveOrRefresh:SchemaWatchError",
+      "precommit:refreshNow:SchemaWatchError",
+      "precommit:resolveOrRefresh:SchemaWatchError",
+    ]);
+    check("  and allowed from postcommit", fromPostcommit, 1);
+    check("  the postcommit refresh really ran", watch.refreshCount >= 1, true);
+    sub.dispose();
+    db.close();
+  },
+
+  "schema watch: ATTACH arms but does not commit, so it needs a drain"() {
+    const db = memory();
+    const watch = watchSchema(db);
+    const sub = withEvents(db, (e) => watch.observe(e), LIB, {
+      authorize: true,
+    });
+    db.exec("ATTACH ':memory:' AS aux");
+    // Measured on 3.45.1 and 3.53.4: ATTACH produces an authorize event and no
+    // commit at all, so postcommit never drains it.
+    check("  armed", watch.armed, true);
+    check("  but not refreshed", watch.refreshCount, 0);
+    check("  the drain refreshes", watch.refreshIfArmed(), true);
+    check("  exactly once", watch.refreshCount, 1);
+    check("  and disarms", watch.armed, false);
+    check("  a second drain does nothing", watch.refreshIfArmed(), false);
+    check("  still once", watch.refreshCount, 1);
+    sub.dispose();
+    db.close();
+  },
+
+  "schema watch: a rolled-back DDL disarms without refreshing"() {
+    const db = memory();
+    const watch = watchSchema(db);
+    const sub = withEvents(db, (e) => watch.observe(e), LIB, {
+      authorize: true,
+    });
+    db.exec("BEGIN");
+    db.exec("CREATE TABLE rolled(x)");
+    db.exec("ROLLBACK");
+    check("  disarmed", watch.armed, false);
+    check("  no refresh", watch.refreshCount, 0);
+    check(
+      "  and the table really is gone",
+      watch.map.resolveTable("rolled").kind,
+      "unknown",
+    );
+    sub.dispose();
+    db.close();
+  },
+
+  "schema watch: isSchemaChangingAction separates DDL from ordinary work"() {
+    check(
+      "  DDL actions all count",
+      ([
+        "create_vtable",
+        "drop_vtable",
+        "create_table",
+        "drop_table",
+        "alter_table",
+        "create_view",
+        "create_trigger",
+        "create_index",
+        "attach",
+        "detach",
+      ] as const)
+        .filter((a) => !isSchemaChangingAction(a)),
+      [],
+    );
+    check(
+      "  and ordinary work counts for none",
+      ([
+        "read",
+        "select",
+        "insert",
+        "update",
+        "delete",
+        "pragma",
+        "transaction",
+        "savepoint",
+        "function",
+        "reindex",
+        "analyze",
+        "recursive",
+        "unknown",
+      ] as const)
+        .filter((a) => isSchemaChangingAction(a)),
+      [],
+    );
   },
 
   "SqliteHooksError is exported and instanceof-able"() {

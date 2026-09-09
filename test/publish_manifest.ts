@@ -27,6 +27,7 @@ const MUST_SHIP = [
   "mod.ts",
   "src/hooks.ts",
   "src/schema_map.ts",
+  "src/schema_watch.ts",
 ];
 
 /** Excluded today. Listed so the test fails if what ships WIDENS, not only if it narrows. */

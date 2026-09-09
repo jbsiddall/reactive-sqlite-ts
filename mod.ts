@@ -21,6 +21,7 @@
  */
 
 export {
+  insideHookOf,
   probeCapabilities,
   SqliteHooksError,
   withEvents,
@@ -28,6 +29,8 @@ export {
 } from "./src/hooks.ts";
 
 export type {
+  AuthorizeAction,
+  AuthorizeEvent,
   Batch,
   BatchCoverage,
   Capabilities,
@@ -60,3 +63,13 @@ export type {
   SchemaSource,
   TableRef,
 } from "./src/schema_map.ts";
+
+export {
+  connectionInsideHook,
+  isSchemaChangingAction,
+  SchemaWatch,
+  SchemaWatchError,
+  watchSchema,
+} from "./src/schema_watch.ts";
+
+export type { RefreshReason, SchemaWatchOptions } from "./src/schema_watch.ts";

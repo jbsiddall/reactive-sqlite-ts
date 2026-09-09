@@ -324,6 +324,80 @@ shape as `main`'s. Change events carry the schema too (`Change.db`). A map keyed
 by table name alone will merge a `main` table with a `temp` one of the same
 name.
 
+## What SQLite reports when the schema changes (2026-09-09)
+
+Measured on 2026-09-09 against both libraries in the capability ledger — the
+system build 3.45.1 and the vendored build 3.53.4 — through `@db/sqlite` 0.13.0
+under `resolveLibPath()`, with `withEvents(..., { authorize: true })` on a
+`:memory:` database. Every result below was identical on the two.
+
+### The commit batch does NOT identify DDL
+
+The intuitive rule — "DDL writes to `sqlite_schema`, `update_hook` does not
+report that, so a DDL commit arrives with `coverage: "unknown"` and an empty
+batch" — is true of some DDL and **false of the case that matters most here**.
+
+| statement                                      | postcommit coverage | changeCount |
+| ---------------------------------------------- | ------------------- | ----------- |
+| `CREATE TABLE plain(x)`                        | `unknown`           | 0           |
+| `CREATE INDEX ix ON plain(x)`                  | `unknown`           | 0           |
+| `DROP TABLE ft` (an FTS5 table)                | `unknown`           | 0           |
+| `CREATE TABLE aux.t2(y)` (attached schema)     | `unknown`           | 0           |
+| **`CREATE VIRTUAL TABLE ft USING fts5(body)`** | **`complete`**      | **2**       |
+| `INSERT INTO plain VALUES (1)` (control)       | `complete`          | 1           |
+| `INSERT INTO ft(body) VALUES ('hello')`        | `complete`          | 5           |
+
+Creating an FTS5 table writes two rows — into `ft_data` and `ft_config` — and
+those are ordinary tables, so `update_hook` reports them normally and the commit
+is indistinguishable from an ordinary write. Anything that detects DDL by
+watching for `coverage: "unknown"` therefore misses **every FTS5 creation**
+while working correctly on plain tables: the failure is invisible until someone
+uses a virtual table, which is exactly the population that needed it.
+
+### `ATTACH` and `DETACH` produce no commit at all
+
+`ATTACH ':memory:' AS aux` and `DETACH aux` each report to the authorizer —
+`attach`/24 with `arg1` the filename, `detach`/25 with `arg1` the alias, both
+with a null schema — and produce **no commit hook event of any kind**. A
+schema-change detector that only acts at `postcommit` will hold an attach
+pending until some unrelated transaction commits.
+
+### The authorizer names every object, at prepare time
+
+`CREATE VIRTUAL TABLE ft USING fts5(body)` reports, in order: `create_vtable`
+(`ft`, `fts5`, `main`), then `create_table` for `ft_data`, `ft_idx`,
+`ft_content`, `ft_docsize`, `ft_config`, and `create_index` for
+`sqlite_autoindex_ft_idx_1` and `sqlite_autoindex_ft_config_1`. `DROP TABLE ft`
+reports `drop_vtable` (`ft`, `fts5`, `main`) and `drop_table` for each of the
+five shadows. `arg3` carries the schema, so DDL in an ATTACHed database is
+distinguishable (`CREATE TABLE aux.t2(y)` reports `create_table`, `t2`, null,
+`aux`).
+
+**Controls, both libraries:** `INSERT INTO plain VALUES (1)` and
+`SELECT * FROM plain` report **no** create/drop/alter/attach action at all. This
+is what makes "no DDL means no refresh" a property rather than a hope, and it is
+the control that fails first if the action set is widened carelessly — adding
+`pragma` to it makes an ordinary `PRAGMA table_list` re-arm the detector.
+
+### A rolled-back DDL is visible as a rollback
+
+`BEGIN; CREATE TABLE rolled(x); ROLLBACK;` reports `create_table` to the
+authorizer at prepare time and then a `rollback` event with
+`coverage: "unknown"`. The authorizer fires whether or not the statement is ever
+stepped or committed, so a detector armed by it must be disarmed by the rollback
+or it will refresh for a schema change that did not happen.
+
+### The schema cookie is per schema, not per connection
+
+`PRAGMA <schema>.schema_version` is reachable on both libraries and does move on
+every schema change — but only for the schema that changed. With `aux2`
+attached: before, `main` = 9 and `aux2` = 0; after `CREATE TABLE aux2.t3(z)`,
+`main` = 9 and `aux2` = 1; after `CREATE TABLE main.t4(z)`, `main` = 10 and
+`aux2` = 1. A single read of `main.schema_version` used as a "did anything
+change" guard would suppress the refresh for every ATTACHed schema, silently.
+Reading every schema means reading `pragma_database_list` first, which is more
+SQL per check than the re-read it was meant to avoid.
+
 ## The record of the divergence (2026-09-09)
 
 Against the driver `@db/sqlite` as vendored here, and both libraries in the
