@@ -164,7 +164,7 @@ const plain = (v: unknown): unknown => {
   if (Array.isArray(v)) return v.map(plain);
   if (v !== null && typeof v === "object") {
     return Object.fromEntries(
-      Object.entries(v as Record<string, RowValue>).map((
+      Object.entries(v).map((
         [k, x],
       ) => [k, plain(x)]),
     );
@@ -179,6 +179,16 @@ const plain = (v: unknown): unknown => {
 const DB_METHODS = ["exec", "run", "prepare", "transaction", "close"] as const;
 const STMT_METHODS = ["run", "get", "all", "values", "value"] as const;
 const TX_VARIANTS = ["default", "deferred", "immediate", "exclusive"] as const;
+
+const msg = (e: unknown): string => e instanceof Error ? e.message : String(e);
+
+const name_ = (e: unknown): string => e instanceof Error ? e.name : typeof e;
+
+/** A checked read: in a test a wrong storage class is a failure, not a cast. */
+const text = (v: unknown): string => {
+  if (typeof v === "string") return v;
+  throw new Error(`expected text, got ${Deno.inspect(v)}`);
+};
 
 const rows = (db: Db): number =>
   db.prepare("SELECT count(*) c FROM t").get<{ c: number }>()?.c ?? -1;
@@ -300,7 +310,7 @@ const SEMANTIC: Record<string, () => void> = {
     try {
       db.exec("INSERT INTO t VALUES (1, 'a')");
     } catch (e) {
-      threw = (e as Error).message;
+      threw = msg(e);
     }
     // preupdate leads every row now, so the veto scenario sees four events.
     check("  events", seen, ["preupdate", "change", "precommit", "rollback"]);
@@ -486,7 +496,7 @@ const SEMANTIC: Record<string, () => void> = {
       try {
         db.prepare("SELECT 1").get();
       } catch (x) {
-        err = (x as Error).name;
+        err = name_(x);
       }
     }, LIB);
     db.exec("INSERT INTO t VALUES (1, 'a')");
@@ -577,8 +587,8 @@ const SEMANTIC: Record<string, () => void> = {
     try {
       withEvents(db, () => {}, LIB);
     } catch (e) {
-      name = (e as Error).name;
-      message = (e as Error).message;
+      name = name_(e);
+      message = msg(e);
     }
     check("  error type", name, "SqliteHooksError");
     check("  mentions mismatch", message.includes("library mismatch"), true);
@@ -691,8 +701,8 @@ const SEMANTIC: Record<string, () => void> = {
     );
     db.exec("INSERT INTO v VALUES (2, '', -1.5, x'', -9223372036854775808)");
     const first = pre[0]!.new!, second = pre[1]!.new!;
-    check("  embedded NUL survives", [...(first.s as string)].length, 3);
-    check("  as code points", (first.s as string).charCodeAt(1), 0);
+    check("  embedded NUL survives", [...text(first.s)].length, 3);
+    check("  as code points", text(first.s).charCodeAt(1), 0);
     check("  real", first.r, 1e300);
     check("  blob bytes", plain(first.b), "blob:0,255,128");
     check("  blob is a Uint8Array", first.b instanceof Uint8Array, true);
@@ -880,7 +890,7 @@ const SEMANTIC: Record<string, () => void> = {
     try {
       probeCapabilities("/usr/lib/x86_64-linux-gnu/libz.so.1");
     } catch (e) {
-      name = (e as Error).name;
+      name = name_(e);
     }
     check("  error", name, "SqliteHooksError");
   },
@@ -934,7 +944,7 @@ const SEMANTIC: Record<string, () => void> = {
     try {
       withEvents(db, () => {}, LIB, { preupdate: "required" });
     } catch (e) {
-      message = (e as Error).message;
+      message = msg(e);
     }
     check("  refused", message.includes('preupdate: "required"'), true);
     db.close();
@@ -950,7 +960,7 @@ const SEMANTIC: Record<string, () => void> = {
       (row) => row.new && row.new.s === "bad" ? "no bad rows" : undefined,
       LIB,
       {
-        onListenerError: (e) => errors.push((e as Error).message),
+        onListenerError: (e) => errors.push(msg(e)),
       },
     );
     db.exec("INSERT INTO v VALUES (1, 'good', 0, NULL, NULL)");
@@ -958,7 +968,7 @@ const SEMANTIC: Record<string, () => void> = {
     try {
       db.exec("INSERT INTO v VALUES (2, 'bad', 0, NULL, NULL)");
     } catch (e) {
-      sqlError = (e as Error).message;
+      sqlError = msg(e);
     }
     db.exec("INSERT INTO v VALUES (3, 'fine', 0, NULL, NULL)");
     check("  sql error is SQLite's own", sqlError, "constraint failed");
@@ -990,7 +1000,9 @@ const SEMANTIC: Record<string, () => void> = {
       caught = e;
     }
     check("  AggregateError", caught instanceof AggregateError, true);
-    const errs = (caught as AggregateError).errors as Error[];
+    const errs: Error[] = caught instanceof AggregateError
+      ? caught.errors.map((e) => e instanceof Error ? e : new Error(String(e)))
+      : [];
     check("  both errors", errs.length, 2);
     check("  SQLite's", errs[0]!.message, "constraint failed");
     check("  ours", errs[1]!.message.includes("no bad rows"), true);
@@ -1014,7 +1026,7 @@ const SEMANTIC: Record<string, () => void> = {
     try {
       db.exec("COMMIT");
     } catch (e) {
-      threw = (e as Error).message;
+      threw = msg(e);
     }
     check("  the COMMIT failed", threw.length > 0, true);
     check(
@@ -1067,7 +1079,7 @@ const SEMANTIC: Record<string, () => void> = {
         throw new Error("validator exploded");
       },
       LIB,
-      { onListenerError: (e) => errors.push((e as Error).message) },
+      { onListenerError: (e) => errors.push(msg(e)) },
     );
     try {
       db.exec("INSERT INTO v VALUES (1, 'a', 0, NULL, NULL)");
@@ -1091,9 +1103,27 @@ const SEMANTIC: Record<string, () => void> = {
     try {
       withValidation(types(), () => undefined, LIB, { preupdate: "off" });
     } catch (e) {
-      message = (e as Error).message;
+      message = msg(e);
     }
     check("  refused", message.includes("cannot work with preupdate"), true);
+  },
+
+  "column names survive schema and table names that would collide under a separator"() {
+    // "x: y"+"z" and "x"+" y:z" are the same string under any single ":" join.
+    const db = new Database(":memory:");
+    db.exec(`ATTACH ':memory:' AS "x: y"`);
+    db.exec(`CREATE TABLE "x: y"."z" (alpha INTEGER)`);
+    db.exec(`ATTACH ':memory:' AS "x"`);
+    db.exec(`CREATE TABLE "x"." y:z" (beta INTEGER)`);
+    const rows = preupdates(db);
+    db.exec(`INSERT INTO "x: y"."z" VALUES (1)`);
+    db.exec(`INSERT INTO "x"." y:z" VALUES (2)`);
+    check(
+      "  each pair kept its own columns",
+      rows.map((r) => [r.db, r.table, [...r.columns]]),
+      [["x: y", "z", ["alpha"]], ["x", " y:z", ["beta"]]],
+    );
+    db.close();
   },
 
   "an async precommit listener refuses the commit instead of permitting it"() {
@@ -1253,7 +1283,7 @@ if (runSemantic) {
     try {
       fn();
     } catch (e) {
-      fail(name, `threw ${(e as Error).stack ?? e}`);
+      fail(name, `threw ${e instanceof Error ? e.stack : e}`);
     }
   }
 }

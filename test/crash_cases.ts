@@ -39,12 +39,19 @@ const fresh = (sql = "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)"): Db => {
 };
 
 /** Attach with a listener that only reacts to one event type. */
-const on = (db: Db, type: DbEvent["type"], fn: (e: DbEvent) => unknown) =>
-  withEvents(
-    db,
-    ((e) => (e.type === type ? fn(e) : undefined)) as Listener,
-    LIB,
-  );
+const on = (db: Db, type: DbEvent["type"], fn: (e: DbEvent) => unknown) => {
+  const listener: Listener = (e) => e.type === type ? fn(e) : undefined;
+  return withEvents(db, listener, LIB);
+};
+
+const message = (e: unknown): string =>
+  e instanceof Error ? e.message : String(e);
+
+/** A checked read: in a test a wrong storage class is a failure, not a cast. */
+const bytes = (v: unknown): Uint8Array => {
+  if (v instanceof Uint8Array) return v;
+  throw new Error(`expected a blob, got ${Deno.inspect(v)}`);
+};
 
 export const CASES: Record<string, CrashCase> = {
   "dispose-in-listener": {
@@ -277,6 +284,7 @@ export const CASES: Record<string, CrashCase> = {
     match: "must be a @db/sqlite Database",
     why: "A duck-typed pointer would be handed straight to dlopen'd C.",
     run() {
+      // deno-lint-ignore project/no-type-assertion -- the point of the case is to hand withEvents what its types forbid, so the runtime guard is what gets tested.
       withEvents({ unsafeHandle: 1 } as never, () => {}, LIB);
     },
   },
@@ -287,6 +295,7 @@ export const CASES: Record<string, CrashCase> = {
     why: "The listener is called from inside an FFI callback.",
     run() {
       const db = fresh();
+      // deno-lint-ignore project/no-type-assertion -- as above: the illegal argument IS the test.
       withEvents(db, "nope" as never, LIB);
     },
   },
@@ -678,7 +687,7 @@ export const CASES: Record<string, CrashCase> = {
       db.exec("VACUUM");
       const first = kept[0]!;
       const s = first.new!.s;
-      const b = first.new!.b as Uint8Array;
+      const b = bytes(first.new?.b);
       const ok = s === "keep me" && b instanceof Uint8Array &&
         [...b].join(",") === "1,2,3,4" && first.new!.id === 1n &&
         junk.length === 50_000;
@@ -700,7 +709,7 @@ export const CASES: Record<string, CrashCase> = {
       withEvents(db, (e) => {
         if (e.type === "preupdate" && e.blobWriteColumn !== null) {
           line = `${e.op} blobcol ${e.blobWriteColumn} old-len ${
-            (e.old!.b as Uint8Array).length
+            bytes(e.old?.b).length
           }`;
         }
       }, LIB);
@@ -807,7 +816,8 @@ export const CASES: Record<string, CrashCase> = {
       const db = new Database(":memory:");
       db.exec("CREATE TABLE acct(id INTEGER PRIMARY KEY, bal INTEGER)");
       withValidation(db, (row) => {
-        if (row.new && (row.new.bal as bigint) < 0n) {
+        const bal = row.new?.bal;
+        if (typeof bal === "bigint" && bal < 0n) {
           return "balance must not go negative";
         }
         return undefined;
@@ -827,7 +837,8 @@ export const CASES: Record<string, CrashCase> = {
       withValidation(
         db,
         (row) => {
-          if (row.new && (row.new.bal as bigint) < 0n) return "negative";
+          const bal = row.new?.bal;
+          if (typeof bal === "bigint" && bal < 0n) return "negative";
           return undefined;
         },
         LIB,
@@ -837,7 +848,7 @@ export const CASES: Record<string, CrashCase> = {
       try {
         db.exec("INSERT INTO acct VALUES (1, -5)");
       } catch (e) {
-        sqlMessage = (e as Error).message;
+        sqlMessage = message(e);
       }
       db.exec("INSERT INTO acct VALUES (2, 10)");
       console.log(
@@ -861,7 +872,8 @@ export const CASES: Record<string, CrashCase> = {
       withValidation(
         db,
         (row) => {
-          if (row.new && (row.new.bal as bigint) < 0n) return "negative";
+          const bal = row.new?.bal;
+          if (typeof bal === "bigint" && bal < 0n) return "negative";
           return undefined;
         },
         LIB,
@@ -906,7 +918,7 @@ export const CASES: Record<string, CrashCase> = {
         {
           onListenerError: (e) => {
             reason = `rejected: ${
-              (e as Error).message.replace(/^.*validation: /, "").replace(
+              message(e).replace(/^.*validation: /, "").replace(
                 / \(.*$/,
                 "",
               )

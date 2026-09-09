@@ -141,14 +141,37 @@ export function readManifest(
   target: Target = currentTarget(),
 ): BuildManifest | undefined {
   try {
-    return JSON.parse(
+    const parsed: unknown = JSON.parse(
       Deno.readTextFileSync(
         join(VENDOR_DIR, "lib", target, "build_manifest.json"),
       ),
-    ) as BuildManifest;
+    );
+    return isBuildManifest(parsed) ? parsed : undefined;
   } catch {
     return undefined;
   }
+}
+
+const STRING_FIELDS = [
+  "sqliteVersion",
+  "sourceUrl",
+  "sourceSha3_256",
+  "sourceSha256",
+  "target",
+  "libraryFile",
+  "librarySha256",
+  "compiler",
+  "builtAtUtc",
+] as const;
+
+function isBuildManifest(v: unknown): v is BuildManifest {
+  if (v === null || typeof v !== "object") return false;
+  if (typeof Reflect.get(v, "librarySizeBytes") !== "number") return false;
+  const flags: unknown = Reflect.get(v, "flags");
+  if (!Array.isArray(flags) || flags.some((f) => typeof f !== "string")) {
+    return false;
+  }
+  return STRING_FIELDS.every((k) => typeof Reflect.get(v, k) === "string");
 }
 
 /**

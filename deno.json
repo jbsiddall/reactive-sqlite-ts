@@ -52,9 +52,15 @@
     }
   },
   "lint": {
+    "plugins": [
+      "./tools/lint_plugin.ts"
+    ],
     "rules": {
       "tags": [
         "recommended"
+      ],
+      "include": [
+        "no-explicit-any"
       ]
     }
   },
@@ -75,6 +81,7 @@
       ".github/",
       "test/",
       "examples/",
+      "tools/",
       "CONTRIBUTING.md"
     ]
   }

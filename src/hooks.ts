@@ -411,11 +411,12 @@ type Registration = {
 const REGISTRATIONS = new WeakMap<Database, Registration>();
 
 function isDatabase(db: unknown): db is Database {
-  const o = db as Record<string, unknown> | null;
-  return !!o && typeof o === "object" &&
-    typeof o.prepare === "function" && typeof o.exec === "function" &&
-    typeof o.close === "function" && typeof o.transaction === "function" &&
-    "unsafeHandle" in o && "open" in o;
+  if (db === null || typeof db !== "object") return false;
+  return typeof Reflect.get(db, "prepare") === "function" &&
+    typeof Reflect.get(db, "exec") === "function" &&
+    typeof Reflect.get(db, "close") === "function" &&
+    typeof Reflect.get(db, "transaction") === "function" &&
+    "unsafeHandle" in db && "open" in db;
 }
 
 type OpenedLibrary = {
@@ -656,6 +657,11 @@ function subscription(
   };
 }
 
+/** Any callable, whatever its parameters: enough to wrap, never enough to call blindly. */
+type Patchable = (...args: never[]) => unknown;
+
+const isPatchable = (v: unknown): v is Patchable => typeof v === "function";
+
 /** Cross-realm safe: a thenable need not be an `instanceof Promise`. */
 function isThenable(v: unknown): v is PromiseLike<unknown> {
   if (v === null || (typeof v !== "object" && typeof v !== "function")) {
@@ -857,7 +863,8 @@ function attach(
   /** Something was seen that the cache cannot explain; refill at the next boundary. */
   let schemaDirty = false;
   const DDL = /\b(create|alter|drop|attach|detach)\b/i;
-  const key = (schema: string, table: string) => `${schema} ${table}`;
+  const key = (schema: string, table: string) =>
+    `${schema.length}:${schema}:${table}`;
 
   /** Run one uninstrumented query and release the statement rather than waiting for GC. */
   const ask = <T extends Record<string, unknown>>(
@@ -982,6 +989,10 @@ function attach(
       } as const,
       (_ctx, dbh, opcode, zDb, zTable, iKey1, iKey2) =>
         inFfi(undefined, () => {
+          // SQLite only ever passes the three opcodes in OPS; the fallback
+          // labels an impossible one rather than dropping the row, which the
+          // closed Change["op"] union has no way to express.
+          // deno-lint-ignore project/no-type-assertion
           const op = OPS[opcode] ?? `op${opcode}` as never;
           const schema = readC(zDb);
           const table = readC(zTable);
@@ -1057,6 +1068,8 @@ function attach(
     (_arg, op, zDb, zTable, rowid) =>
       inFfi(undefined, () => {
         const change: Change = {
+          // As above: an opcode outside OPS is unreachable, and unrepresentable.
+          // deno-lint-ignore project/no-type-assertion
           op: OPS[op] ?? `op${op}` as never,
           db: readC(zDb),
           table: readC(zTable),
@@ -1158,10 +1171,7 @@ function attach(
     }
   };
 
-  const instrument = <F extends (...a: never[]) => unknown>(
-    fn: F,
-    what: string,
-  ): F =>
+  const instrument = (fn: Patchable, what: string): Patchable =>
     function (this: unknown, ...args: never[]) {
       guard(what);
       // Column names are refreshed here, between statements, because the hook
@@ -1190,7 +1200,7 @@ function attach(
         }
         throw sqlError;
       }
-    } as F;
+    };
 
   /**
    * Install `replacement` at `obj[name]`, recording how to put back exactly
@@ -1199,49 +1209,45 @@ function attach(
    * permanently altered.
    */
   const patch = (
-    obj: Record<string, unknown>,
+    obj: object,
     name: string,
     replacement: unknown,
     undoable = true,
   ) => {
     const own = Object.hasOwn(obj, name);
-    const orig = obj[name];
-    obj[name] = replacement;
+    const orig: unknown = Reflect.get(obj, name);
+    Reflect.set(obj, name, replacement);
     if (!undoable) return;
     undo.push(() => {
-      if (own) obj[name] = orig;
-      else delete obj[name];
+      if (own) Reflect.set(obj, name, orig);
+      else Reflect.deleteProperty(obj, name);
     });
   };
 
   /** Patch own+inherited callables in `names`, recording how to undo it. */
   const wrap = (
-    obj: Record<string, unknown>,
+    obj: object,
     names: readonly string[],
     label: string,
     undoable = true,
   ) => {
     for (const name of names) {
-      const orig = obj[name];
-      if (typeof orig !== "function") continue;
-      patch(
-        obj,
-        name,
-        instrument(orig as (...a: never[]) => unknown, `${label}${name}()`),
-        undoable,
-      );
+      const orig: unknown = Reflect.get(obj, name);
+      if (!isPatchable(orig)) continue;
+      patch(obj, name, instrument(orig, `${label}${name}()`), undoable);
     }
   };
 
-  const dbObj = db as unknown as Record<string, unknown>;
-  wrap(dbObj, DB_METHODS, "db.");
+  wrap(db, DB_METHODS, "db.");
 
-  const origOpenBlob = dbObj.openBlob;
-  if (typeof origOpenBlob === "function") {
-    patch(dbObj, "openBlob", (...args: never[]) => {
+  const origOpenBlob: unknown = Reflect.get(db, "openBlob");
+  if (isPatchable(origOpenBlob)) {
+    patch(db, "openBlob", (...args: never[]) => {
       guard("db.openBlob()");
-      const blob = (origOpenBlob as (...a: never[]) => unknown).apply(db, args);
-      wrap(blob as Record<string, unknown>, BLOB_METHODS, "blob.", false);
+      const blob: unknown = origOpenBlob.apply(db, args);
+      if (blob !== null && typeof blob === "object") {
+        wrap(blob, BLOB_METHODS, "blob.", false);
+      }
       return blob;
     });
   }
@@ -1250,31 +1256,26 @@ function attach(
   // run/get/all/... as OWN properties on each Statement, shadowing the
   // prototype, so the prototype is not a useful place to patch.
   const origPrepare = db.prepare.bind(db);
-  patch(dbObj, "prepare", (...args: never[]) => {
+  patch(db, "prepare", (sql: string) => {
     guard("db.prepare()");
-    const stmt = (origPrepare as (...a: never[]) => unknown)(...args);
-    wrap(stmt as Record<string, unknown>, STMT_METHODS, "statement.", false);
+    const stmt = origPrepare(sql);
+    wrap(stmt, STMT_METHODS, "statement.", false);
     return stmt;
   });
 
   // db.transaction() returns a closure that BEGINs and COMMITs internally, and
   // carries .default/.deferred/.immediate/.exclusive versions of itself.
   const origTransaction = db.transaction.bind(db);
-  patch(dbObj, "transaction", (...args: never[]) => {
+  patch(db, "transaction", (fn: (...args: unknown[]) => void) => {
     guard("db.transaction()");
-    const tx = (origTransaction as (...a: never[]) => unknown)(...args) as
-      & ((...a: never[]) => unknown)
-      & Record<string, unknown>;
+    const tx = origTransaction(fn);
     const wrapped = instrument(tx, "transaction()");
     const props: PropertyDescriptorMap = {};
     for (const variant of TX_VARIANTS) {
-      const v = tx[variant];
-      if (typeof v === "function") {
+      const v: unknown = Reflect.get(tx, variant);
+      if (isPatchable(v)) {
         props[variant] = {
-          value: instrument(
-            v as (...a: never[]) => unknown,
-            `transaction().${variant}()`,
-          ),
+          value: instrument(v, `transaction().${variant}()`),
         };
       }
     }
@@ -1288,7 +1289,7 @@ function attach(
   // Intercept close(): the callbacks must not outlive the connection, and the
   // driver does not guard use-after-close at all.
   const origClose = db.close.bind(db);
-  patch(dbObj, "close", () => {
+  patch(db, "close", () => {
     if (reg.closed) return; // the driver's close() is a no-op too
     if (reg.inListener) {
       throw new SqliteHooksError(

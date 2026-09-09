@@ -10,6 +10,9 @@
  */
 import { resolveLibPath } from "../src/lib_path.ts";
 
+const message = (e: unknown): string =>
+  e instanceof Error ? e.message : String(e);
+
 const LIB = resolveLibPath();
 console.log(`using ${LIB}`);
 
@@ -91,7 +94,7 @@ vetoNext = true;
 try {
   ins.run(4, "d");
 } catch (err) {
-  console.log(`   run() threw: ${(err as Error).message}`);
+  console.log(`   run() threw: ${message(err)}`);
 }
 vetoNext = false;
 expect("rows after veto", rows(), 1);
@@ -102,7 +105,7 @@ ins.run(5, "e");
 try {
   ins.run(6, "e"); // duplicate of the UNIQUE value above
 } catch (err) {
-  console.log(`   run() threw: ${(err as Error).message}`);
+  console.log(`   run() threw: ${message(err)}`);
 }
 db.exec("ROLLBACK");
 expect("rows after failed statement", rows(), 1);
@@ -169,7 +172,8 @@ if (CAPS.preupdate) {
   const guarded = new Database(":memory:");
   guarded.exec("CREATE TABLE acct(id INTEGER PRIMARY KEY, balance INTEGER)");
   withValidation(guarded, (row) => {
-    if (row.new && (row.new.balance as bigint) < 0n) {
+    const balance = row.new?.balance;
+    if (typeof balance === "bigint" && balance < 0n) {
       return "balance must not go negative";
     }
     return undefined;
@@ -179,8 +183,8 @@ if (CAPS.preupdate) {
     guarded.exec("INSERT INTO acct VALUES (2, -5)");
   } catch (err) {
     const parts = err instanceof AggregateError
-      ? err.errors.map((e) => (e as Error).message)
-      : [(err as Error).message];
+      ? err.errors.map(message)
+      : [message(err)];
     console.log(`   rejected: ${parts.join(" | ")}`);
   }
   expect(
