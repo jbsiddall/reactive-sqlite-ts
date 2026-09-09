@@ -824,8 +824,9 @@ function attach(
    * error is recorded and reported from JS, never unwound through C.
    */
   const attachment = backend.attach({
-    update: (raw: RawChange) =>
+    update: (read: () => RawChange) =>
       inFfi(undefined, () => {
+        const raw = read();
         const change: Change = {
           op: opFor(raw.opcode),
           opcode: raw.opcode,
@@ -837,8 +838,17 @@ function attach(
         dispatch({ type: "change", change });
       }),
 
-    preupdate: (raw: RawPreUpdate) =>
+    preupdate: (read: () => RawPreUpdate) =>
       inFfi(undefined, () => {
+        let raw: RawPreUpdate;
+        try {
+          raw = read();
+        } catch (error) {
+          // The row could not be read, so the names cached for it are no
+          // longer trustworthy either. Refill at the next statement boundary.
+          schemaDirty = true;
+          throw error;
+        }
         const op = opFor(raw.opcode);
         const cached = columnCache.get(key(raw.db, raw.table));
         // A stale cache (a column added since) is as bad as a missing one:
@@ -918,9 +928,10 @@ function attach(
 
     // The seam's other direction: an error raised BELOW it, before any handler
     // ran. Recorded like any listener error rather than crossing back into C.
-    fail: (error: unknown) => {
-      errors.push({ error, event: { type: "change", change: NO_ROW } });
-    },
+    fail: (error: unknown) =>
+      inFfi(undefined, () => {
+        errors.push({ error, event: { type: "change", change: NO_ROW } });
+      }),
 
     rollback: () =>
       inFfi(undefined, () => {

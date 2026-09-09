@@ -955,6 +955,22 @@ export const CASES: Record<string, CrashCase> = {
     },
   },
 
+  "reentrant-hook-via-uninstrumented-statement": {
+    code: 1,
+    match: "a SQLite hook fired while another was running",
+    why:
+      "A statement prepared BEFORE withEvents is not instrumented, so calling it from a listener re-enters SQLite's hooks. This pins that the re-entry is refused and does not segfault; that nothing READS the row first is pinned by the semantic suite, which is the only place that difference is observable.",
+    run() {
+      const db = fresh();
+      const uninstrumented = db.prepare("INSERT INTO t VALUES (99, 'x')");
+      on(db, "change", () => {
+        uninstrumented.run();
+      });
+      db.exec("INSERT INTO t VALUES (1, 'a')");
+      console.log("survived");
+    },
+  },
+
   "property-no-permutation-crashes": {
     code: 0,
     match: "survived",

@@ -32,6 +32,7 @@ const {
   withValidation,
 } = await import("../src/hooks.ts");
 const { formatEvent, jsonReplacer } = await import("../src/format.ts");
+const { openFfiBackend } = await import("../src/backend_ffi.ts");
 type DbEvent = import("../src/hooks.ts").DbEvent;
 type PreUpdate = import("../src/hooks.ts").PreUpdate;
 type RowValue = import("../src/hooks.ts").RowValue;
@@ -1274,6 +1275,54 @@ const SEMANTIC: Record<string, () => void> = {
     const seen = JSON.parse(text);
     check("  valid JSON", typeof seen, "object");
     check("  rowid exact", `${seen.change.rowid}`, "9007199254740993");
+    db.close();
+  },
+
+  "the backend hands over an UNREAD row, so a caller's guards run first"() {
+    // The re-entrancy guard must be able to reject a callback without SQLite
+    // having been touched at all. A row handed over already-decoded would mean
+    // the accessors had run before the guard could say no.
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE t(id INTEGER PRIMARY KEY, v)");
+    const backend = openFfiBackend(LIB, db.unsafeHandle, "required");
+    let handed = 0;
+    let readRows = 0;
+    let table = "";
+    const at = backend.attach({
+      update: () => {},
+      preupdate: (read) => {
+        handed++;
+        if (handed > 1) return; // the second row is deliberately never read
+        readRows++;
+        table = read().table;
+      },
+      commit: () => false,
+      rollback: () => {},
+      fail: () => {},
+    });
+    db.exec("INSERT INTO t VALUES (1, 'a')");
+    db.exec("INSERT INTO t VALUES (2, 'b')");
+    check("  both rows handed over", handed, 2);
+    check("  only one was read", readRows, 1);
+    check("  and reading gave the row", table, "t");
+    at.detach(true);
+    db.close();
+  },
+
+  "detaching twice is safe"() {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE t(id INTEGER PRIMARY KEY)");
+    const backend = openFfiBackend(LIB, db.unsafeHandle, "auto");
+    const at = backend.attach({
+      update: () => {},
+      preupdate: () => {},
+      commit: () => false,
+      rollback: () => {},
+      fail: () => {},
+    });
+    at.detach(true);
+    at.detach(true);
+    check("  survived a second detach", true, true);
     db.close();
   },
 

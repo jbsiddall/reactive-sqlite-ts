@@ -74,11 +74,19 @@ type PreSymbols = Deno.DynamicLibrary<typeof PREUPDATE_SYMBOLS>["symbols"];
 /** SQLITE_NULL etc., as returned by sqlite3_value_type. */
 const VALUE_INTEGER = 1, VALUE_FLOAT = 2, VALUE_TEXT = 3, VALUE_BLOB = 4;
 
-type Opened = {
-  lib: CoreLib;
-  pre: PreSymbols | null;
-  capabilities: Capabilities;
-};
+type Opened = { lib: CoreLib; pre: PreSymbols | null; unavailable: string };
+
+/**
+ * Capabilities are DERIVED from `pre`, never carried beside it: two fields
+ * saying the same thing can disagree, and a disagreement here would deliver
+ * preupdate events the caller believes it does not have.
+ */
+const capabilitiesOf = (opened: Opened): Capabilities =>
+  opened.pre !== null ? { hooks: true, preupdate: true } : {
+    hooks: true,
+    preupdate: false,
+    preupdateUnavailable: opened.unavailable,
+  };
 
 /**
  * dlopen the library, taking the preupdate API if it is there.
@@ -108,11 +116,7 @@ function openLibrary(
           ...PREUPDATE_SYMBOLS,
         } as const,
       );
-      return {
-        lib: full,
-        pre: full.symbols,
-        capabilities: { hooks: true, preupdate: true },
-      };
+      return { lib: full, pre: full.symbols, unavailable: "" };
     } catch (cause) {
       // Either the preupdate API is absent (the interesting case) or the whole
       // library is wrong — the core dlopen below tells those two apart.
@@ -137,15 +141,7 @@ function openLibrary(
       `preupdate: "required" was asked for, but ${unavailable}`,
     );
   }
-  return {
-    lib,
-    pre: null,
-    capabilities: {
-      hooks: true,
-      preupdate: false,
-      preupdateUnavailable: unavailable,
-    },
-  };
+  return { lib, pre: null, unavailable };
 }
 
 /**
@@ -157,7 +153,9 @@ export function openFfiBackend(
   handle: Deno.PointerValue,
   want: NonNullable<EventOptions["preupdate"]>,
 ): Backend {
-  const { lib, pre, capabilities } = openLibrary(libPath, want);
+  const opened = openLibrary(libPath, want);
+  const { lib, pre } = opened;
+  const capabilities = capabilitiesOf(opened);
   const version = readC(lib.symbols.sqlite3_libversion());
 
   // One reusable out-param for the sqlite3_value** the accessors fill in.
@@ -215,6 +213,17 @@ export function openFfiBackend(
     }
   };
 
+  /** The last line of defence: a handler that throws must not reach SQLite. */
+  const safely = (handlers: BackendHandlers, body: () => void): void => {
+    try {
+      body();
+    } catch (error) {
+      try {
+        handlers.fail(error);
+      } catch { /* `fail` threw too; there is nowhere left to report it. */ }
+    }
+  };
+
   const readRow = (
     p: PreSymbols,
     dbh: Deno.PointerValue,
@@ -224,6 +233,8 @@ export function openFfiBackend(
     iKey1: bigint,
     iKey2: bigint,
   ): RawPreUpdate => {
+    const db = readC(zDb);
+    const table = readC(zTable);
     const count = p.sqlite3_preupdate_count(dbh);
     const blobwrite = p.sqlite3_preupdate_blobwrite(dbh);
     const side = (which: "old" | "new"): RowValue[] | null => {
@@ -241,8 +252,8 @@ export function openFfiBackend(
     const newValues = opcode === SQLITE_DELETE ? null : side("new");
     return {
       opcode,
-      db: readC(zDb),
-      table: readC(zTable),
+      db,
+      table,
       oldRowid: iKey1,
       newRowid: iKey2,
       columnCount: count,
@@ -275,15 +286,11 @@ export function openFfiBackend(
             ],
             result: "void",
           } as const,
-          (_ctx, dbh, opcode, zDb, zTable, iKey1, iKey2) => {
-            try {
-              handlers.preupdate(
-                readRow(pre, dbh, opcode, zDb, zTable, iKey1, iKey2),
-              );
-            } catch (error) {
-              handlers.fail(error);
-            }
-          },
+          (_ctx, dbh, opcode, zDb, zTable, iKey1, iKey2) =>
+            safely(handlers, () =>
+              handlers.preupdate(() =>
+                readRow(pre, dbh, opcode, zDb, zTable, iKey1, iKey2)
+              )),
         )
         : null;
 
@@ -292,18 +299,14 @@ export function openFfiBackend(
           parameters: ["pointer", "i32", "pointer", "pointer", "i64"],
           result: "void",
         } as const,
-        (_arg, opcode, zDb, zTable, rowid) => {
-          try {
-            handlers.update({
+        (_arg, opcode, zDb, zTable, rowid) =>
+          safely(handlers, () =>
+            handlers.update(() => ({
               opcode,
               db: readC(zDb),
               table: readC(zTable),
               rowid,
-            });
-          } catch (error) {
-            handlers.fail(error);
-          }
-        },
+            }))),
       );
 
       const commit = new Deno.UnsafeCallback(
@@ -314,7 +317,9 @@ export function openFfiBackend(
           try {
             return handlers.commit() ? 1 : 0;
           } catch (error) {
-            handlers.fail(error);
+            safely(handlers, () => {
+              throw error;
+            });
             return 1;
           }
         },
@@ -322,13 +327,7 @@ export function openFfiBackend(
 
       const rollback = new Deno.UnsafeCallback(
         { parameters: ["pointer"], result: "void" } as const,
-        () => {
-          try {
-            handlers.rollback();
-          } catch (error) {
-            handlers.fail(error);
-          }
-        },
+        () => safely(handlers, () => handlers.rollback()),
       );
 
       // A forgotten dispose() should not wedge the process open at exit; these
@@ -345,8 +344,11 @@ export function openFfiBackend(
       lib.symbols.sqlite3_commit_hook(handle, commit.pointer, null);
       lib.symbols.sqlite3_rollback_hook(handle, rollback.pointer, null);
 
+      let detached = false;
       return {
         detach(live: boolean) {
+          if (detached) return; // double-closing a callback or the library aborts
+          detached = true;
           // Order matters: unregister while the connection is still alive, so
           // SQLite can never call a callback we are about to free.
           if (live) {

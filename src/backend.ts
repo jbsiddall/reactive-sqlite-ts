@@ -51,8 +51,14 @@ export type RawPreUpdate = {
  * a backend may assume it and must not rely on a try/catch of its own.
  */
 export type BackendHandlers = {
-  update(change: RawChange): void;
-  preupdate(row: RawPreUpdate): void;
+  /**
+   * `read` performs the C-level reads for this row. It is handed over
+   * UNCALLED so the caller's own guards run FIRST — a caller that declines to
+   * read has cost SQLite nothing. Call it synchronously and at most once; the
+   * values it returns are dead as soon as the callback returns.
+   */
+  update(read: () => RawChange): void;
+  preupdate(read: () => RawPreUpdate): void;
   /** `true` turns the COMMIT into a ROLLBACK. */
   commit(): boolean;
   rollback(): void;
@@ -66,9 +72,9 @@ export type BackendHandlers = {
 
 export type Attachment = {
   /**
-   * Release everything. `live` is false when the connection has already been
-   * closed, in which case the hooks must NOT be unregistered — that would
-   * touch a freed handle.
+   * Release everything, idempotently. `live` is false when the connection has
+   * already been closed, in which case the hooks must NOT be unregistered —
+   * that would touch a freed handle.
    */
   detach(live: boolean): void;
 };
