@@ -38,6 +38,10 @@
       "description": "Re-probe the three libraries and fail if README.md's capability table does not match — plus the gate that must pass before any of those numbers is reportable: three distinct files, three non-identical columns, each version found in the bytes of its own file, and one pinned known answer.",
       "command": "deno run --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write --allow-run tools/capability_table.ts --check"
     },
+    "test:table-structure": {
+      "description": "Ask whether `Capabilities`, the table's row list and the committed README block still agree, without opening any library: every field has a row or a named exemption, every row and every exemption names a live field, the rows follow declaration order, the markers and observation date are present, and every cell is yes or no. Field names are read textually out of src/hooks.ts, because `keyof Capabilities` is the thing under suspicion. Needs no libsqlite3 and no FFI, which is why CI runs it first.",
+      "command": "deno run --allow-read tools/capability_table.ts --structure"
+    },
     "test:capability-coverage": {
       "description": "Measure which capability-refusal branches are actually exercised, and by what: real absence, a simulating option, or nothing. Rewrites each refusal to `false` in the source and re-runs the semantic suite, restoring the source afterwards. --check additionally fails if the result drifts from the states recorded in the tool. --allow-run is unscoped because the child is Deno.execPath(), known only at runtime. Needs a libsqlite3 (see //libsqlite3).",
       "command": "deno run --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write --allow-net --allow-run tools/capability_coverage.ts"

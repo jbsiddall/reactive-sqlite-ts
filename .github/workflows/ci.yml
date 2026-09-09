@@ -45,6 +45,16 @@ jobs:
         with:
           deno-version: v2.x
 
+      # Before any library is installed, and deliberately so: this asks only
+      # whether `Capabilities`, the capability table's row list and the
+      # committed README block still agree with one another, and it opens
+      # nothing. Running it first means it still reports on a runner where
+      # installing libsqlite3 fails — and a structural mismatch is reported as
+      # itself rather than buried under an environment failure it has nothing
+      # to do with. Do not move it below the two steps that follow.
+      - name: Capability table structure
+        run: deno task test:table-structure
+
       # Ubuntu 24.04 ships SQLite 3.45.x built with SQLITE_ENABLE_PREUPDATE_HOOK
       # (verified: the sqlite3_preupdate_* symbols are exported from
       # libsqlite3.so.0). libsqlite3-0 is normally already present; installing

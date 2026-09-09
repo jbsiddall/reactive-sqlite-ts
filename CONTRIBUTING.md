@@ -21,6 +21,7 @@ deno task check       # fmt --check, lint, type check
 deno task test        # the in-process suite
 deno task test:crash  # the out-of-process crash matrix
 deno task test:table  # README's capability table still matches the libraries
+deno task test:table-structure  # ...and its rows still match `Capabilities`
 ```
 
 `test:table` needs all THREE libraries on disk — the system one, a vendored
@@ -30,6 +31,17 @@ the last two; it is a developer-machine check, and it says which library it
 loaded from which path before it asserts anything. Run it after anything that
 changes `Capabilities` or the vendored build's flags, and `deno task table` to
 regenerate.
+
+`test:table-structure` is the half of that question needing no library at all:
+whether every field of `Capabilities` has a row, every row and every exemption
+names a field that still exists, the rows follow declaration order, and the
+committed block still has its markers, its observation date and nothing but
+`yes`/`no` in its cells. It reads the field names out of the SOURCE TEXT of
+`src/hooks.ts` rather than from `keyof Capabilities`, because the declaration is
+the thing under suspicion: a check that derived the expected set from the type
+would agree with any mistake made in it. That is why it can — and in CI does —
+run before libsqlite3 is installed, and why adding a capability with no row
+fails there rather than at the next developer's `test:table`.
 
 If `DENO_SQLITE_PATH` is unset, the driver downloads and loads a prebuilt
 library of its own while our FFI opens a system one. The two `sqlite3*` layouts
