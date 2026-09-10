@@ -366,6 +366,36 @@ function locate(): { name: string; path: string }[] {
     throw new Error(missingPrebuiltMessage());
   }
   return [
+    // DO NOT DROP THE SYSTEM COLUMN because we ship a vendored build now.
+    // This is the line a tidier deletes, so the answer lives here rather
+    // than in a document they will not open. Three things go with it, and
+    // none of them is the column itself:
+    //
+    //   1. The only variance the table has. The two live columns disagree
+    //      on at least one row, and this is one of the two. Delete it and
+    //      the sole remaining live column agrees with itself; the table
+    //      still renders and distinguishes nothing. `liveVariance` below
+    //      refuses a run in which they agree everywhere, and prints the
+    //      rows that carry the difference -- so read its output for which
+    //      rows those are today rather than trusting a name written here.
+    //      That control is the point of the pair; it is not a check to be
+    //      relaxed when it starts failing.
+    //   2. The only assertion that `resolveLibPath()` UNPINNED resolves to
+    //      something real. Every other caller of it is invoked from a task
+    //      in deno.json that sets DENO_SQLITE_PATH first, so the unpinned
+    //      branch is exercised here and nowhere else; check that task list
+    //      before believing otherwise.
+    //   3. The report on the library CI actually runs the suite against.
+    //      .github/workflows/ci.yml pins DENO_SQLITE_PATH at the system
+    //      library; the procedure run before pushing pins the vendored
+    //      one. Drop this column and the table stops describing the
+    //      library every CI run has ever used.
+    //
+    // "We ship our own library now" is a reason to prefer the vendored
+    // build at RUN time. It is not a reason to stop measuring the other
+    // one, and the three losses above are not recoverable by adding a
+    // column back later: the readings would be of somebody else's build
+    // by then, not of the one the readings above were taken from.
     { name: "system", path: resolveLibPath() },
     { name: "vendored", path: vendoredLibraryPath() },
     { name: "@db/sqlite prebuilt", path: prebuilt.path },
