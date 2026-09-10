@@ -1,20 +1,27 @@
 # Driver defects
 
-Bugs in `@db/sqlite` that this library works around, cannot work around, or
-merely runs into. Each one has a minimal reproduction that has been run, so it
-is ready to send upstream. Nothing here has been reported yet.
+**The driver is now ours.** It lives in `driver/`, vendored from
+[the Deno SQLite3 driver](https://github.com/denodrivers/sqlite3) 0.13.0 (see
+`NOTICE`). This file is therefore no longer a bug report about somebody else's
+code: it is the record of which defects the vendoring fixed and which one it
+deliberately carried.
 
-Each entry says three things: what it does, what it SHOULD do, and **whether we
-intend to fix it when the code is ours.** That last part is there because this
-file is about to change what it is. While the driver is someone else's, this is
-a bug report; once the driver is vendored, it becomes the changelog of what we
-fixed and what we deliberately left alone. Writing the decision down now means
-the vendoring inherits it rather than rediscovering it.
+Every entry keeps the version it was first measured against, because that is
+where the reproduction was run. Two are marked FIXED and have a regression case
+in the repository; one is marked CARRIED, and the code that carries it says so
+at the site.
 
-## `openBlob()` on a closed Database segfaults
+| Defect                                 | Status  | Pinned by                                         |
+| -------------------------------------- | ------- | ------------------------------------------------- |
+| `openBlob()` on a closed Database      | FIXED   | `driver-use-after-close` in `test/crash_cases.ts` |
+| Binding `-0` throws                    | FIXED   | the property suite's value generator              |
+| `finalize()` throws the last run error | CARRIED | nothing — see the entry                           |
 
-**Version:** `@db/sqlite` 0.13.0. **Impact:** process death, exit 139, no
-JavaScript error.
+## FIXED — `openBlob()` on a closed Database segfaults
+
+**First measured against:** `@db/sqlite` 0.13.0, and reproduced unchanged
+against the vendored copy before the fix. **Impact:** process death, exit 139,
+no JavaScript error.
 
 `Database#close()` frees the `sqlite3*` but leaves the object usable, and
 `openBlob()` dereferences the freed handle. No hooks are involved; this is the
@@ -32,20 +39,34 @@ db.openBlob({ table: "t", column: "b", row: 1 }); // SIGSEGV
 method throw, or `openBlob()` should check the handle before dereferencing it.
 Either one turns a segfault into an exception.
 
-**When the code is ours: fix it.** A null check on the handle in every method
-that dereferences it, not just `openBlob()` — the same shape is reachable from
-anything that takes the raw pointer after `close()`. Process death with no
-JavaScript error is the worst failure mode in the list and the cheapest to
-close.
+**Fixed in `driver/database.ts`.** `close()` nulls the handle, and every method
+that reaches it calls `#assertOpen()` first — not just `openBlob()`, because the
+same shape is reachable from anything that takes the raw pointer after
+`close()`. The call now throws `Database connection is closed`.
 
-While a subscription from this library is attached, the call is intercepted and
-throws instead — see the dispose boundary in the README's hard limits. After
-`dispose()` the driver's own methods are back and so is the crash.
+Measured against the vendored copy, in a child process so a crash cannot read as
+a pass, with a control that must succeed in the same run:
 
-## Binding `-0` throws
+```
+                              before      after
+blob-after-close              exit 139    exit 1, "Database connection is closed"
+control-blob-while-open       exit 0      exit 0
+```
 
-**Version:** `@db/sqlite` 0.13.0. **Impact:** the write never happens, so no
-events fire either.
+Pinned by `driver-use-after-close` in `test/crash_cases.ts`, which opens the
+same BLOB successfully before closing the connection, so a refusal that refused
+everything could not pass it. Reverting the guard turns that case back into
+`exit 139 signal SIGSEGV`; that was checked, not assumed.
+
+This used to be reachable only outside a subscription: while one was attached
+the call was intercepted and threw, and after `dispose()` the driver's own
+methods came back and so did the crash. There is no longer a difference.
+
+## FIXED — binding `-0` throws
+
+**First measured against:** `@db/sqlite` 0.13.0, and reproduced unchanged
+against the vendored copy before the fix. **Impact:** the write never happens,
+so no events fire either.
 
 `-0` satisfies the driver's integer test and reaches `sqlite3_bind_int`, which
 rejects it.
@@ -58,19 +79,32 @@ db.prepare("INSERT INTO t VALUES (?, ?)").run(1, -0);
 **Should:** `-0` is `0`. The bind should route it to `sqlite3_bind_int` as `0`,
 which is what SQLite stores for it anyway.
 
-**When the code is ours: fix it.** `Object.is(v, -0)` in the integer branch,
-normalising to `0`. One line, no behaviour anyone could be relying on.
+**Fixed in `driver/statement.ts`.** `Object.is(param, -0) ? 0 : param` in the
+integer branch of `#bind`. One line, and no behaviour anyone could have been
+relying on: the call used to throw.
 
-Found by the property suite, which now excludes `-0` from its generators for
-this reason.
+```
+                              before      after
+bind-negative-zero            exit 1      exit 0, stored [0]
+control-bind-positive-zero    exit 0      exit 0, stored [0]
+```
 
-## `finalize()` throws the statement's LAST error, not a finalize error
+Found by the property suite, which used to exclude `-0` from its generators for
+this reason and now generates it deliberately — `fc.double` produces it far too
+rarely to rely on. Removing the fix fails that suite.
 
-**Version:** `@db/sqlite` 0.13.0. **Impact:** a `try/finally` cleanup throws,
-masking whatever the caller was actually handling.
+## CARRIED — `finalize()` throws the statement's LAST error, not a finalize error
+
+**This one is ours now, and it is still here.** It was inherited from
+`@db/sqlite` 0.13.0, where it was first measured, but `driver/statement.ts` is
+this repository's code and this is this repository's defect. Nobody else is
+going to fix it.
+
+**Impact:** a `try/finally` cleanup throws, masking whatever the caller was
+actually handling.
 
 `sqlite3_finalize` returns the most recent error the statement produced while
-running, not an error from finalizing. The driver passes that return code
+running, not an error from finalizing. `finalize()` passes that return code
 through `unwrap()`, so finalizing a statement whose last use failed throws —
 even though the statement was released correctly.
 
@@ -93,7 +127,15 @@ documentation says the return code of `sqlite3_finalize` reflects the last
 execution and that applications should not use it to decide whether finalizing
 succeeded.
 
-**When the code is ours: fix it.** Ignore the return code of `sqlite3_finalize`
+**Deliberately not fixed in this change.** The vendoring corrects exactly the
+two defects `NOTICE` names, so that the sentence in `NOTICE` and the diff can be
+checked against each other in both directions. This one is left for its own
+change, where the behaviour difference can be measured on its own.
+
+**The fix, when it comes:** ignore the return code of `sqlite3_finalize`
 entirely. It is the documented reading, and a cleanup path that can throw is
 worse than no diagnostic at all — it turns one failure into two and hides the
 first.
+
+`finalize()` in `driver/statement.ts` carries a comment saying the same thing,
+so the defect is visible where the code is, not only here.

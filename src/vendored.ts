@@ -1,15 +1,15 @@
 /**
  * Finds the vendored libsqlite3 built for the machine this is running on.
  *
- * The whole point of vendoring is that `@db/sqlite` and our FFI must dlopen the
- * *same file*. `@db/sqlite` decides that at import time from `DENO_SQLITE_PATH`,
+ * The whole point of vendoring is that the driver and our FFI must dlopen the
+ * *same file*. The driver decides that at import time from `DENO_SQLITE_PATH`,
  * so this module's job is to set that variable before the driver is imported,
  * and to fail with a message a human can act on when no artifact matches.
  *
  * ```ts
  * import { useVendoredSqlite } from "./src/vendored.ts";
  * const LIB = useVendoredSqlite();          // sets DENO_SQLITE_PATH
- * const { Database } = await import("jsr:@db/sqlite@0.13"); // AFTER, so dynamic
+ * const { Database } = await import("../driver/mod.ts");   // AFTER, so dynamic
  * ```
  *
  * Needs `--allow-env` and `--allow-read`; the caller needs `--allow-ffi`.
@@ -139,7 +139,7 @@ export function vendoredLibraryPath(): string {
  * An explicit `DENO_SQLITE_PATH` always wins: an operator overriding the
  * library is making a deliberate choice, and silently ignoring it would
  * reintroduce the two-libraries-one-handle crash from the other direction.
- * Call this BEFORE importing `@db/sqlite`, which reads the variable once.
+ * Call this BEFORE importing the driver, which reads the variable once.
  */
 export function useVendoredSqlite(): string {
   const existing = Deno.env.get("DENO_SQLITE_PATH");

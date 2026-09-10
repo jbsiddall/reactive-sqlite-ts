@@ -1,5 +1,5 @@
 /**
- * Row and commit-lifecycle events for a `@db/sqlite` {@linkcode Database}, over
+ * Row and commit-lifecycle events for a {@linkcode Database}, over
  * Deno FFI, plus a JavaScript veto on the values a statement is about to write.
  *
  * ## Usage
@@ -8,7 +8,7 @@
  * const LIB = "/usr/lib/x86_64-linux-gnu/libsqlite3.so.0";
  * // The driver picks its library at import time, so set this FIRST.
  * Deno.env.set("DENO_SQLITE_PATH", LIB);
- * const { Database } = await import("jsr:@db/sqlite@0.13");
+ * const { Database } = await import("../driver/mod.ts");
  * const { withEvents } = await import("./hooks.ts"); // or "../mod.ts"
  *
  * const db = new Database("app.db");
@@ -62,14 +62,13 @@
  *
  * ## Why the library path is required
  *
- * The dlopen'd library MUST be the same file @db/sqlite loaded. If it is not,
+ * The dlopen'd library MUST be the same file the driver loaded. If it is not,
  * we hand a `sqlite3*` allocated by one SQLite build to a different build and
  * the process dies of SIGSEGV with no message — verified, not theorised.
  *
- * By default @db/sqlite does not use a system SQLite at all: it downloads its
- * own prebuilt library from its GitHub releases into $DENO_DIR/plug/ under a
- * hashed filename. So callers MUST set DENO_SQLITE_PATH before importing the
- * driver and pass that same path here. `libPath` is deliberately required and
+ * The driver reads DENO_SQLITE_PATH once, at import time, and otherwise falls
+ * back to the vendored build in vendor/lib/. So callers MUST set
+ * DENO_SQLITE_PATH before importing the driver and pass that same path here. `libPath` is deliberately required and
  * has no fallback, because a guessed default is exactly how you get the crash.
  *
  * ## Why the guards exist, and how far they reach
@@ -113,7 +112,7 @@
  *   instead of dereferencing a freed `sqlite3*` (the driver itself does not
  *   check).
  */
-import type { Database } from "@db/sqlite";
+import type { Database } from "../driver/database.ts";
 import type {
   Backend,
   CollationEncoding,
@@ -932,7 +931,7 @@ export function probeCapabilities(libPath: string): Capabilities {
  * or when `db.close()` is called.
  *
  * @param libPath Path of the libsqlite3 the driver loaded — i.e. the exact
- *   value DENO_SQLITE_PATH held when `@db/sqlite` was imported.
+ *   value DENO_SQLITE_PATH held when the driver was imported.
  */
 export function withEvents(
   db: Database,
@@ -945,7 +944,7 @@ export function withEvents(
   }
   if (!isDatabase(db)) {
     throw new SqliteHooksError(
-      "first argument must be a @db/sqlite Database instance",
+      "first argument must be a Database instance from this package's driver",
     );
   }
   if (!db.open) {
@@ -983,7 +982,7 @@ export function withEvents(
     backend.close();
     throw new SqliteHooksError(
       `SQLite library mismatch: hooks opened ${libPath} (${ours}) but the driver is running ${theirs}. ` +
-        `Set DENO_SQLITE_PATH to ${libPath} BEFORE importing @db/sqlite, or the process will segfault.`,
+        `Set DENO_SQLITE_PATH to ${libPath} BEFORE importing the driver, or the process will segfault.`,
     );
   }
 

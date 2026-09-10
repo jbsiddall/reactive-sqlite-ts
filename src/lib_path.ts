@@ -1,9 +1,9 @@
 /**
- * Resolves the one libsqlite3 that both `@db/sqlite` and ./hooks.ts must use.
+ * Resolves the one libsqlite3 that both the driver and ./hooks.ts must use.
  *
- * @db/sqlite reads DENO_SQLITE_PATH once, at import time, and otherwise
- * downloads its own prebuilt library into $DENO_DIR/plug/. Our FFI must dlopen
- * the same file or the `sqlite3*` we borrow belongs to a different build and
+ * The driver reads DENO_SQLITE_PATH once, at import time, and otherwise falls
+ * back to the vendored build in vendor/lib/. Our FFI must dlopen the same
+ * file or the `sqlite3*` we borrow belongs to a different build and
  * the process dies of SIGSEGV. So: import this module BEFORE importing the
  * driver, and pass its return value to `withEvents`.
  */

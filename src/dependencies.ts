@@ -147,7 +147,7 @@
  * @module
  */
 
-import type { Database } from "@db/sqlite";
+import type { Database } from "../driver/database.ts";
 import { withEvents } from "./hooks.ts";
 import type { AuthorizeAction, DbEvent } from "./hooks.ts";
 import type { SchemaMap, TableRef } from "./schema_map.ts";

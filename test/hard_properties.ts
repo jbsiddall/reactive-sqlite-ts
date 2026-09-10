@@ -14,7 +14,7 @@ import { fc, SEED } from "./deps.ts";
 import { resolveLibPath } from "./../src/lib_path.ts";
 
 const LIB = resolveLibPath();
-const { Database } = await import("@db/sqlite");
+const { Database } = await import("../driver/mod.ts");
 const { withEvents } = await import("../src/hooks.ts");
 type Sub = import("../src/hooks.ts").Subscription;
 type Db = InstanceType<typeof Database>;

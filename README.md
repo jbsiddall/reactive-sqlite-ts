@@ -48,20 +48,20 @@ export DENO_SQLITE_PATH=/usr/lib/x86_64-linux-gnu/libsqlite3.so.0            # L
 export DENO_SQLITE_PATH=/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib        # macOS
 ```
 
-It must be the _same file_ the driver loads. `@db/sqlite` reads
-`DENO_SQLITE_PATH` once at import time and otherwise downloads a prebuilt
-library of its own; if the two differ, the `sqlite3*` handle passed across
-belongs to a foreign build and the process dies of `SIGSEGV` — exit 139, no
-exception, no message. The library compares `sqlite3_libversion()` against the
-driver's `sqlite_version()` and refuses to attach on a mismatch, which catches
-the realistic mistake but is not proof of one file.
+It must be the _same file_ the driver loads. The driver reads `DENO_SQLITE_PATH`
+once at import time and otherwise falls back to the vendored build in
+`vendor/lib/`; if the two differ, the `sqlite3*` handle passed across belongs to
+a foreign build and the process dies of `SIGSEGV` — exit 139, no exception, no
+message. The library compares `sqlite3_libversion()` against the driver's
+`sqlite_version()` and refuses to attach on a mismatch, which catches the
+realistic mistake but is not proof of one file.
 
 ## Usage
 
 Reject rows that fail validation, by vetoing the commit:
 
 ```ts
-import { Database } from "@db/sqlite";
+import { Database } from "@jbsiddall/reactive-sqlite/driver";
 import { withEvents } from "@jbsiddall/reactive-sqlite";
 
 const db = new Database("shop.db");
@@ -196,10 +196,9 @@ if this is stale.
 
 A different question from the table above: not "what does SQLite allow" but
 "which binding should you reach for". This library is not a SQLite driver. It is
-a hook layer on top of [`@db/sqlite`](https://jsr.io/@db/sqlite), so wherever a
-row below says _via `@db/sqlite`_ the feature is the driver's, available to you
-because you are still holding the driver's `Database`, and unaffected by
-anything here.
+a hook layer on top of the driver vendored in `driver/`, so wherever a row below
+says _via the driver_ the feature is the driver's, available to you because you
+are still holding the driver's `Database`, and unaffected by anything here.
 
 Versions checked on 2026-09-09, against each project's own documentation, type
 definitions or source: better-sqlite3 13.0.3 (npm, 2026-08-05) · `node:sqlite`
@@ -247,17 +246,17 @@ WASM function pointer.
 
 ### Extending SQLite, and moving data in and out
 
-| Feature                   | reactive-sqlite  | better-sqlite3              | `node:sqlite`             | `bun:sqlite` | `sqlite3`         | `@db/sqlite`     | sqlite-wasm                  |
-| ------------------------- | ---------------- | --------------------------- | ------------------------- | ------------ | ----------------- | ---------------- | ---------------------------- |
-| Scalar functions          | via `@db/sqlite` | yes                         | yes                       | no           | no                | yes              | yes                          |
-| Aggregates                | via `@db/sqlite` | yes                         | yes                       | no           | no                | yes              | yes                          |
-| Window functions          | no               | yes — `aggregate.inverse`   | yes — `aggregate.inverse` | no           | no                | no               | yes                          |
-| Virtual tables            | no               | yes — `db.table`, read-only | no                        | no           | no                | no               | yes — `create_module`        |
-| Custom collations         | no               | no                          | no                        | no           | no                | no               | yes                          |
-| Incremental BLOB I/O      | via `@db/sqlite` | no                          | no                        | no           | no                | yes — `openBlob` | no — `blob_open` not exposed |
-| Backup API                | via `@db/sqlite` | yes — async, with progress  | yes — `sqlite.backup`     | no           | yes — `db.backup` | yes              | no                           |
-| `serialize`/`deserialize` | no               | yes                         | yes                       | yes          | no                | no               | yes                          |
-| Loadable extensions       | via `@db/sqlite` | yes                         | yes                       | yes          | yes               | yes              | no — WASM                    |
+| Feature                   | reactive-sqlite | better-sqlite3              | `node:sqlite`             | `bun:sqlite` | `sqlite3`         | `@db/sqlite`     | sqlite-wasm                  |
+| ------------------------- | --------------- | --------------------------- | ------------------------- | ------------ | ----------------- | ---------------- | ---------------------------- |
+| Scalar functions          | via the driver  | yes                         | yes                       | no           | no                | yes              | yes                          |
+| Aggregates                | via the driver  | yes                         | yes                       | no           | no                | yes              | yes                          |
+| Window functions          | no              | yes — `aggregate.inverse`   | yes — `aggregate.inverse` | no           | no                | no               | yes                          |
+| Virtual tables            | no              | yes — `db.table`, read-only | no                        | no           | no                | no               | yes — `create_module`        |
+| Custom collations         | no              | no                          | no                        | no           | no                | no               | yes                          |
+| Incremental BLOB I/O      | via the driver  | no                          | no                        | no           | no                | yes — `openBlob` | no — `blob_open` not exposed |
+| Backup API                | via the driver  | yes — async, with progress  | yes — `sqlite.backup`     | no           | yes — `db.backup` | yes              | no                           |
+| `serialize`/`deserialize` | no              | yes                         | yes                       | yes          | no                | no               | yes                          |
+| Loadable extensions       | via the driver  | yes                         | yes                       | yes          | yes               | yes              | no — WASM                    |
 
 node-sqlite3's `db.serialize()` is unrelated: it serialises _query execution
 order_, not the database. It has no `sqlite3_serialize`.

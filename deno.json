@@ -3,20 +3,20 @@
   "version": "0.1.0",
   "license": "Apache-2.0",
   "exports": {
-    ".": "./mod.ts"
+    ".": "./mod.ts",
+    "./driver": "./driver/mod.ts"
   },
   "//libsqlite3": [
     "Every task that touches the library needs --unstable-ffi --allow-ffi and,",
     "critically, a DENO_SQLITE_PATH pointing at the SAME libsqlite3 the driver",
-    "loads. @db/sqlite reads DENO_SQLITE_PATH once at import time and otherwise",
-    "downloads its own prebuilt library into $DENO_DIR/plug/. If our FFI dlopens",
-    "a different file, the sqlite3* handle we borrow belongs to another build",
-    "and the process dies of SIGSEGV — exit 139, no message. The tasks do not",
-    "set DENO_SQLITE_PATH for you: it is host-specific, and silently guessing it",
-    "is exactly the mistake that segfaults. Export it, or let the library's path",
-    "resolution pick a system library and pass that same value to the FFI.",
-    "--allow-net is present because the driver falls back to downloading its",
-    "library when DENO_SQLITE_PATH is unset; with it set, nothing is fetched."
+    "loads. The driver in driver/ reads DENO_SQLITE_PATH once at import time and",
+    "otherwise falls back to the vendored build in vendor/lib/. If our FFI",
+    "dlopens a different file, the sqlite3* handle we borrow belongs to another",
+    "build and the process dies of SIGSEGV — exit 139, no message. The tasks do",
+    "not set DENO_SQLITE_PATH for you: it is host-specific, and silently guessing",
+    "it is exactly the mistake that segfaults. Export it, or let the library's",
+    "path resolution pick a system library and pass that same value to the FFI.",
+    "No task needs --allow-net: the driver never downloads a library."
   ],
   "tasks": {
     "fmt": "deno fmt",
@@ -24,11 +24,11 @@
     "check": "deno fmt --check . && deno lint . && deno check",
     "test": {
       "description": "The semantic matrix: every event scenario, asserted in this process. Needs a libsqlite3 (see //libsqlite3).",
-      "command": "deno run --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write --allow-net test/suite.ts semantic"
+      "command": "deno run --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write test/suite.ts semantic"
     },
     "test:crash": {
       "description": "The crash matrix: every case runs in its OWN child process and is asserted on its exit code, so a genuine segfault (139) can never be mistaken for a pass. --allow-run is unscoped because the child is Deno.execPath(), known only at runtime; the only program spawned is this same Deno binary running test/crash_cases.ts.",
-      "command": "deno run --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write --allow-net --allow-run test/suite.ts crash"
+      "command": "deno run --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write --allow-run test/suite.ts crash"
     },
     "table": {
       "description": "Regenerate the capability x library table in README.md by probing each library, each in its own child process. --allow-run is unscoped because the child is Deno.execPath(), known only at runtime; the only program spawned is this same Deno binary running this same file in --probe mode.",
@@ -44,7 +44,7 @@
     },
     "test:capability-coverage": {
       "description": "Measure which capability-refusal branches are actually exercised, and by what: real absence, a simulating option, or nothing. Rewrites each refusal to `false` in the source and re-runs the semantic suite, restoring the source afterwards. --check additionally fails if the result drifts from the states recorded in the tool. --allow-run is unscoped because the child is Deno.execPath(), known only at runtime. Needs a libsqlite3 (see //libsqlite3).",
-      "command": "deno run --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write --allow-net --allow-run tools/capability_coverage.ts"
+      "command": "deno run --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write --allow-run tools/capability_coverage.ts"
     },
     "test:publish": {
       "description": "Assert what the published package actually contains — LICENSE and NOTICE present, test/ and tools/ absent. Spawns `deno publish --dry-run`, which validates without uploading. --allow-run is unscoped because the child is Deno.execPath(), known only at runtime.",
@@ -52,7 +52,7 @@
     },
     "demo": {
       "description": "Run the demo in examples/: every commit-lifecycle event, the precommit veto, batching and the preupdate row values, against a real database. Not a test; needs --allow-ffi and a libsqlite3 (see //libsqlite3).",
-      "command": "deno run --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write --allow-net examples/demo.ts"
+      "command": "deno run --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write examples/demo.ts"
     },
     "vendor:build": {
       "description": "Build the vendored libsqlite3 from the pinned SQLite amalgamation into vendor/lib/<target>/. Needs a C compiler, curl and openssl; no Deno permissions are involved because the work is done by build.sh. Pass --arch aarch64 to cross-compile.",
@@ -93,7 +93,6 @@
     "exactOptionalPropertyTypes": true
   },
   "imports": {
-    "@db/sqlite": "jsr:@db/sqlite@0.13.0",
     "@std/path": "jsr:@std/path@1.1.6"
   },
   "publish": {

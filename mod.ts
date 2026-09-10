@@ -1,12 +1,12 @@
 /**
- * Row and commit-lifecycle events for a `@db/sqlite` `Database`, over Deno FFI,
+ * Row and commit-lifecycle events for a SQLite `Database`, over Deno FFI,
  * plus a JavaScript veto on the values a statement is about to write.
  *
  * ```ts
  * const LIB = "/usr/lib/x86_64-linux-gnu/libsqlite3.so.0";
  * // The driver picks its library at import time, so set this FIRST.
  * Deno.env.set("DENO_SQLITE_PATH", LIB);
- * const { Database } = await import("jsr:@db/sqlite@0.13");
+ * const { Database } = await import("@jbsiddall/reactive-sqlite/driver");
  * const { withEvents } = await import("./mod.ts");
  *
  * const db = new Database("app.db");

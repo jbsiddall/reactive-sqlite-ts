@@ -23,7 +23,7 @@ import { CASES } from "./crash_cases.ts";
 import { PROPERTIES, PROPERTY_RUNS, PROPERTY_SEED } from "./properties.ts";
 
 const LIB = resolveLibPath();
-const { Database, Statement } = await import("@db/sqlite");
+const { Database, Statement } = await import("../driver/mod.ts");
 const {
   actionFor,
   opFor,

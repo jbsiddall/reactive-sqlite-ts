@@ -84,7 +84,7 @@
  * @module
  */
 /**
- * The little of a database connection this module uses. A `@db/sqlite`
+ * The little of a database connection this module uses. The driver's
  * `Database` satisfies it; so does a stub, which is how the paths below the
  * `PRAGMA table_list` version floor are tested without an ancient libsqlite3.
  */

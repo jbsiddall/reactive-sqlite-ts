@@ -14,3 +14,18 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
+
+------------------------------------------------------------------
+This product includes software from the Deno SQLite3 driver
+(https://github.com/denodrivers/sqlite3).
+
+Copyright 2022 DjDeveloperr
+
+Licensed under the Apache License, Version 2.0.
+
+The vendored sources have been MODIFIED by the reactive-sqlite-ts
+authors: restyled to this project's conventions, reduced to the
+surface this library uses, and corrected for two defects present
+upstream (a use-after-close segmentation fault, and a bind failure
+on negative zero).
+------------------------------------------------------------------

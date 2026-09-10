@@ -16,7 +16,7 @@ const message = (e: unknown): string =>
 const LIB = resolveLibPath();
 console.log(`using ${LIB}`);
 
-const { Database } = await import("@db/sqlite");
+const { Database } = await import("../driver/mod.ts");
 const { probeCapabilities, withEvents, withValidation } = await import(
   "../src/hooks.ts"
 );

@@ -16,7 +16,7 @@ import { resolveLibPath } from "../src/lib_path.ts";
 import { runHardProperty } from "./hard_properties.ts";
 
 const LIB = resolveLibPath();
-const { Database } = await import("@db/sqlite");
+const { Database } = await import("../driver/mod.ts");
 const { withEvents, withValidation } = await import("../src/hooks.ts");
 type PreUpdate = import("../src/hooks.ts").PreUpdate;
 type DbEvent = import("../src/hooks.ts").DbEvent;
@@ -285,7 +285,7 @@ export const CASES: Record<string, CrashCase> = {
 
   "withevents-not-a-database": {
     code: 1,
-    match: "must be a @db/sqlite Database",
+    match: "must be a Database instance from this package's driver",
     why: "A duck-typed pointer would be handed straight to dlopen'd C.",
     run() {
       // deno-lint-ignore project/no-type-assertion -- the point of the case is to hand withEvents what its types forbid, so the runtime guard is what gets tested.
@@ -656,6 +656,26 @@ export const CASES: Record<string, CrashCase> = {
         ids.every((i) => typeof i === "bigint") ? "ok" : "FAIL not bigint",
       );
       db.close();
+    },
+  },
+
+  "driver-use-after-close": {
+    code: 1,
+    match: "Database connection is closed",
+    why:
+      "The driver's use-after-close, fixed in driver/. No subscription is attached, so nothing of ours intercepts close(): this is the vendored Database refusing on its own. Upstream this dereferenced the freed sqlite3* and exited 139.",
+    run() {
+      const db = new Database(":memory:");
+      db.exec("CREATE TABLE t(id INTEGER PRIMARY KEY, b BLOB)");
+      db.exec("INSERT INTO t VALUES (1, zeroblob(8))");
+      // Control first: the same call while the connection is open must work,
+      // so a refusal that refuses everything cannot pass this case.
+      const blob = db.openBlob({ table: "t", column: "b", row: 1 });
+      console.log(`open: ${blob.byteLength} bytes`);
+      blob.close();
+      db.close();
+      db.openBlob({ table: "t", column: "b", row: 1 });
+      console.log("NOT REACHED");
     },
   },
 

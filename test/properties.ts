@@ -18,7 +18,7 @@ import { fc, SEED } from "./deps.ts";
 import { resolveLibPath } from "../src/lib_path.ts";
 
 const LIB = resolveLibPath();
-const { Database } = await import("@db/sqlite");
+const { Database } = await import("../driver/mod.ts");
 const { withEvents } = await import("../src/hooks.ts");
 type DbEvent = import("../src/hooks.ts").DbEvent;
 type Db = InstanceType<typeof Database>;
@@ -46,11 +46,12 @@ const snapshot = (db: Db): string =>
 const value = () =>
   fc.oneof(
     fc.integer({ min: -1000, max: 1000 }),
-    // -0 is excluded because @db/sqlite 0.13.0 cannot bind it: it reaches
-    // sqlite3_bind_int and throws "Invalid FFI i32 type, expected integer".
-    fc.double({ noNaN: true, noDefaultInfinity: true }).filter((d) =>
-      !Object.is(d, -0)
-    ),
+    // -0 used to be excluded here: it reached sqlite3_bind_int and threw
+    // "Invalid FFI i32 type, expected integer". The vendored driver normalises
+    // it, so it is generated again — and as a constant, because fc.double
+    // almost never produces it on its own.
+    fc.constant(-0),
+    fc.double({ noNaN: true, noDefaultInfinity: true }),
     fc.string(),
     fc.constant(null),
     fc.uint8Array({ maxLength: 8 }),
