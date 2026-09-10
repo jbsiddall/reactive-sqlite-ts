@@ -185,9 +185,10 @@ package.
 | `collation`     | yes           | yes             | yes                        |
 | `normalizedSql` | no            | yes             | no                         |
 
-- `system` — the path `resolveLibPath()` returns — the library the test suite
-  runs against
-- `vendored` — `vendor/lib/<target>/`, built by `deno task vendor:build`
+- `system` — the path `resolveLibPath()` returns with `DENO_SQLITE_PATH` unset —
+  not necessarily the library the suite runs against, which is normally pinned
+- `vendored` — `vendor/lib/<target>/`, built by `deno task vendor:build` and
+  matching the `build_manifest.json` beside it
 - `@db/sqlite prebuilt` — `$DENO_DIR/plug/`, downloaded by `@db/sqlite` 0.13.0
   when `DENO_SQLITE_PATH` is unset
 

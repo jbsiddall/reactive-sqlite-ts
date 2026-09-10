@@ -60,7 +60,7 @@
 
 import { probeCapabilities, resolveLibPath } from "../mod.ts";
 import type { Capabilities } from "../mod.ts";
-import { driverPrebuilt } from "../vendor/probe.ts";
+import { driverPrebuilt, releaseFromMetadata } from "../vendor/probe.ts";
 import { vendoredLibraryPath } from "../src/vendored.ts";
 
 const README = new URL("../README.md", import.meta.url);
@@ -73,17 +73,31 @@ const END = "<!-- capability-table:end -->";
  * is false, a string rather than a capability, and it says nothing a reader of
  * this table can act on.
  */
-const ROWS: { key: keyof Capabilities; label: string }[] = [
-  { key: "hooks", label: "`hooks`" },
-  { key: "preupdate", label: "`preupdate`" },
-  { key: "wal", label: "`wal`" },
-  { key: "trace", label: "`trace`" },
-  { key: "progress", label: "`progress`" },
-  { key: "busy", label: "`busy`" },
-  { key: "authorize", label: "`authorize`" },
-  { key: "collation", label: "`collation`" },
-  { key: "normalizedSql", label: "`normalizedSql`" },
+const ROWS: { key: keyof Capabilities }[] = [
+  { key: "hooks" },
+  { key: "preupdate" },
+  { key: "wal" },
+  { key: "trace" },
+  { key: "progress" },
+  { key: "busy" },
+  { key: "authorize" },
+  { key: "collation" },
+  { key: "normalizedSql" },
 ];
+
+/**
+ * The cell a row is printed under, derived rather than typed.
+ *
+ * There used to be a `label` string beside each key here, and the parity
+ * controls below check the KEY. So a label reading `hooks` beside the key
+ * `wal` would have rendered a row asserting the wrong capability with every
+ * control green, and nothing on disk would have had to change for it to be
+ * wrong -- it WAS the typed string. Deriving it removes the axis rather than
+ * guarding it.
+ */
+function rowLabel(key: string): string {
+  return `\`${key}\``;
+}
 
 /**
  * The known answer. Established by measurement first (running this file's
@@ -97,14 +111,47 @@ const PINNED = {
   value: false,
 } as const;
 
-/** How each column's library is found. Stable across machines; the path is not. */
-const PROVENANCE: Record<string, string> = {
-  "system":
-    "the path `resolveLibPath()` returns — the library the test suite runs against",
-  "vendored": "`vendor/lib/<target>/`, built by `deno task vendor:build`",
-  "@db/sqlite prebuilt":
-    "`$DENO_DIR/plug/`, downloaded by `@db/sqlite` 0.13.0 when `DENO_SQLITE_PATH` is unset",
-};
+/**
+ * How each column's library is found. Stable across machines; the path is not.
+ *
+ * ONE TABLE MUST NOT CARRY TWO PROVENANCES. Every SQLite version in the header
+ * row is measured -- `sqlite3_libversion()` on the dlopened file, with
+ * `gate()` requiring that string to occur in the file's own bytes -- and for a
+ * while the `@db/sqlite` RELEASE beside it was a literal typed into this
+ * object. Rewriting the cached artefact's metadata.json to name release 0.9.99
+ * left `--check` green while the rendered line went on saying 0.13.0. The
+ * measured axis was lending its credibility to the asserted one, in the same
+ * row, with nothing on the page telling them apart.
+ *
+ * So the test applied to every identifying string here is: WHAT WOULD HAVE TO
+ * CHANGE ON DISK FOR THIS TO BECOME WRONG? If the answer is nothing, it is not
+ * measured, and it either gets read from the artefact or it says out loud that
+ * it is not measured. The two that stay unmeasured are marked below.
+ */
+function provenanceOf(prebuiltRelease: string | undefined): Record<
+  string,
+  string
+> {
+  return {
+    // Corrected, and this was a false claim rather than a vague one. The
+    // suite calls `resolveLibPath()` too, which honours DENO_SQLITE_PATH, and
+    // the suite is normally run with it pinned at the vendored library --
+    // while this table refuses to build at all when it is set. MEASURED: the
+    // suite runs against vendor/lib/<target>/ at 3.53.4 while this column is
+    // the machine's 3.45.1. They are the same library only when nobody pins
+    // one, which is not how the suite is run.
+    "system":
+      "the path `resolveLibPath()` returns with `DENO_SQLITE_PATH` unset — not necessarily the library the suite runs against, which is normally pinned",
+    // `built by deno task vendor:build` is not asserted here on trust: gate()
+    // reads build_manifest.json beside the library and requires it to agree
+    // with the file, by version and by SHA-256.
+    "vendored":
+      "`vendor/lib/<target>/`, built by `deno task vendor:build` and matching the `build_manifest.json` beside it",
+    "@db/sqlite prebuilt": `\`$DENO_DIR/plug/\`, downloaded by \`@db/sqlite\` ${
+      prebuiltRelease ?? "(release unknown — its metadata.json names none)"
+    } when \`DENO_SQLITE_PATH\` is unset`,
+  };
+}
 
 interface Column {
   name: string;
@@ -236,6 +283,12 @@ function pinnedLibraryRefusal(
   ].join("\n");
 }
 
+/**
+ * The release the cached prebuilt's own metadata names, once `locate()` has
+ * read it. Rendered into the provenance line instead of a literal.
+ */
+let prebuiltRelease: string | undefined;
+
 /** Where the three libraries are. Throws with a usable message when one is missing. */
 function locate(): { name: string; path: string }[] {
   const refusal = pinnedLibraryRefusal(
@@ -244,6 +297,7 @@ function locate(): { name: string; path: string }[] {
   );
   if (refusal !== null) throw new Error(refusal);
   const prebuilt = driverPrebuilt();
+  prebuiltRelease = prebuilt?.release;
   if (prebuilt === undefined) {
     throw new Error(
       "No @db/sqlite prebuilt in $DENO_DIR/plug. It is downloaded the first " +
@@ -254,7 +308,7 @@ function locate(): { name: string; path: string }[] {
   return [
     { name: "system", path: resolveLibPath() },
     { name: "vendored", path: vendoredLibraryPath() },
-    { name: "@db/sqlite prebuilt", path: prebuilt },
+    { name: "@db/sqlite prebuilt", path: prebuilt.path },
   ];
 }
 
@@ -276,9 +330,9 @@ function tableOf(columns: Column[]): string {
     `| ${head.join(" | ")} |`,
     `| ${head.map(() => "---").join(" | ")} |`,
   ];
-  for (const { key, label } of ROWS) {
+  for (const { key } of ROWS) {
     const values = columns.map((c) => cell(c.caps[key] === true));
-    lines.push(`| ${label} | ${values.join(" | ")} |`);
+    lines.push(`| ${rowLabel(key)} | ${values.join(" | ")} |`);
   }
   return lines.join("\n");
 }
@@ -365,7 +419,8 @@ function blockFor(columns: Column[], date: string): string {
   // wrong on every other machine and would make `--check` fail for a reason
   // that has nothing to do with capabilities. The real paths are printed by
   // both modes at run time, where they can be read and checked.
-  const paths = columns.map((c) => `- \`${c.name}\` — ${PROVENANCE[c.name]}`);
+  const provenance = provenanceOf(prebuiltRelease);
+  const paths = columns.map((c) => `- \`${c.name}\` — ${provenance[c.name]}`);
   return [
     `Observed **${date}**, by running \`probeCapabilities()\` against each ` +
     `library at the path below, each in its own process. Every \`no\` is a ` +
@@ -405,6 +460,26 @@ const fail = (what: string, detail: string) => {
  */
 function allDistinct(paths: readonly string[]): boolean {
   return new Set(paths).size === paths.length;
+}
+
+/**
+ * Why the library at the vendored path is not the one `build.sh` produced, or
+ * `null` when it is. Pure, so the control can be fixtured without swapping a
+ * real 1.6MB library in and out of the tree.
+ */
+function manifestDisagreement(
+  manifestVersion: string,
+  manifestSha: string,
+  probedVersion: string,
+  fileSha: string,
+): string | null {
+  if (manifestVersion !== probedVersion) {
+    return `build_manifest.json records SQLite ${manifestVersion}, the library at that path reports ${probedVersion}`;
+  }
+  if (manifestSha !== fileSha) {
+    return `build_manifest.json records librarySha256 ${manifestSha}, the file is ${fileSha}`;
+  }
+  return null;
 }
 
 /** The gate. Nothing this file measures is reportable until every one passes. */
@@ -454,17 +529,66 @@ async function gate(columns: Column[]): Promise<void> {
     }
   }
 
+  // Named for what it checks, which is narrower than it used to claim. This
+  // control cannot run at all with DENO_SQLITE_PATH set -- locate() refuses --
+  // so the path it compares against is always the unpinned candidate scan.
+  // "The library the suite runs against" was the old name and was FALSE in the
+  // configuration we actually use: the suite is run with DENO_SQLITE_PATH
+  // pinned at the vendored 3.53.4 while this column is the machine's 3.45.1.
   const system = columns.find((c) => c.name === "system");
-  const suiteLib = Deno.realPathSync(resolveLibPath());
-  if (system && Deno.realPathSync(system.path) === suiteLib) {
+  const unpinned = Deno.realPathSync(resolveLibPath());
+  if (system && Deno.realPathSync(system.path) === unpinned) {
     pass(
-      `the system column is the library the suite runs against (${suiteLib})`,
+      `the system column is what resolveLibPath() resolves with DENO_SQLITE_PATH unset (${unpinned})`,
     );
   } else {
     fail(
-      "the system column is the library the suite runs against",
-      `column is ${system?.path}, suite uses ${suiteLib}`,
+      "the system column is what resolveLibPath() resolves with DENO_SQLITE_PATH unset",
+      `column is ${system?.path}, resolveLibPath() gives ${unpinned}`,
     );
+  }
+
+  // The vendored column's provenance clause says the library was built by
+  // `deno task vendor:build`. MEASURED before this existed: replacing that
+  // file with the machine's system library left every gate control green --
+  // distinctness included, because it is a different file -- and the only red
+  // was staleness. Regenerating would then have written "vendored 3.45.1,
+  // built by deno task vendor:build" over a library the build never produced,
+  // with build_manifest.json sitting beside it saying otherwise and nothing
+  // reading it. MEASURED too: mutating that manifest to sqliteVersion 0.0.0
+  // and librarySha256 deadbeef changed nothing -- 8 passed, 0 failed.
+  const vend = columns.find((c) => c.name === "vendored");
+  if (vend !== undefined) {
+    const dir = vend.path.slice(0, vend.path.lastIndexOf("/"));
+    const claim = `the vendored column matches build_manifest.json beside it`;
+    let manifest: { sqliteVersion?: unknown; librarySha256?: unknown };
+    try {
+      manifest = JSON.parse(
+        await Deno.readTextFile(`${dir}/build_manifest.json`),
+      );
+    } catch (e) {
+      fail(claim, `no readable build_manifest.json in ${dir}: ${e}`);
+      manifest = {};
+    }
+    if (typeof manifest.sqliteVersion === "string") {
+      const digest = await crypto.subtle.digest(
+        "SHA-256",
+        await Deno.readFile(vend.path),
+      );
+      const sha = [...new Uint8Array(digest)]
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+      const wrong = manifestDisagreement(
+        manifest.sqliteVersion,
+        typeof manifest.librarySha256 === "string"
+          ? manifest.librarySha256
+          : "",
+        vend.version,
+        sha,
+      );
+      if (wrong === null) pass(`${claim} (${manifest.sqliteVersion}, ${sha})`);
+      else fail(claim, wrong);
+    }
   }
 
   const pinned = columns.find((c) => c.name === PINNED.column);
@@ -621,7 +745,7 @@ function dataCells(block: string): string[][] {
  */
 function structuralFindings(
   decl: Declaration,
-  rows: readonly { readonly key: string; readonly label: string }[],
+  rows: readonly { readonly key: string }[],
   block: string | undefined,
 ): Finding[] {
   const out: Finding[] = [];
@@ -781,17 +905,13 @@ function fixtures(): {
   name: string;
   expect: string | null;
   decl: Declaration;
-  rows: { key: string; label: string }[];
+  rows: { key: string }[];
   block: string | undefined;
 }[] {
   const names = EXEMPT.length > 0
     ? ["alpha", "beta", "gamma", ...EXEMPT]
     : ["alpha", "beta", "gamma"];
-  const rows = [
-    { key: "alpha", label: "`alpha`" },
-    { key: "beta", label: "`beta`" },
-    { key: "gamma", label: "`gamma`" },
-  ];
+  const rows = [{ key: "alpha" }, { key: "beta" }, { key: "gamma" }];
   const live: Declaration = { kind: "fields", names };
   const good = fixtureBlock(["alpha", "beta", "gamma"]);
   return [
@@ -813,7 +933,7 @@ function fixtures(): {
       name: "(b) a row names a field that no longer exists",
       expect: "names a field `Capabilities` still declares",
       decl: live,
-      rows: [...rows, { key: "ghost", label: "`ghost`" }],
+      rows: [...rows, { key: "ghost" }],
       block: good,
     },
     {
@@ -999,6 +1119,108 @@ async function structure(): Promise<void> {
     const what = `distinctness control: ${c.name}`;
     if (allDistinct(c.paths) === c.want) pass(what);
     else fail(what, `said ${!c.want}`);
+  }
+
+  // The mislabelled-cache control. This is the demonstration that found the
+  // defect, turned into something that runs: a metadata.json claiming a
+  // release the table would then have to report. It is fixtured as a STRING
+  // rather than by mutating $DENO_DIR/plug, because the parse is pure and a
+  // test that edits the developer's real cache is a test that can leave it
+  // broken. What that trade costs is the link between the parser and the
+  // actual cache file, so the last case below pays for it: the real
+  // metadata.json on this machine, if there is one, must be something this
+  // parser reads a release out of.
+  for (
+    const c of [
+      {
+        name: "a real plug metadata file",
+        text:
+          '{"url":"https://github.com/denodrivers/sqlite3/releases/download/0.13.0/libsqlite3.so"}',
+        want: "0.13.0",
+      },
+      {
+        name: "the same artefact relabelled",
+        text:
+          '{"url":"https://github.com/denodrivers/sqlite3/releases/download/0.9.99/libsqlite3.so"}',
+        want: "0.9.99",
+      },
+      { name: "not JSON", text: "not json at all", want: undefined },
+      { name: "JSON with no url", text: '{"etag":"x"}', want: undefined },
+      {
+        name: "a url naming no release",
+        text: '{"url":"https://example.invalid/libsqlite3.so"}',
+        want: undefined,
+      },
+    ]
+  ) {
+    const got = releaseFromMetadata(c.text);
+    const what = `release read from metadata: ${c.name}`;
+    if (got === c.want) pass(`${what} → ${got}`);
+    else fail(what, `read ${got}, expected ${c.want}`);
+  }
+  {
+    // The literal is gone only if the rendered line moves when the artefact
+    // does. Two different releases must render two different lines.
+    const a = provenanceOf("0.13.0")["@db/sqlite prebuilt"];
+    const b = provenanceOf("0.9.99")["@db/sqlite prebuilt"];
+    const what = "the prebuilt provenance line follows the release";
+    if (a !== b && a?.includes("0.13.0") && b?.includes("0.9.99")) pass(what);
+    else fail(what, `rendered ${a} and ${b}`);
+  }
+  {
+    const what = "no release: the provenance line says so rather than a number";
+    const line = provenanceOf(undefined)["@db/sqlite prebuilt"] ?? "";
+    if (line.includes("release unknown") && !/\d+\.\d+\.\d+/.test(line)) {
+      pass(what);
+    } else fail(what, `rendered ${line}`);
+  }
+  {
+    // Pays for fixturing the parser on strings: the file the real cache holds
+    // must be one this parser understands. Skipped, loudly, when there is no
+    // cache to look at, so it never passes vacuously.
+    const found = ((): string | undefined => {
+      try {
+        return driverPrebuilt()?.release;
+      } catch {
+        return undefined;
+      }
+    })();
+    const what = "the cached prebuilt on this machine names a release";
+    if (found === undefined) {
+      console.log(`  skip  ${what} — no @db/sqlite prebuilt in $DENO_DIR/plug`);
+    } else pass(`${what} (${found})`);
+  }
+
+  // The vendored-manifest control, fixtured rather than run against the tree.
+  for (
+    const c of [
+      { name: "agrees", m: ["3.53.4", "ab"], p: ["3.53.4", "ab"], bad: null },
+      {
+        name: "a different library at the vendored path",
+        m: ["3.53.4", "ab"],
+        p: ["3.45.1", "cd"],
+        bad: "reports 3.45.1",
+      },
+      {
+        name: "same version, different bytes",
+        m: ["3.53.4", "ab"],
+        p: ["3.53.4", "cd"],
+        bad: "librarySha256 ab",
+      },
+    ]
+  ) {
+    const got = manifestDisagreement(
+      c.m[0] ?? "",
+      c.m[1] ?? "",
+      c.p[0] ?? "",
+      c.p[1] ?? "",
+    );
+    const what = `vendored manifest control: ${c.name}`;
+    if (c.bad === null) {
+      if (got === null) pass(what);
+      else fail(what, `objected: ${got}`);
+    } else if (got !== null && got.includes(c.bad)) pass(what);
+    else fail(what, `said ${got}`);
   }
 
   // Only now the real files.

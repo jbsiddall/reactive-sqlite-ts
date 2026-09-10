@@ -40,7 +40,7 @@
     },
     "test:table-structure": {
       "description": "Ask whether `Capabilities`, the table's row list and the committed README block still agree, without opening any library: every field has a row or a named exemption, every row and every exemption names a live field, the rows follow declaration order, the markers and observation date are present, and every cell is yes or no. Field names are read textually out of src/hooks.ts, because `keyof Capabilities` is the thing under suspicion. Needs no libsqlite3 and no FFI, which is why CI runs it first.",
-      "command": "deno run --allow-read tools/capability_table.ts --structure"
+      "command": "deno run --allow-read --allow-env tools/capability_table.ts --structure"
     },
     "test:capability-coverage": {
       "description": "Measure which capability-refusal branches are actually exercised, and by what: real absence, a simulating option, or nothing. Rewrites each refusal to `false` in the source and re-runs the semantic suite, restoring the source afterwards. --check additionally fails if the result drifts from the states recorded in the tool. --allow-run is unscoped because the child is Deno.execPath(), known only at runtime. Needs a libsqlite3 (see //libsqlite3).",

@@ -464,8 +464,41 @@ export function systemLibrary(): string | undefined {
  * though it is a cache artefact. `@denosaurs/plug` stores it under
  * $DENO_DIR/plug/<host>/<sha256>.so beside a metadata.json naming the URL, so
  * the metadata is what identifies it; the hashed filename says nothing.
+ *
+ * The release is returned alongside the path because it is ON DISK and this
+ * function already opens the file holding it. It used to read that file, test
+ * it for /sqlite3/i, and throw the URL away, while the release number went
+ * into the capability table as a typed literal -- an identifying string that
+ * nothing on disk could make wrong.
  */
-export function driverPrebuilt(): string | undefined {
+export interface DriverPrebuilt {
+  readonly path: string;
+  /** The release named in the artefact's own metadata, or undefined. */
+  readonly release: string | undefined;
+}
+
+/**
+ * The release a plug metadata URL names, read out of the metadata text.
+ *
+ * Pure and exported so it can be fixtured: the control that matters is a
+ * metadata file claiming a release the table then has to report, and that is
+ * a string, not a cache to mutate.
+ */
+export function releaseFromMetadata(text: string): string | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null) return undefined;
+  if (!("url" in parsed)) return undefined;
+  const url: unknown = parsed.url;
+  if (typeof url !== "string") return undefined;
+  return /\/releases\/download\/([^/]+)\//.exec(url)?.[1];
+}
+
+export function driverPrebuilt(): DriverPrebuilt | undefined {
   const denoDir = Deno.env.get("DENO_DIR") ??
     (() => {
       const home = Deno.env.get("HOME");
@@ -497,7 +530,9 @@ export function driverPrebuilt(): string | undefined {
         for (const ext of [".so", ".dylib", ".dll"]) {
           const candidate = full.replace(/\.metadata\.json$/, ext);
           try {
-            if (Deno.statSync(candidate).isFile) return candidate;
+            if (Deno.statSync(candidate).isFile) {
+              return { path: candidate, release: releaseFromMetadata(url) };
+            }
           } catch { /* try the next extension */ }
         }
       }
@@ -518,7 +553,7 @@ if (import.meta.main) {
     }
   } else {
     const prebuilt = driverPrebuilt();
-    if (prebuilt) reports.push(probeLibrary("@db/sqlite", prebuilt));
+    if (prebuilt) reports.push(probeLibrary("@db/sqlite", prebuilt.path));
 
     const system = systemLibrary();
     if (system) reports.push(probeLibrary("system", system));
