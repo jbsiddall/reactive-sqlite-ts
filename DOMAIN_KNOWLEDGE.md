@@ -856,10 +856,83 @@ nothing named `carray` appears in `pragma_function_list` either, yet
 `SELECT * FROM carray(0,0)` compiles in the new build and fails with
 `no such table: carray` in the old one. So a capability audit that enumerates
 `pragma_module_list` reports this flag as having done nothing. Prepare the
-statement instead.
+statement instead — but for this one flag preparing is necessary and still not
+sufficient, for the reason recorded below.
 
 **`ext/misc` is not in the amalgamation.** Building any of those extensions in
 means fetching `sqlite-src-<version>.zip` as well — 14.5 MiB against the
 amalgamation's 2.5 MiB — pinning a second hash, and calling their
 `sqlite3_*_init` from `SQLITE_EXTRA_INIT`. That is a change to the build's
 one-download story, not just another `-D`.
+
+### Exercised, not enumerated (2026-09-10, SQLite 3.53.4)
+
+Everything above was measured by asking the library what it has. That is the
+weaker question, and the SQLLOG precedent in this file is what it costs. Each of
+the four was therefore also made to PRODUCE A VALUE, by a C harness that
+`dlopen`s the library with `RTLD_NOW` — the way `driver/` loads it — and runs
+against six builds of the same pinned amalgamation: the baseline, one per flag,
+and all four together. Every claim below has the baseline's answer beside it.
+
+**`SQLITE_ENABLE_PERCENTILE` — exercised.** Over `x = 1..10`: `median(x)` gives
+`5.500000`, `percentile(x,25)` gives `3.250000`, `percentile_cont(x,0.25)` gives
+`3.250000`, `percentile_disc(x,0.25)` gives `3.000000`. In the baseline all four
+fail at prepare — `no such function: median`, and so on for the other three.
+
+**`SQLITE_ENABLE_CARRAY` — exercised.** `dlsym` resolves `sqlite3_carray_bind`,
+and with `{2,4,5}` bound as `CARRAY_INT32`,
+`SELECT id,name FROM t WHERE id IN (SELECT value FROM carray(?1)) ORDER BY id`
+returns exactly three rows: `id=2 name=b`, `id=4 name=d`, `id=5 name=e`. In the
+baseline the symbol is not found and the same statement fails to prepare with
+`no such table: carray`.
+
+**The two-argument `carray` form fails silently.** Write `carray(?1,?2)` with
+the element count bound into `?2` — alongside the count already passed to
+`sqlite3_carray_bind` — and every call returns `SQLITE_OK`, the statement
+prepares, and it yields ZERO ROWS with no error and no message.
+`carrayBestIndex` reads a bound count as `idxNum` 2, which is a different
+calling convention from the one `sqlite3_carray_bind` establishes, and the two
+do not compose. `carray(?1)` alone is the working form. This is why prepare
+alone does not settle this flag: prepare succeeds for the shape that can never
+return a row.
+
+**`SQLITE_ENABLE_SNAPSHOT` — exercised.** `sqlite3_snapshot_get` returns `rc=0`
+with a non-null handle on a WAL database holding 3 rows; a second connection
+then writes it to 5 rows; `sqlite3_snapshot_open` returns `rc=0` and the reader
+still sees 3 rows while the live database has 5. In the baseline all three of
+`sqlite3_snapshot_get`, `_open` and `_free` are absent from `dlsym`, so there is
+nothing to call.
+
+**`SQLITE_ENABLE_STAT4` — the plans move and the answers do not.** On 20,000
+rows of `t(a TEXT, b INTEGER)` with an index on each column, where `a` is
+`'rare'` in exactly one row and `'common'` in the other 19,999 and `b` is
+`i%1000`, `SELECT count(*) FROM t WHERE a='rare' AND b=1` plans as
+`SEARCH t USING INDEX ib (b=?)` before `ANALYZE` on both builds. After `ANALYZE`
+the STAT4 build moves to `SEARCH t USING INDEX ia (a=?)` — the one-row index —
+and the baseline does not move at all. `sqlite_stat4` exists with 3 rows in the
+STAT4 build; the baseline reports `no such table:
+sqlite_stat4` and has only
+`sqlite_stat1`.
+
+Across an 18-query battery run after `ANALYZE` on both builds, **4 of the 18
+plans differ and 18 of the 18 result lines are byte-identical**, six of those
+queries being deliberately order-sensitive (no `ORDER BY`, a `LIMIT`, and a
+predicate each index answers in a different row order). So on this dataset STAT4
+changes which index is chosen without changing a single returned value,
+including the values whose order is not pinned by SQL.
+
+**That reading is licensed by a control that fires, and not by the obvious
+one.** The obvious control — running the same battery against system libsqlite3
+3.45.1 — produced output identical to 3.53.4's, so it discriminates nothing and
+is worthless as evidence that the battery could have detected a change. The
+control that does fire is a mutation: the same library and the same rows, with
+the plan forced by `INDEXED BY`. `INDEXED BY ia` prints
+`2 ; 0 ; 1 ; 2 ; 0 ; 1 ; 2 ; 0 ;` and `INDEXED BY ib` prints
+`0 ; 0 ; 0 ; 0 ; 0 ; 0 ; 0 ; 0 ;` for the same query over the same table. A plan
+change on this data CAN move the printed rows; on these 18 it did not.
+
+**The per-flag byte deltas are not additive.** Against the 1,606,768-byte
+baseline: PERCENTILE +288, CARRAY +224, STAT4 +12,288, SNAPSHOT +4,096. Those
+sum to 16,896, while all four built together cost +20,992 — the figure quoted
+above. Quoting a per-flag delta as a share of a combined total, or adding them
+up to predict one, is wrong by about 24%.
