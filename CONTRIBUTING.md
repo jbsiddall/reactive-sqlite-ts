@@ -23,8 +23,43 @@ deno task test:crash  # the out-of-process crash matrix
 deno task test:table  # README's capability table still matches the libraries
 deno task test:table-structure  # ...and its rows still match `Capabilities`
 deno task test:docs-literals  # no code span in the docs is wrapped across a line
-deno task test:commits  # the commit-message constraints nothing else enforces
 ```
+
+`test:commits` is deliberately not in that list. It is the one check whose
+subject is the commit itself, so it runs at a different moment -- see below.
+
+### `test:commits` runs AFTER you commit and BEFORE you push
+
+Every other task above asks a question about the working tree, so running it
+before you commit is the whole point. `test:commits` asks a question about the
+range `<baseline>..HEAD`, and until you have committed, the commit you are about
+to push is not in that range. Run it before, and it reports on the commits that
+were already there -- green, and silent about the only one you could still fix.
+
+That is not hypothetical. It happened here: a commit whose subject contained a
+forbidden string was pushed green, because the check had been run over the
+previous six commits a minute before the seventh existed. The branch was red on
+arrival for a defect a correctly-timed run would have caught locally.
+
+So the order is fixed:
+
+```sh
+git commit                       # the subject and body are now real
+git pull --rebase origin main    # a rebase can change the range; do it before checking
+deno task check && deno task test
+deno task test:commits           # NOW it can see your commit
+git push
+```
+
+READ THE RANGE COUNT IT PRINTS, every time. The line to read is
+`the parse found every commit in the range`, and the number in brackets after it
+is how many commits were walked. That number is the only thing separating a
+green run from a green run that saw nothing, because a check that scans an empty
+range passes. If the count did not go up by the commit you just made, the run
+did not examine it and its verdict is about somebody else's work.
+
+If the rebase conflicts, stop and resolve it before re-running -- the range you
+checked is no longer the range you are pushing.
 
 ### Which library you pin is a choice about coverage, not only about segfaults
 
@@ -74,9 +109,10 @@ stamped here: re-derive it at `.github/workflows/ci.yml`.
 
 ### Which of these CI runs, and why the rest do not
 
-CI runs everything above except `test:table` and `test:commits`, and those two
-are absent for different reasons. Neither is an oversight, and neither is
-waiting for someone to wire it up.
+CI runs everything in that list except `test:table`, and it does not run
+`test:commits` either, which is why that one is not in the list. The two are
+absent for different reasons. Neither is an oversight, and neither is waiting
+for someone to wire it up.
 
 `test:table` CANNOT be in CI. It needs all THREE libraries on disk — the system
 one, a vendored build (`deno task vendor:build`), and the prebuilt `@db/sqlite`
