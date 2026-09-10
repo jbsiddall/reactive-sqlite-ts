@@ -7,14 +7,27 @@
  * not from memory. The three libraries are the three a user can actually end
  * up with:
  *
- *   1. the system library `resolveLibPath()` finds — the one `deno task test`
- *      runs against, which is why the system column is resolved that exact way
- *      rather than by a second candidate list;
+ *   1. the library `resolveLibPath()` finds with DENO_SQLITE_PATH unset. The
+ *      column is resolved by calling that function rather than by a second
+ *      candidate list, so the table cannot drift from the resolution logic the
+ *      rest of the project uses. That is a claim about the MECHANISM and not
+ *      about the outcome, and the difference matters: `deno task test` calls
+ *      the same function, but DENO_SQLITE_PATH short-circuits it, and the task
+ *      does not set the variable itself — the caller does. Our own gate
+ *      procedure exports it at the vendored build, so in the configuration we
+ *      actually run, the suite is on 3.53.4 while this column is the machine's
+ *      3.45.1. `locate()` refuses outright when the variable is set, so this
+ *      column is ALWAYS the unpinned scan and never the pinned library;
  *   2. the vendored build under `vendor/lib/<target>/`;
- *   3. the prebuilt `@db/sqlite` 0.13.0 downloads into `$DENO_DIR/plug/` when
- *      DENO_SQLITE_PATH is unset. That one is the only library reachable here
- *      that GENUINELY lacks capabilities, so it is the only honest fixture for
- *      the absent-capability branches — and it exists only until the driver is
+ *   3. the prebuilt `@db/sqlite` downloads into `$DENO_DIR/plug/` when
+ *      DENO_SQLITE_PATH is unset. No release is named here on purpose: the
+ *      driver is not a dependency of this project, so the cached artefact's
+ *      own metadata.json is the only record of which release it is, and
+ *      `releaseFromMetadata()` reads it into the rendered provenance line. A
+ *      number typed into this comment would have nothing on disk to be wrong
+ *      against. That library is also the only one reachable here that
+ *      GENUINELY lacks capabilities, so it is the only honest fixture for the
+ *      absent-capability branches — and it exists only until the driver is
  *      vendored.
  *
  * The table is generated and checked rather than maintained by hand:
@@ -289,6 +302,20 @@ function pinnedLibraryRefusal(
  */
 let prebuiltRelease: string | undefined;
 
+/**
+ * What to print when there is no cached prebuilt to probe.
+ *
+ * Pulled out and fixtured so that the absent version pin STAYS absent. It is
+ * the one identifying string in this file's output that cannot be read off an
+ * artefact -- the message exists precisely because the artefact is missing --
+ * so the guard is that no release number may appear in it at all.
+ */
+function missingPrebuiltMessage(): string {
+  return "No @db/sqlite prebuilt in $DENO_DIR/plug. It is downloaded the first " +
+    "time the driver is imported with DENO_SQLITE_PATH unset:\n" +
+    "  DENO_SQLITE_PATH= deno eval \"await import('jsr:@db/sqlite')\"";
+}
+
 /** Where the three libraries are. Throws with a usable message when one is missing. */
 function locate(): { name: string; path: string }[] {
   const refusal = pinnedLibraryRefusal(
@@ -299,11 +326,18 @@ function locate(): { name: string; path: string }[] {
   const prebuilt = driverPrebuilt();
   prebuiltRelease = prebuilt?.release;
   if (prebuilt === undefined) {
-    throw new Error(
-      "No @db/sqlite prebuilt in $DENO_DIR/plug. It is downloaded the first " +
-        "time the driver is imported with DENO_SQLITE_PATH unset:\n" +
-        "  DENO_SQLITE_PATH= deno eval \"await import('jsr:@db/sqlite@0.13.0')\"",
-    );
+    // The version pin is GONE from this command rather than being read from
+    // somewhere, and that is the honest answer rather than a contrived one.
+    // This message is printed on the one path where the cache is ABSENT, so
+    // there is no artefact to read a release out of; the driver is not a
+    // dependency of this project either, so nothing else on disk records one.
+    // A typed pin here would be the defect this file exists to refuse. What
+    // the command fetches is whatever jsr resolves today, and the table then
+    // reports THAT release, because the provenance line follows the metadata
+    // of the artefact this command creates. If the release it lands on ever
+    // behaves differently, `PINNED` fails loudly rather than the table lying:
+    // the known answer says this column's `preupdate` is false.
+    throw new Error(missingPrebuiltMessage());
   }
   return [
     { name: "system", path: resolveLibPath() },
@@ -1189,6 +1223,26 @@ async function structure(): Promise<void> {
     if (found === undefined) {
       console.log(`  skip  ${what} — no @db/sqlite prebuilt in $DENO_DIR/plug`);
     } else pass(`${what} (${found})`);
+  }
+
+  // The absent-prebuilt message. Two halves: it must still tell the reader how
+  // to get the artefact, and it must not name a release while doing so.
+  {
+    const msg = missingPrebuiltMessage();
+    const what = "the absent-prebuilt message still gives the recovery command";
+    if (msg.includes("deno eval") && msg.includes("jsr:@db/sqlite")) pass(what);
+    else fail(what, `message was ${JSON.stringify(msg)}`);
+
+    const pinned = /\d+\.\d+\.\d+/.exec(msg)?.[0];
+    const what2 = "the absent-prebuilt message pins no release";
+    if (pinned === undefined) pass(what2);
+    else {
+      fail(
+        what2,
+        `it names ${pinned}, and no artefact exists at that point to read a ` +
+          `release from -- the cache is what is missing`,
+      );
+    }
   }
 
   // The vendored-manifest control, fixtured rather than run against the tree.
