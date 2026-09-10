@@ -183,8 +183,66 @@ function capsOf(raw: object): Capabilities {
   };
 }
 
+/**
+ * The refusal that stops the table being built against a pinned library.
+ *
+ * MEASURED: with `DENO_SQLITE_PATH` exported at the vendored library,
+ * `--check` printed 6 passed / 2 failed and the distinctness control reported
+ * the `system` and `vendored` columns resolving to the same file. The gate
+ * caught it, which is the gate working -- and a caption is still not enough.
+ * A table that renders two headings over one library when an environment
+ * variable happens to be exported is an instrument with a wrong reading, and
+ * documenting which reading you took does not stop the next person taking the
+ * other one. So the table is not built at all under that condition.
+ *
+ * It lives here, in the function that resolves the columns, rather than in the
+ * `import.meta.main` block. Every path that produces a table -- generation and
+ * `--check` alike, and any future importer -- goes through `locate()`, and a
+ * guard in the entry block would be a guard on the task rather than on the
+ * measurement.
+ *
+ * Pure, and takes both paths as arguments, so the message can be asserted by
+ * the structural check with no libsqlite3 on disk and nothing exported.
+ */
+function pinnedLibraryRefusal(
+  pinned: string | undefined,
+  vendored: string,
+): string | null {
+  if (pinned === undefined || pinned.trim() === "") return null;
+  const real = (p: string): string => {
+    try {
+      return Deno.realPathSync(p);
+    } catch {
+      return p;
+    }
+  };
+  const same = real(pinned) === real(vendored);
+  const consequence = same
+    ? `That is the same file as the \`vendored\` column (${
+      real(vendored)
+    }), so ` +
+      `the table would render one library under two headings and say nothing ` +
+      `about it.`
+    : `The \`system\` column would report that library rather than the ` +
+      `machine's, under a heading that says otherwise.`;
+  return [
+    `Refusing to build the capability table: DENO_SQLITE_PATH is set to ${pinned}.`,
+    ``,
+    `The \`system\` column is whatever resolveLibPath() returns, and that`,
+    `honours DENO_SQLITE_PATH. ${consequence}`,
+    ``,
+    `Unset it for this command:`,
+    `  DENO_SQLITE_PATH= deno task table        # or test:table`,
+  ].join("\n");
+}
+
 /** Where the three libraries are. Throws with a usable message when one is missing. */
 function locate(): { name: string; path: string }[] {
+  const refusal = pinnedLibraryRefusal(
+    Deno.env.get("DENO_SQLITE_PATH"),
+    vendoredLibraryPath(),
+  );
+  if (refusal !== null) throw new Error(refusal);
   const prebuilt = driverPrebuilt();
   if (prebuilt === undefined) {
     throw new Error(
@@ -334,10 +392,25 @@ const fail = (what: string, detail: string) => {
   console.log(`  FAIL  ${what} — ${detail}`);
 };
 
+/**
+ * Whether the resolved column paths are all different files.
+ *
+ * Pulled out of `gate()` and given fixtures because of what the refusal above
+ * costs. Exporting DENO_SQLITE_PATH used to be the one way anybody had SEEN
+ * the distinctness control fire, and the refusal now stops that run before the
+ * gate is reached -- so without this the control would still be there, still
+ * be right, and never again be observed rejecting anything. The refusal covers
+ * one cause of a collapse; the control covers the rest, and the fixtures are
+ * what keep it from becoming a control nobody has seen fail.
+ */
+function allDistinct(paths: readonly string[]): boolean {
+  return new Set(paths).size === paths.length;
+}
+
 /** The gate. Nothing this file measures is reportable until every one passes. */
 async function gate(columns: Column[]): Promise<void> {
   const real = columns.map((c) => Deno.realPathSync(c.path));
-  if (new Set(real).size === columns.length) {
+  if (allDistinct(real)) {
     pass(`three distinct libraries: ${real.join(", ")}`);
   } else {
     fail("three distinct libraries", `resolved to ${real.join(", ")}`);
@@ -834,6 +907,98 @@ async function structure(): Promise<void> {
           : `rejected, but only by ${failures.map((g) => g.what).join("; ")}`,
       );
     }
+  }
+
+  // The refusal that keeps the `system` column honest. Asserted on its TEXT,
+  // not on the fact that something threw: the exit status tells an operator
+  // that the table did not build, and only the message tells them why or what
+  // to do about it, so a control that checks the status alone leaves the half
+  // a human actually reads unverified.
+  const V = "/x/vendor/lib/linux-x86_64-gnu/libsqlite3.so";
+  for (
+    const c of [
+      {
+        name: "unset — the table builds",
+        pinned: undefined,
+        want: [],
+        refuse: false,
+      },
+      { name: "empty — treated as unset", pinned: "", want: [], refuse: false },
+      {
+        name: "pinned at the vendored library",
+        pinned: V,
+        refuse: true,
+        // Names the variable, names its value, and names the collapse in the
+        // table's own vocabulary -- `system` and `vendored` are the column
+        // headings a reader is looking at -- plus the command that recovers.
+        want: [
+          "DENO_SQLITE_PATH is set to " + V,
+          "`system`",
+          "`vendored`",
+          "one library under two headings",
+          "DENO_SQLITE_PATH= deno task table",
+        ],
+      },
+      {
+        name: "pinned at some other library",
+        pinned: "/x/other/libsqlite3.so",
+        refuse: true,
+        // A different consequence, so the message must not be the same one
+        // with a different path in it: nothing collapses here, the `system`
+        // column is simply not the system.
+        want: [
+          "DENO_SQLITE_PATH is set to /x/other/libsqlite3.so",
+          "rather than the",
+          "DENO_SQLITE_PATH= deno task table",
+        ],
+      },
+    ]
+  ) {
+    const got = pinnedLibraryRefusal(c.pinned, V);
+    const what = `refusal: ${c.name}`;
+    if (!c.refuse) {
+      if (got === null) pass(what);
+      else fail(what, `refused anyway with: ${got}`);
+      continue;
+    }
+    if (got === null) {
+      fail(what, "did not refuse");
+      continue;
+    }
+    const missing = c.want.filter((w) => !got.includes(w));
+    if (missing.length === 0) pass(`${what}, saying all of: ${c.want.length}`);
+    else fail(what, `message omits ${missing.join(" | ")}. Said:\n${got}`);
+  }
+  // The two refusals must differ, or the second fixture is proving only that
+  // the first one's text also contains a path.
+  if (
+    pinnedLibraryRefusal(V, V) !== pinnedLibraryRefusal("/x/other.so", V)
+  ) {
+    pass("refusal: the two refusals say different things");
+  } else {
+    fail("refusal: the two refusals say different things", "identical text");
+  }
+
+  // The distinctness control, which the refusal above would otherwise have
+  // left permanently unobserved.
+  for (
+    const c of [
+      { name: "three different files", paths: ["/a", "/b", "/c"], want: true },
+      {
+        name: "system and vendored are one file",
+        paths: ["/a", "/a", "/c"],
+        want: false,
+      },
+      {
+        name: "all three are one file",
+        paths: ["/a", "/a", "/a"],
+        want: false,
+      },
+    ]
+  ) {
+    const what = `distinctness control: ${c.name}`;
+    if (allDistinct(c.paths) === c.want) pass(what);
+    else fail(what, `said ${!c.want}`);
   }
 
   // Only now the real files.
