@@ -480,11 +480,15 @@ unless you specifically want the silence.
 
 The row events report writes to FTS5's _shadow_ tables — `ft_content`,
 `ft_docsize`, `ft_data`, `ft_idx` — and never the virtual table `ft`. The
-authorizer is the mirror image: preparing
-`SELECT body FROM ft WHERE ft MATCH
-'hello'` reports `ft` and no shadow table at
-all. Neither source alone can tell you that a query depends on a virtual table.
-Measured on `fts5` and `rtree`; other modules were not tested.
+authorizer is the mirror image. Preparing this statement:
+
+```sql
+SELECT body FROM ft WHERE ft MATCH 'hello'
+```
+
+reports `ft` and no shadow table at all. Neither source alone can tell you that
+a query depends on a virtual table. Measured on `fts5` and `rtree`; other
+modules were not tested.
 
 One asymmetry to know if you collect these: _executing_ a write to a virtual
 table also authorizes its shadow tables, because FTS5 prepares its own

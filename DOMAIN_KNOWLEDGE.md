@@ -515,9 +515,12 @@ had shipped as a stated precondition on a call that returned a confident
 
 - **`sqlite3_prepare_v2`'s `pzTail`** reports where the unused text begins.
   Measured directly over FFI:
-  `"INSERT INTO a VALUES (1); INSERT INTO b VALUES
-  (2)"` → tail
-  `" INSERT INTO b VALUES (2)"`; `"SELECT x FROM a;"` → tail `""`;
+
+  ```
+  "INSERT INTO a VALUES (1); INSERT INTO b VALUES (2)"
+  ```
+
+  gives tail `" INSERT INTO b VALUES (2)"`; `"SELECT x FROM a;"` → tail `""`;
   `"SELECT x FROM a; -- note"` → tail `" -- note"`; and, the case a scan for `;`
   gets wrong, `"SELECT x FROM a WHERE x = ';'"` → tail `""`.
 - **`sqlite3_sql(stmt)`**, which the driver already exposes as the public getter
@@ -679,16 +682,18 @@ own first line.
 ### `vendor/probe.ts`, `vendor/select.ts` and `tools/capability_table.ts` do NOT dlopen at import time
 
 **A measured negative.** Each was imported under
-`deno run --allow-read
---allow-env` with `--allow-ffi` and `--unstable-ffi` both
-withheld; all three imported and ran to completion. The dlopens are inside
+`deno run --allow-read --allow-env`, with `--allow-ffi` and `--unstable-ffi`
+both withheld; all three imported and ran to completion. The dlopens are inside
 functions, reached only when a probe is actually called.
 
 **Control seen to fail:** a module whose top level calls `Deno.dlopen` on
-`libsqlite3.so.0` dies under the identical flags with
-`NotCapable: Requires ffi
-access ... run again with the --allow-ffi flag`, and
-succeeds once `--allow-ffi` is added. The harness can therefore tell the two
+`libsqlite3.so.0` dies under the identical flags with:
+
+```
+NotCapable: Requires ffi access ... run again with the --allow-ffi flag
+```
+
+and succeeds once `--allow-ffi` is added. The harness can therefore tell the two
 cases apart, so the negative is a finding rather than an untested path.
 
 Consequence for tooling: a structural, no-library check can live in
@@ -794,9 +799,8 @@ Deno does not let an `unload` handler change the exit code.
 
 **MEASURED.** In a git worktree, `.git` is a FILE (a one-line `gitdir:` pointer)
 rather than a directory, and `deno publish --dry-run` includes it in the file
-list. `test/publish_manifest.ts` therefore reported `WIDENED by 1:
-.git` from a
-detached worktree — 20 passed, 1 failed — while the same commit in a real
+list. From a detached worktree `test/publish_manifest.ts` therefore reported
+`WIDENED by 1: .git` — 20 passed, 1 failed — while the same commit in a real
 checkout reported 21 passed, 0 failed.
 
 The failure mode is not the extra file, it is the sentence: a red that reads
@@ -910,8 +914,7 @@ rows of `t(a TEXT, b INTEGER)` with an index on each column, where `a` is
 `SEARCH t USING INDEX ib (b=?)` before `ANALYZE` on both builds. After `ANALYZE`
 the STAT4 build moves to `SEARCH t USING INDEX ia (a=?)` — the one-row index —
 and the baseline does not move at all. `sqlite_stat4` exists with 3 rows in the
-STAT4 build; the baseline reports `no such table:
-sqlite_stat4` and has only
+STAT4 build. The baseline reports `no such table: sqlite_stat4` and has only
 `sqlite_stat1`.
 
 Across an 18-query battery run after `ANALYZE` on both builds, **4 of the 18

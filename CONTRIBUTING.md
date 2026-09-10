@@ -326,9 +326,8 @@ Two triggers, either one sufficient:
 
 `set_authorizer` surfaced a defect class nothing before it could have: **our own
 instrumentation became visible through the hook we were adding.** The
-displacement checks from the WAL and busy chunks issue
-`PRAGMA
-wal_autocheckpoint` and `PRAGMA busy_timeout`, and `preupdate` reads the
+displacement checks from the WAL and busy chunks issue the pragmas
+`PRAGMA wal_autocheckpoint` and `PRAGMA busy_timeout`, and `preupdate` reads the
 schema — all through `rawPrepare`, all of which fire the authorizer. Measured
 before any suppression existed: one `INSERT` produced three authorizer
 callbacks, two of them ours, dispatched from inside `drain()`.
@@ -355,10 +354,9 @@ stream, and the null schema argument), plus where to collect them.
 
 ### The one gap that remains
 
-The **absent-capability branches** — "preupdate unavailable",
-`preupdate:
-"required"` refusing, and `trace` being absent entirely — have never
-run against a library that genuinely lacks those symbols, because both libraries
+The **absent-capability branches** — "preupdate unavailable", a refusing
+`preupdate: "required"`, and `trace` being absent entirely — have never run
+against a library that genuinely lacks those symbols, because both libraries
 reachable here have them. The honest fixture for those is the prebuilt library
 `@db/sqlite` downloads when `DENO_SQLITE_PATH` is unset, which carries a much
 smaller symbol set. Still not wired up as a test fixture — but that library is

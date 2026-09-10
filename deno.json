@@ -50,6 +50,14 @@
       "description": "Measure which capability-refusal branches are actually exercised, and by what: real absence, a simulating option, or nothing. Rewrites each refusal to `false` in the source and re-runs the semantic suite, restoring the source afterwards. --check additionally fails if the result drifts from the states recorded in the tool. --allow-run is unscoped because the child is Deno.execPath(), known only at runtime. Needs a libsqlite3 (see //libsqlite3).",
       "command": "deno run --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write --allow-run tools/capability_coverage.ts"
     },
+    "test:docs-literals": {
+      "description": "Ask whether any code span in the prose documents has been wrapped across a newline by the formatter. A wrapped span still renders, but the literal inside it can no longer be found by anyone who greps the document for the command it names, so the span silently stops being a citation. Reads the four documents as text; no libsqlite3, no FFI, no network. LOCAL ONLY: this task is in no CI workflow, so a wrapped literal reaching main is caught by whoever runs the gate, not by CI.",
+      "command": "deno run --allow-read test/markdown_literals.ts"
+    },
+    "test:commits": {
+      "description": "Ask whether the commits on this branch satisfy the four constraints that are held by attention alone: the assistant co-author trailer present exactly once, author and committer both the human, no session or generator strings anywhere in the message, and no file:line citation in a body. Shells out to `git log` over the range after a named baseline commit and cross-checks the count with `git rev-list`. LOCAL ONLY: this task is in no CI workflow, and CI's shallow checkout could not see the range even if it were.",
+      "command": "deno run --allow-run=git --allow-read test/commit_trailers.ts"
+    },
     "test:publish": {
       "description": "Assert what the published package actually contains — LICENSE and NOTICE present, test/ and tools/ absent. Spawns `deno publish --dry-run`, which validates without uploading. --allow-run is unscoped because the child is Deno.execPath(), known only at runtime.",
       "command": "deno run --allow-run --allow-read --allow-env test/publish_manifest.ts"
