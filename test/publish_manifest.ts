@@ -36,10 +36,12 @@
  * fixtures that must all be rejected cannot tell a working comparison from one
  * that rejects everything.
  *
- * WHEN THE DRIVER IS VENDORED, PRESENCE STOPS BEING ENOUGH. A trimmed NOTICE
- * still exists, and Apache-2.0's modified-files sentence is exactly the kind of
- * paragraph that gets shortened for tidiness. At that point this file grows a
- * CONTENT assertion on the attribution block, not just a presence one.
+ * PRESENCE IS NOT ENOUGH, NOW THE DRIVER IS VENDORED. A trimmed NOTICE still
+ * exists, and Apache-2.0's modified-files sentence is exactly the kind of
+ * paragraph that gets shortened for tidiness — deleting it whole was measured
+ * to leave this file green before {@linkcode attributionFindings} existed. So
+ * the attribution block is asserted on its CONTENT: every clause it must carry
+ * is named, and each one has a fixture that deletes it and must be rejected.
  *
  * Run: deno task test:publish
  */
@@ -148,6 +150,78 @@ function manifestFindings(
     ),
   );
   return findings;
+}
+
+/**
+ * Every clause the attribution block must carry, as a whitespace-insensitive
+ * needle.
+ *
+ * Named one clause at a time rather than pinned as a whole paragraph. A pinned
+ * paragraph fails on every reflow and teaches people to re-pin it without
+ * reading, which is how a deleted sentence gets waved through. Naming the
+ * clauses means a rewording passes and a REMOVAL fails, which is the
+ * distinction the licence cares about.
+ *
+ * Anything the modification sentence claims belongs here too: a clause that is
+ * asserted nowhere is a clause that can be quietly dropped, and the whole point
+ * of disclosing a divergence is that the disclosure outlives the person who
+ * wrote it.
+ */
+const ATTRIBUTION_CLAUSES: readonly { what: string; needle: string }[] = [
+  { what: "names the upstream project", needle: "denodrivers/sqlite3" },
+  {
+    what: "carries the upstream copyright line",
+    needle: "Copyright 2022 DjDeveloperr",
+  },
+  {
+    what: "states the upstream licence",
+    needle: "Licensed under the Apache License, Version 2.0.",
+  },
+  {
+    what: "states that the vendored sources were modified",
+    needle: "have been MODIFIED by the reactive-sqlite-ts authors",
+  },
+  {
+    what: "names the use-after-close correction",
+    needle: "use-after-close segmentation fault",
+  },
+  {
+    what: "names the negative-zero correction",
+    needle: "bind failure on negative zero",
+  },
+  {
+    what: "discloses that the row readers diverge further",
+    needle: "result row readers diverge further than restyling",
+  },
+  {
+    what: "states that the row readers generate no source at run time",
+    needle: "generate no JavaScript source at run time",
+  },
+  {
+    what: "states that hostile column names read correctly",
+    needle: "names contain quotation marks or newlines",
+  },
+  {
+    what: "keeps those three claims about THIS build, not about upstream",
+    needle: "None of them is a claim about the upstream sources",
+  },
+];
+
+/** Hard wrapping is not content: compare with runs of whitespace collapsed. */
+const flat = (text: string): string => text.replace(/\s+/g, " ").trim();
+
+/**
+ * Whether the attribution block still says everything it must.
+ *
+ * Pure, so the fixtures below run the same code the real NOTICE does.
+ */
+function attributionFindings(notice: string): Finding[] {
+  const text = flat(notice);
+  return ATTRIBUTION_CLAUSES.map(({ what, needle }) =>
+    text.includes(flat(needle))
+      ? ok(`NOTICE ${what}`)
+      : bad(`NOTICE ${what}`, `missing: ${JSON.stringify(needle)}`)
+  );
 }
 
 /** Whether any pinned-never prefix leaked into the shipped set. */
@@ -393,6 +467,73 @@ for (const fixture of GRAPH_FIXTURES) {
         ),
     );
   }
+}
+
+console.log("\nthe attribution block");
+
+/** Delete a clause from the real NOTICE, tolerating however it is wrapped. */
+function withoutClause(notice: string, needle: string): string {
+  const pattern = flat(needle)
+    .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+    .replaceAll(" ", "\\s+");
+  return notice.replace(new RegExp(pattern), "");
+}
+
+const noticeText = ((): string | null => {
+  try {
+    return Deno.readTextFileSync(`${root}/NOTICE`);
+  } catch {
+    return null;
+  }
+})();
+
+if (noticeText === null) {
+  record(bad("NOTICE was read", `no readable NOTICE at ${root}/NOTICE`));
+} else {
+  // The accepted side, clause by clause. This is the real assertion; the
+  // fixtures below are what say it can go red.
+  for (const f of attributionFindings(noticeText)) record(f);
+
+  // Each clause deleted in turn. The deletion must be rejected, and rejected
+  // BY THE NAME of the clause that went missing — a check that only reported
+  // "NOTICE is wrong" would leave the operator to find out which sentence.
+  for (const clause of ATTRIBUTION_CLAUSES) {
+    const damaged = withoutClause(noticeText, clause.needle);
+    const name = `control: deleting "${clause.what}" is rejected`;
+    if (damaged === noticeText) {
+      record(bad(name, "the fixture deleted nothing, so it proves nothing"));
+      continue;
+    }
+    const named = attributionFindings(damaged)
+      .filter((f) => !f.ok)
+      .map((f) => f.what);
+    record(
+      named.includes(`NOTICE ${clause.what}`) ? ok(name) : bad(
+        name,
+        named.length === 0
+          ? "accepted it"
+          : `rejected it, but named ${named.join(", ")} instead`,
+      ),
+    );
+  }
+
+  // The tidying that started this: the whole modified-files paragraph gone.
+  // Measured 2026-09-10 to leave every other assertion in this file green.
+  const untidied = noticeText.replace(
+    /The vendored sources have been MODIFIED[\s\S]*?on negative zero\)\.\n/,
+    "",
+  );
+  const lost = attributionFindings(untidied).filter((f) => !f.ok).length;
+  record(
+    untidied !== noticeText && lost >= 3
+      ? ok("control: deleting the whole modified-files paragraph is rejected")
+      : bad(
+        "control: deleting the whole modified-files paragraph is rejected",
+        untidied === noticeText
+          ? "the fixture deleted nothing, so it proves nothing"
+          : `only ${lost} clauses went red`,
+      ),
+  );
 }
 
 console.log("\nenvironment controls");

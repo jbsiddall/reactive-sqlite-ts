@@ -28,4 +28,12 @@ authors: restyled to this project's conventions, reduced to the
 surface this library uses, and corrected for two defects present
 upstream (a use-after-close segmentation fault, and a bind failure
 on negative zero).
+
+The result row readers diverge further than restyling, so they are
+disclosed separately: in this build they are plain loops, they
+generate no JavaScript source at run time, and they read result
+columns whose names contain quotation marks or newlines correctly.
+Those are statements about this build, measured here. None of them
+is a claim about the upstream sources, which are no longer in this
+tree to measure.
 ------------------------------------------------------------------

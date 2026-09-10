@@ -6,10 +6,24 @@
  * `as const` is not an assertion in this sense — it narrows a literal rather
  * than overriding an inference — so it is allowed.
  */
-/** The published library: src/ and mod.ts. Suites, examples and vendor tooling are not. */
+/**
+ * The published library: `src/`, `driver/` and `mod.ts`. Suites, examples and
+ * vendor tooling are not.
+ *
+ * `driver/` is in this set by decision rather than by accident of the pattern.
+ * It used to sit outside it, which meant the `as` ban reached it (that rule has
+ * no file scope) and the `!` ban did not — a rule holding in one directory and
+ * stopping in the next for a reason nobody chose. Both now reach it, because
+ * `driver/` is published under this package's name, and it is the FFI boundary
+ * itself, which is the exact place the `!` rule was aimed at. Being vendored
+ * originally is not an argument for softer rules on it: nothing upstream is
+ * coming back to merge.
+ */
 function isLibrary(filename: string): boolean {
   const path = filename.replaceAll("\\", "/");
-  return /(^|\/)src\/[^/]+\.ts$/.test(path) || /(^|\/)mod\.ts$/.test(path);
+  return /(^|\/)src\/[^/]+\.ts$/.test(path) ||
+    /(^|\/)driver\/[^/]+\.ts$/.test(path) ||
+    /(^|\/)mod\.ts$/.test(path);
 }
 
 const plugin: Deno.lint.Plugin = {

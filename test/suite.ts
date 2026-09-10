@@ -3144,6 +3144,38 @@ const SEMANTIC: Record<string, () => void> = {
     db.close();
   },
 
+  "driver internals: row readers read column names containing quotes and newlines"() {
+    // NOTICE says this build reads such columns correctly. This is where that
+    // sentence is measured; delete this scenario and the claim is unbacked.
+    // The row readers are plain loops over the column list, so a name is data
+    // here rather than text that has to survive being written into source.
+    const db = memory('CREATE TABLE weird("a""b" INTEGER, "c\nd" TEXT)');
+    db.exec("INSERT INTO weird VALUES (1, 'x')");
+    const stmt = db.prepare("SELECT * FROM weird");
+    check("  column names", stmt.columnNames(), ['a"b', "c\nd"]);
+    check("  read as an object", stmt.get(), { 'a"b': 1, "c\nd": "x" });
+    check("  read as an array", stmt.values(), [[1, "x"]]);
+    // A name that would close the string and start a statement, had one ever
+    // been generated.
+    const hostile = 'x");globalThis.PWNED=1;("';
+    const db2 = memory(
+      `CREATE TABLE hostile(${`"${hostile.replaceAll('"', '""')}"`} INTEGER)`,
+    );
+    db2.exec("INSERT INTO hostile VALUES (7)");
+    check(
+      "  hostile name read as data",
+      db2.prepare("SELECT * FROM hostile").get(),
+      { [hostile]: 7 },
+    );
+    check(
+      "  nothing was evaluated",
+      Reflect.get(globalThis, "PWNED"),
+      undefined,
+    );
+    db2.close();
+    db.close();
+  },
+
   // ------------------------------------------------------- the schema map
   //
   // The negative control is the first scenario and it asserts ZERO shadow

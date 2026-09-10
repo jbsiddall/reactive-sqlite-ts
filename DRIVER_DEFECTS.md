@@ -3,19 +3,22 @@
 **The driver is now ours.** It lives in `driver/`, vendored from
 [the Deno SQLite3 driver](https://github.com/denodrivers/sqlite3) 0.13.0 (see
 `NOTICE`). This file is therefore no longer a bug report about somebody else's
-code: it is the record of which defects the vendoring fixed and which one it
-deliberately carried.
+code: it is the record of which defects the vendoring fixed, which one it
+deliberately carried, and where the vendored code diverges without any defect
+being claimed on either side.
 
 Every entry keeps the version it was first measured against, because that is
 where the reproduction was run. Two are marked FIXED and have a regression case
 in the repository; one is marked CARRIED, and the code that carries it says so
-at the site.
+at the site. One is marked CHANGED: the behaviour differs and is pinned, but no
+claim is made that what it replaced was wrong.
 
-| Defect                                 | Status  | Pinned by                                         |
-| -------------------------------------- | ------- | ------------------------------------------------- |
-| `openBlob()` on a closed Database      | FIXED   | `driver-use-after-close` in `test/crash_cases.ts` |
-| Binding `-0` throws                    | FIXED   | the property suite's value generator              |
-| `finalize()` throws the last run error | CARRIED | nothing — see the entry                           |
+| Defect                                 | Status  | Pinned by                                          |
+| -------------------------------------- | ------- | -------------------------------------------------- |
+| `openBlob()` on a closed Database      | FIXED   | `driver-use-after-close` in `test/crash_cases.ts`  |
+| Binding `-0` throws                    | FIXED   | the property suite's value generator               |
+| `finalize()` throws the last run error | CARRIED | nothing — see the entry                            |
+| Row readers generated JS source        | CHANGED | `driver internals: row readers` in `test/suite.ts` |
 
 ## FIXED — `openBlob()` on a closed Database segfaults
 
@@ -139,3 +142,29 @@ first.
 
 `finalize()` in `driver/statement.ts` carries a comment saying the same thing,
 so the defect is visible where the code is, not only here.
+
+## CHANGED — the row readers no longer generate JavaScript at run time
+
+**Not a defect entry.** Nothing here claims the upstream readers were wrong. It
+is recorded because the behaviour differs, and an undisclosed difference is the
+thing that costs somebody a day.
+
+Upstream built each row reader by assembling JavaScript source and compiling it
+with `new Function`, interpolating the column names into that source. In
+`driver/statement.ts` the readers are plain loops over the column list, so a
+column name is data throughout and never becomes text that has to survive being
+written into a program.
+
+**Measured here, 2026-09-10, system SQLite 3.45.1**, by the row-reader scenario
+in `test/suite.ts` (search it for "quotes and newlines"): columns named `a"b`
+and `c` + newline + `d` read back correctly by name, as objects and as arrays;
+and a column named `x");globalThis.PWNED=1;("` reads back as an ordinary key
+with nothing evaluated.
+
+**Why no claim about upstream.** Whether upstream would have thrown a
+`SyntaxError` or executed the interpolated text on those names was never
+measured, and the sources are no longer in this tree to measure. So `NOTICE`
+discloses the divergence as three facts about this build and asserts nothing
+about theirs. Establishing the stronger statement would mean fetching
+`@db/sqlite` 0.13.0 into a scratch tree and running the same two names against
+it; until somebody does, the weaker sentence is the honest one.
