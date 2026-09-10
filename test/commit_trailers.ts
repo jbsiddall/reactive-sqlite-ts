@@ -131,6 +131,19 @@ export function decodedNeedles(): string[] {
 const FILE_LINE =
   /\b[\w./-]+\.(?:ts|tsx|js|md|json|jsonc|sh|ya?ml|c|h|toml)\s*:\s*\d+/i;
 
+/**
+ * Whether `message` carries `needle` at the start of a word.
+ *
+ * The needle must begin where a letter or a digit does not precede it. There
+ * is no matching assertion on the far end, and both halves of that are
+ * load-bearing -- the fixtures that pin them, and the measurement that
+ * rejected the symmetric alternative, are in the control block below.
+ */
+export function carriesNeedle(message: string, needle: string): boolean {
+  const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?<![A-Za-z0-9])${escaped}`, "i").test(message);
+}
+
 export interface Commit {
   sha: string;
   authorName: string;
@@ -196,9 +209,8 @@ export function problemsWith(c: Commit): Problem[] {
     });
   }
 
-  const lower = c.message.toLowerCase();
   for (const needle of decodedNeedles()) {
-    if (lower.includes(needle.toLowerCase())) {
+    if (carriesNeedle(c.message, needle)) {
       out.push({
         rule: RULES.strings,
         detail:
@@ -371,6 +383,186 @@ for (
       } characters)`,
     );
   } else fail(what, `decoded to ${n.length} entries`);
+}
+
+/**
+ * The eight positions a needle can sit in, and the six ordinary words that
+ * must not be mistaken for one.
+ *
+ * WHY THIS BLOCK EXISTS. The scan above matched by bare substring, and the
+ * word "imported" ends in one of the needles, so an honest subject about
+ * importing a package was rejected for carrying a string it does not carry.
+ * The matcher now requires the needle to begin at a character that is not a
+ * letter or a digit. THAT IS A LOOSENING, and a loosening is silent
+ * afterwards: nothing about a needle that stops being caught prints anything.
+ * So the fixtures come first and the matcher answers to them.
+ *
+ * THE CLASS BOUNDARY IS `[A-Za-z0-9]`, AND `-` AND `_` ARE DELIBERATELY
+ * OUTSIDE IT. Two cases decide that, and they were written by different hands
+ * without sight of each other, which is why they are worth naming here: a
+ * needle written hyphen-adjacent must still be caught, and a needle prefixed
+ * by an underscore -- the shape an identifier takes -- must still be caught.
+ * Put `-` or `_` inside the class and one of those two goes silent.
+ *
+ * THERE IS NO TRAILING ASSERTION, and that is not an omission. Adding
+ * `(?![A-Za-z0-9])` here was measured against these fixtures: FOUR of them go
+ * red, three of the six under "words a longer form must not hide" plus the
+ * justification fixture that depends on one of those three. The needle list is
+ * heterogeneous -- seven whole phrases, one ending in an underscore, one
+ * ending in a colon -- and one symmetric rule cannot serve all three shapes.
+ *
+ * THE OTHER THREE OF THOSE SIX SURVIVE THAT MUTATION, and the reason is worth
+ * knowing before anyone trusts them: a DIFFERENT needle in the list catches
+ * the same subject. They pin the intent -- these forms must stay caught -- but
+ * they do not discriminate a trailing assertion, so a reader counting red
+ * fixtures should count four and not six. Measuring one needle at a time
+ * against its own fixture, rather than the whole list against the message,
+ * is what makes that number look like six.
+ *
+ * THE ACCEPT CASES ARE THE HALF THAT PROVES THE CHANGE. Fixtures that must all
+ * be REJECTED cannot tell this matcher from the one it replaced, nor from one
+ * that rejects everything; the accepted ones are the only fixtures whose
+ * verdict differs between the two. They are derived mechanically, not
+ * eyeballed: `/usr/share/dict/words` (american-english, 74744 entries after
+ * dropping possessives) was searched for every word ending in each needle's
+ * leading alphanumeric run. Six of the nine needles yield nothing at all, and
+ * that absence is the reason they get no accept fixture rather than an
+ * oversight.
+ *
+ * NO NEEDLE IS SPELLED OUT HERE. Every fixture is built from
+ * `decodedNeedles()`, for the same reason the list is encoded at all.
+ */
+{
+  const n = decodedNeedles();
+  const commit = (subject: string): Commit => ({
+    ...CONFORMING,
+    message: `${subject}\n\nA body about the change.\n\n${TRAILER}\n`,
+  });
+  const flip = (s: string) =>
+    s === s.toLowerCase() ? s.toUpperCase() : s.toLowerCase();
+  const caught = (subject: string) =>
+    problemsWith(commit(subject)).some((p) => p.rule === RULES.strings);
+
+  // Eight positions per needle. Reported one line per needle rather than one
+  // per position, but a failure names the position that failed, so no needle
+  // and no position can pass unexamined.
+  for (let i = 0; i < n.length; i++) {
+    const x = n[i] ?? "";
+    const positions: [string, string][] = [
+      ["opening the subject", `${x} and then some words`],
+      ["after a colon", `Change something: ${x} again`],
+      ["after a comma", `Change something, ${x} again`],
+      ["after an em dash", `Change something — ${x} again`],
+      ["between plain spaces", `Change the thing ${x} in passing`],
+      ["in the other case", `Change the thing ${flip(x)} in passing`],
+      [
+        "in the body, past a newline",
+        `Change the thing\n\nThe body says ${x}.`,
+      ],
+      ["hyphen-adjacent", `Change the thing re-${x} in passing`],
+    ];
+    const missed = positions.filter(([, subject]) => !caught(subject));
+    const what =
+      `control: needle #${i} is caught in all ${positions.length} positions`;
+    if (missed.length === 0) pass(what);
+    else fail(what, `not caught ${missed.map(([where]) => where).join(", ")}`);
+  }
+
+  // Words a longer form must not hide. These are the six the measured
+  // alternative -- a symmetric word boundary -- would have stopped catching.
+  // Two are identifiers built on a needle that is a prefix by design; four are
+  // ordinary derivations of a whole-word needle.
+  for (
+    const [what, subject] of [
+      [
+        "an identifier built on the prefix needle",
+        `Read ${n[3]}PORT at startup`,
+      ],
+      [
+        "a second identifier on the same prefix",
+        `Set ${n[3]}ROOT before running`,
+      ],
+      ["a needle behind an underscore", `Rename the my_${n[2]} module`],
+      ["a needle in the plural", `Drop the ${n[1]}s`],
+      [
+        "a needle inside a longer word of its own family",
+        `Ask the ${n[7]}sitory`,
+      ],
+      ["a needle pluralised mid-phrase", `Chase the ${n[8]}s in latency`],
+    ] satisfies [string, string][]
+  ) {
+    const label = `control: ${what} is still caught`;
+    if (caught(subject)) pass(label);
+    else fail(label, "the longer form hid the needle");
+  }
+
+  {
+    // One message carrying the same needle twice, once as the tail of an
+    // ordinary word and once on its own. A matcher that stops at the first
+    // occurrence, or that reports the one it found rather than the one that
+    // matters, passes every other fixture here and fails this one.
+    const label =
+      "control: a needle that appears falsely and then truly is rejected";
+    const subject = `Fix a bug im${n[6]} the log, then ${n[6]} the other tree`;
+    if (caught(subject)) pass(label);
+    else fail(label, "the false occurrence masked the true one");
+  }
+
+  {
+    // THE FIXTURE THAT TESTS THE JUSTIFICATION RATHER THAN THE RULE.
+    // Accepting `re` + needle #6 rests on a claim: a message that really does
+    // leak provenance does not leak it through that one phrase alone, because
+    // the naming needles around it fire. This is that claim as a check. If it
+    // ever goes red, the accept case below it is wider than it was ruled to
+    // be.
+    const label =
+      "control: a real leak carrying the accepted form is still rejected";
+    const subject = `Fix the crash first re${n[6]} the ${n[7]}sitory`;
+    if (caught(subject)) pass(label);
+    else fail(label, "a provenance leak got through on the accepted form");
+  }
+
+  // The accepted half, derived from the word-list hunt described above.
+  for (
+    const [what, subject] of [
+      [
+        "the subject this control was written for",
+        `Let the package be im${n[6]} a non-file: URL`,
+      ],
+      [
+        "the same word in the other direction",
+        `A symbol ex${n[6]} the library`,
+      ],
+      // ACCEPTED ON PURPOSE, not by accident and not as a side effect of the
+      // class. `re` + needle #6 is ordinary English that honest commit
+      // messages will carry, and a message that genuinely leaks provenance
+      // trips one of the naming needles as well -- which is what the fixture
+      // immediately above checks, so this gap has a live guard on it rather
+      // than a paragraph of reassurance.
+      [
+        "ordinary English accepted deliberately",
+        `An error re${n[6]} JS, never unwound`,
+      ],
+      ["a third word of the same family", `Rows trans${n[6]} the other table`],
+      [
+        "a needle hidden inside a longer ordinary word",
+        `Keep the trans${n[7]} we have`,
+      ],
+      // Mechanically derived and frankly not idiomatic: the hunt found words
+      // ending in this needle's leading run, and this is one of them with the
+      // rest of the needle appended. It is kept because it is what the
+      // derivation printed, and because it discriminates -- the old matcher
+      // rejected it.
+      [
+        "the hunt's only candidate for the hyphenated needle",
+        `Fit a roof${n[0]} to it`,
+      ],
+    ] satisfies [string, string][]
+  ) {
+    const label = `control: ${what} is accepted`;
+    if (!caught(subject)) pass(label);
+    else fail(label, "an ordinary word was read as a needle");
+  }
 }
 
 console.log(`\ncommits after ${BASELINE}\n`);
