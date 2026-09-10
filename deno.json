@@ -63,7 +63,7 @@
       "command": "vendor/smoke_test.sh"
     },
     "vendor:probe": {
-      "description": "Report which SQLite capabilities a libsqlite3 actually has, side by side. With no arguments it compares the prebuilt @db/sqlite downloads, the system library and the vendored build. Needs --allow-ffi.",
+      "description": "Report which SQLite capabilities a libsqlite3 actually has, side by side. With no arguments it compares the system library and the vendored build. Needs --allow-ffi.",
       "command": "deno run --unstable-ffi --allow-ffi --allow-env --allow-read vendor/probe.ts"
     },
     "vendor:session-demo": {

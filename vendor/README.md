@@ -45,32 +45,40 @@ reintroduce the same crash from the other direction.
 
 ## The tasks
 
+The one task that works from an installed package, because `build.sh` is one of
+the two files here that ships:
+
 ```sh
 deno task vendor:build                  # build for this machine
 deno task vendor:build -- --arch aarch64  # cross-compile
-deno task vendor:smoke                  # compile a C test against it and RUN it
-deno task vendor:smoke -- --arch aarch64  # ... under qemu-user
-deno task vendor:probe                  # capability table, side by side
-deno task vendor:session-demo           # SESSION round trip, end to end
 ```
 
-`vendor:probe` and `vendor:session-demo` take an optional library path, so they
-work as general-purpose tools against any `libsqlite3` on the machine — which is
-the point: they answer "what does this library actually give me" without a
-segfault being the way you find out.
+The rest of this directory is development apparatus and stays in the repository.
+From a checkout, `vendor:smoke` compiles a C test against a built library and
+runs it (add `-- --arch aarch64` to run the cross-built one under qemu-user),
+`vendor:probe` prints the capability table side by side, and
+`vendor:session-demo` drives a SESSION round trip end to end. The probe and the
+demo take an optional library path, so they work against any `libsqlite3` on the
+machine — which is the point: they answer "what does this library actually give
+me" without a segfault being the way you find out. Neither runs in the test
+suite: both need `--unstable-ffi --allow-ffi`, and CI has no committed library
+to point them at.
 
-Neither is in `deno task test`: both need `--unstable-ffi --allow-ffi`, and CI
-has no committed library to point them at.
+Of this directory only `build.sh` and this file are published, which is why
+those three are described above rather than handed to you as command lines:
+`test/publish_manifest.ts` fails if any shipped file tells a reader to run a
+task whose script the package leaves out. The rule is deliberately general,
+because the way this went wrong was not a broken document. It was a boundary
+moving underneath a document that was true when it was written, with nothing
+watching the relationship between the two.
 
-**These tasks run from a checkout, not from an installed package.** Of this
-directory only `build.sh` and this file are published; the probe, the demo and
-the smoke test are development apparatus that no shipped code reaches, and
-shipping them would put files in the package that nothing in the package can
-use. What a consumer gets is the one thing they might actually need from here:
-the ability to rebuild the native library themselves, from the package they
-already have, without going and finding a repository first. The shipped set is
-pinned in `test/publish_manifest.ts` in both directions, so dropping `build.sh`
-fails exactly as loudly as re-adding a demo.
+What a consumer gets from here is the one thing they might actually need: the
+ability to rebuild the native library themselves, from the package they already
+have, without going and finding a repository first. Shipping the probe, the demo
+or the smoke test alongside it would put files in the package that nothing in
+the package can use. The shipped set is pinned in `test/publish_manifest.ts` in
+both directions, so dropping `build.sh` fails exactly as loudly as re-adding a
+demo.
 
 ## What is built
 

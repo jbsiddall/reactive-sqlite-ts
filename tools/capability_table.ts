@@ -100,7 +100,7 @@ const PINNED = {
 /** How each column's library is found. Stable across machines; the path is not. */
 const PROVENANCE: Record<string, string> = {
   "system":
-    "the path `resolveLibPath()` returns — the library `deno task test` runs against",
+    "the path `resolveLibPath()` returns — the library the test suite runs against",
   "vendored": "`vendor/lib/<target>/`, built by `deno task vendor:build`",
   "@db/sqlite prebuilt":
     "`$DENO_DIR/plug/`, downloaded by `@db/sqlite` 0.13.0 when `DENO_SQLITE_PATH` is unset",
@@ -312,8 +312,9 @@ function blockFor(columns: Column[], date: string): string {
     `Observed **${date}**, by running \`probeCapabilities()\` against each ` +
     `library at the path below, each in its own process. Every \`no\` is a ` +
     `measured negative — the symbol was looked for in that file, on that ` +
-    `date, and was not there — not an unchecked cell. Regenerate with ` +
-    `\`deno task table\`; \`deno task test:table\` fails if this is stale.`,
+    `date, and was not there — not an unchecked cell. In the repository the ` +
+    `\`table\` task rewrites this block and the \`test:table\` gate fails if ` +
+    `it is stale; neither script is in the published package.`,
     ``,
     table,
     ``,

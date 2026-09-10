@@ -352,6 +352,85 @@ function reproductionFindings(texts: FileTexts): Finding[] {
   return findings;
 }
 
+/**
+ * A `deno task <name>` written somewhere in a file that ships.
+ *
+ * THE GUARANTEE THAT STOPPED HOLDING AT A BOUNDARY WE DREW OURSELVES. Before
+ * the shipped set was trimmed, every file in `vendor/` was in the package, so
+ * a README telling the reader to run `deno task vendor:probe` was TRUE of the
+ * package. Trimming the set did not break that document -- it moved the
+ * boundary the document was describing, and nothing was watching the
+ * relationship between the two. `deno.json` ships and declares the task; the
+ * script it runs does not; the reader gets a missing-file error from a command
+ * the package's own documentation recommended.
+ *
+ * So the general form is asserted rather than the instance: no shipped file
+ * may tell a reader to run a task whose script the package leaves out. It is
+ * checked against the shipped set the dry-run reports, never against the
+ * exclude patterns -- the patterns are the mechanism, the file list is the
+ * outcome, and a check that read the patterns would agree with them by
+ * construction.
+ *
+ * Writing `deno task X` is what makes it a recommendation. A file may still
+ * discuss a repository-only task; it may not hand the reader a command line
+ * for one.
+ */
+interface Recommendation {
+  readonly file: string;
+  readonly task: string;
+}
+
+/** Every task a file hands the reader as a runnable command. */
+function recommendationsIn(file: string, text: string): Recommendation[] {
+  const seen = new Set<string>();
+  for (const m of text.matchAll(/deno task\s+([A-Za-z0-9:_-]+)/g)) {
+    const task = m[1];
+    if (task !== undefined) seen.add(task);
+  }
+  return [...seen].sort().map((task) => ({ file, task }));
+}
+
+/**
+ * The local files a task's command line runs.
+ *
+ * Resolved from the command rather than guessed from the task's name: the
+ * relationship being asserted is recommended-task to shipped-script, and it
+ * has to hold for a task that has nothing to do with `vendor/`.
+ */
+function scriptsOf(command: string): string[] {
+  return command.split(/\s+/)
+    .filter((token) => !token.startsWith("-"))
+    .filter((token) => /^[A-Za-z0-9_./@-]+\.(ts|js|mjs|sh|c)$/.test(token));
+}
+
+/**
+ * Whether every task a shipped file recommends is one the package can run.
+ *
+ * Pure, so the fixtures below run the same code the real tree does.
+ */
+function taskFindings(
+  recommendations: readonly Recommendation[],
+  commands: Readonly<Record<string, string>>,
+  shipped: readonly string[],
+): Finding[] {
+  const have = new Set(shipped);
+  return recommendations.map(({ file, task }) => {
+    const name = `${file} recommends only tasks the package can run: ${task}`;
+    const command = commands[task];
+    if (command === undefined) {
+      return bad(name, `deno.json declares no task \`${task}\``);
+    }
+    const scripts = scriptsOf(command);
+    const absent = scripts.filter((s) => !have.has(s)).sort();
+    return absent.length === 0 ? ok(name) : bad(
+      name,
+      `\`deno task ${task}\` runs ${
+        absent.join(", ")
+      }, which the package excludes. Ship the script, or stop writing it as a command someone can run.`,
+    );
+  });
+}
+
 /** Whether any pinned-never prefix leaked into the shipped set. */
 function forbiddenFindings(shipped: readonly string[]): Finding[] {
   return MUST_NOT_SHIP.map((prefix) => {
@@ -602,9 +681,20 @@ console.log("\nthe attribution block");
 /**
  * Delete a clause from a real file, tolerating however it is wrapped.
  *
- * Every occurrence, not the first. A clause that appears twice and is deleted
- * once is still present, so the fixture would go green having proved nothing
- * -- the failure mode this whole file exists to refuse.
+ * Every occurrence, not the first, and that is measured rather than reasoned.
+ * The regexp was written without `g` first, and the deletion fixtures were run
+ * against the real files: 61 passed, 7 failed, and all seven failures were
+ * deletion controls reporting that the checker had ACCEPTED a file the fixture
+ * had just damaged. The counts behind them, in `build.sh` / `README.md`:
+ * `SQLITE_ENABLE_SESSION` 2/3, `SQLITE_ENABLE_PREUPDATE_HOOK` 2/2,
+ * `build_manifest.json` 2/2, `build.sh` 1/13, `Release assets` 0/2.
+ *
+ * The mechanism is worth stating because it is not the obvious one. The
+ * `damaged === text` guard does not catch this: one occurrence IS removed, so
+ * the text really does change and the fixture looks well-formed. What survives
+ * is the clause, in the occurrences the guard never looked at, so the content
+ * check stays green and the fixture proves nothing -- the failure mode this
+ * whole file exists to refuse.
  */
 function withoutClause(text: string, needle: string): string {
   const pattern = flat(needle)
@@ -666,6 +756,109 @@ if (noticeText === null) {
         untidied === noticeText
           ? "the fixture deleted nothing, so it proves nothing"
           : `only ${lost} clauses went red`,
+      ),
+  );
+}
+
+/**
+ * Task commands the fixtures run against.
+ *
+ * Deliberately not the real `deno.json`: a control whose expected answer moves
+ * when the tasks are edited is a control that will one day be re-pinned rather
+ * than read. The real task table is checked against the real shipped set
+ * below; these four fix the behaviour of the comparison itself.
+ */
+const TASK_FIXTURE_COMMANDS: Readonly<Record<string, string>> = {
+  "vendor:build": "vendor/build.sh",
+  "vendor:probe": "deno run --unstable-ffi --allow-ffi vendor/probe.ts",
+  "test": "deno run --allow-read test/suite.ts semantic",
+  "fmt": "deno fmt",
+};
+
+const TASK_FIXTURE_SHIPPED: readonly string[] = [
+  "vendor/build.sh",
+  "vendor/README.md",
+];
+
+const TASK_FIXTURES: readonly {
+  readonly name: string;
+  readonly task: string;
+  /** Empty means the fixture must be ACCEPTED. */
+  readonly expect: string;
+}[] = [
+  {
+    name: "a task whose script ships is accepted",
+    task: "vendor:build",
+    expect: "",
+  },
+  {
+    name: "a task that runs no local script at all is accepted",
+    task: "fmt",
+    expect: "",
+  },
+  {
+    name: "a recommended task whose script is excluded is rejected",
+    task: "vendor:probe",
+    expect: "vendor/probe.ts",
+  },
+  {
+    name: "the same holds for a task nowhere near vendor/",
+    task: "test",
+    expect: "test/suite.ts",
+  },
+  {
+    name: "a recommendation for a task that does not exist is rejected",
+    task: "no-such-task",
+    expect: "declares no task",
+  },
+];
+
+console.log("\ntask recommendations in shipped files");
+for (const fixture of TASK_FIXTURES) {
+  const [f] = taskFindings(
+    [{ file: "fixture.md", task: fixture.task }],
+    TASK_FIXTURE_COMMANDS,
+    TASK_FIXTURE_SHIPPED,
+  );
+  const name = `control: ${fixture.name}`;
+  if (f === undefined) {
+    record(bad(name, "the comparison returned no finding at all"));
+  } else if (fixture.expect === "") {
+    record(f.ok ? ok(name) : bad(name, `rejected it: ${f.detail}`));
+  } else {
+    record(
+      !f.ok && f.detail.includes(fixture.expect) ? ok(name) : bad(
+        name,
+        f.ok ? "accepted it" : `rejected it without naming it: ${f.detail}`,
+      ),
+    );
+  }
+}
+
+// The reader, separately: a comparison that is never handed a recommendation
+// agrees with everything.
+{
+  const found = recommendationsIn(
+    "fixture.md",
+    "run `deno task vendor:build`, then deno task  test, then vendor:build again",
+  ).map((r) => r.task);
+  record(
+    found.join(",") === "test,vendor:build"
+      ? ok(
+        "control: every recommendation is found once, whatever the spacing",
+      )
+      : bad(
+        "control: every recommendation is found once, whatever the spacing",
+        `found ${found.join(",") || "nothing"}`,
+      ),
+  );
+  const none = recommendationsIn("fixture.md", "no commands here at all");
+  record(
+    none.length === 0
+      ? ok("control: a file that recommends nothing yields nothing")
+      : bad(
+        "control: a file that recommends nothing yields nothing",
+        `found ${none.map((r) => r.task).join(", ")}`,
       ),
   );
 }
@@ -847,6 +1040,70 @@ if (out.code !== 0) {
         `the entry point's module graph was read (${reachable.paths.length} local modules)`,
       ));
       record(graphFindings(shipped, reachable.paths));
+    }
+
+    // Task recommendations, resolved against the set that actually shipped.
+    const commands = ((): Readonly<Record<string, string>> | string => {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(Deno.readTextFileSync(`${root}/deno.json`));
+      } catch (e) {
+        return `deno.json could not be read: ${String(e)}`;
+      }
+      if (typeof parsed !== "object" || parsed === null) {
+        return "deno.json did not parse to an object";
+      }
+      const tasks: unknown = Reflect.get(parsed, "tasks");
+      if (typeof tasks !== "object" || tasks === null) {
+        return "deno.json declares no tasks object";
+      }
+      const out: Record<string, string> = {};
+      for (const name of Object.keys(tasks)) {
+        const value: unknown = Reflect.get(tasks, name);
+        if (typeof value === "string") {
+          out[name] = value;
+          continue;
+        }
+        if (typeof value === "object" && value !== null) {
+          const command: unknown = Reflect.get(value, "command");
+          if (typeof command === "string") out[name] = command;
+        }
+      }
+      return out;
+    })();
+
+    if (typeof commands === "string") {
+      record(bad("deno.json's task table was read", commands));
+    } else {
+      record(ok(
+        `deno.json's task table was read (${
+          Object.keys(commands).length
+        } tasks)`,
+      ));
+      const recommendations: Recommendation[] = [];
+      for (const file of shipped) {
+        if (!/\.(md|ts|js|mjs|sh|json)$/.test(file)) continue;
+        let text: string;
+        try {
+          text = Deno.readTextFileSync(`${root}/${file}`);
+        } catch {
+          continue;
+        }
+        recommendations.push(...recommendationsIn(file, text));
+      }
+      if (recommendations.length === 0) {
+        record(bad(
+          "shipped files were read for task recommendations",
+          "not one shipped file names a task, which is not what this tree looks like -- the reader has probably stopped matching",
+        ));
+      } else {
+        record(ok(
+          `shipped files were read for task recommendations (${recommendations.length} found)`,
+        ));
+        for (const f of taskFindings(recommendations, commands, shipped)) {
+          record(f);
+        }
+      }
     }
   }
 }

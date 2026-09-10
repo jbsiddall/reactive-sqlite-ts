@@ -169,8 +169,9 @@ downloads for itself when `DENO_SQLITE_PATH` is unset. Each cell is the value
 Observed **2026-09-09**, by running `probeCapabilities()` against each library
 at the path below, each in its own process. Every `no` is a measured negative —
 the symbol was looked for in that file, on that date, and was not there — not an
-unchecked cell. Regenerate with `deno task table`; `deno task test:table` fails
-if this is stale.
+unchecked cell. In the repository the `table` task rewrites this block and the
+`test:table` gate fails if it is stale; neither script is in the published
+package.
 
 | Capability      | system 3.45.1 | vendored 3.53.4 | @db/sqlite prebuilt 3.46.0 |
 | --------------- | ------------- | --------------- | -------------------------- |
@@ -184,7 +185,7 @@ if this is stale.
 | `collation`     | yes           | yes             | yes                        |
 | `normalizedSql` | no            | yes             | no                         |
 
-- `system` — the path `resolveLibPath()` returns — the library `deno task test`
+- `system` — the path `resolveLibPath()` returns — the library the test suite
   runs against
 - `vendored` — `vendor/lib/<target>/`, built by `deno task vendor:build`
 - `@db/sqlite prebuilt` — `$DENO_DIR/plug/`, downloaded by `@db/sqlite` 0.13.0
