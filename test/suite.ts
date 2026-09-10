@@ -20,6 +20,7 @@
  */
 import { resolveLibPath } from "../src/lib_path.ts";
 import { CASES } from "./crash_cases.ts";
+import { elisionMarker, excerpt, EXCERPT_BUDGET } from "./excerpt.ts";
 import { PROPERTIES, PROPERTY_RUNS, PROPERTY_SEED } from "./properties.ts";
 
 const LIB = resolveLibPath();
@@ -108,32 +109,6 @@ const FLAGS = [
 const CASE_SCRIPT = new URL("./crash_cases.ts", import.meta.url).pathname;
 /** Generous enough for the slowest legitimate case, short enough to catch a hang. */
 const CASE_TIMEOUT_MS = 60_000;
-
-// How much of a failing child's output goes on the FAIL line, from each end.
-// 400 each because a Deno uncaught error's message line plus the first few
-// stack frames fit in that, and 400 from the end keeps everything the previous
-// tail-only excerpt showed with room to spare. Both ends, never one: the
-// message is at the TOP of an uncaught error and the frames are at the bottom,
-// so a tail-only excerpt deletes the diagnosis and keeps the scenery.
-const EXCERPT_HEAD = 400;
-const EXCERPT_TAIL = 400;
-
-/**
- * The part of a child's output that a FAIL line carries.
- *
- * Shorter than the two budgets together and it is printed once, whole — a
- * truncation that prints its input twice on the short path is worse than no
- * truncation. Longer, and the elision is marked with the count of what was
- * dropped, so a reader can see that something was cut instead of wondering.
- */
-function excerpt(raw: string): string {
-  const text = raw.trim();
-  if (text.length <= EXCERPT_HEAD + EXCERPT_TAIL) return text;
-  const elided = text.length - EXCERPT_HEAD - EXCERPT_TAIL;
-  return `${
-    text.slice(0, EXCERPT_HEAD)
-  }\n... [${elided} characters elided] ...\n${text.slice(-EXCERPT_TAIL)}`;
-}
 
 /** Run one crash case in a child process and assert on how it died. */
 async function runCase(name: string): Promise<void> {
@@ -4280,6 +4255,67 @@ const SEMANTIC: Record<string, () => void> = {
     const none = extractDependencies(db, "SELECT 1; SELECT v FROM t", opts);
     check("  a tail after SELECT 1 is not 'none'", none.kind, "unknown");
     db.close();
+  },
+
+  // WHAT THESE DO NOT ESTABLISH. They exercise the function; they do not prove
+  // either branch of `runCase` calls it; the only evidence the branches call it
+  // is a hand demonstration that no longer runs. A passing assertion that looks
+  // like coverage of the thing it does not cover is worse than no assertion,
+  // because it answers the question a future reader would otherwise go and ask.
+  "excerpt keeps both ends and marks what it dropped"() {
+    const head = "HEAD-MARKER";
+    const tail = "TAIL-MARKER";
+    const budget = 32;
+    const long = head + "x".repeat(500) + tail;
+    const cut = excerpt(long, budget);
+    check("  head survives", cut.startsWith(head), true);
+    check("  tail survives", cut.endsWith(tail), true);
+    const dropped = long.length - budget * 2;
+    check(
+      "  elision is marked with the count",
+      cut.includes(elisionMarker(dropped)),
+      true,
+    );
+    // Above the tail, not appended after it: a marker below the last line reads
+    // as part of the output rather than as a note about what is missing.
+    check(
+      "  the marker sits above the tail",
+      cut.indexOf(elisionMarker(dropped)) < cut.lastIndexOf(tail),
+      true,
+    );
+    check(
+      "  nothing but the marker is added",
+      cut.length,
+      budget * 2 + elisionMarker(dropped).length + 2,
+    );
+  },
+
+  "excerpt prints a short input once, whole"() {
+    const short = "SHORT-MARKER all of it";
+    const cut = excerpt(short, 32);
+    check("  returned whole", cut, short);
+    check("  printed once", cut.split("SHORT-MARKER").length - 1, 1);
+    check("  no elision marker", cut.includes("elided"), false);
+    check("  input is trimmed", excerpt(`  ${short}  `, 32), short);
+  },
+
+  "excerpt elides at exactly one character over the budget"() {
+    const budget = 16;
+    const atLimit = "y".repeat(budget * 2);
+    check("  at the boundary it is whole", excerpt(atLimit, budget), atLimit);
+    const overBy1 = "y".repeat(budget * 2 + 1);
+    check(
+      "  one character more is elided",
+      excerpt(overBy1, budget).includes(elisionMarker(1)),
+      true,
+    );
+    // The default budget is a real value the call sites rely on, not a shape.
+    check("  the default budget", EXCERPT_BUDGET, 400);
+    check(
+      "  the default applies when none is given",
+      excerpt("z".repeat(EXCERPT_BUDGET * 2)).length,
+      EXCERPT_BUDGET * 2,
+    );
   },
 
   "SqliteHooksError is exported and instanceof-able"() {

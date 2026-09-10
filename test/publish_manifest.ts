@@ -49,6 +49,8 @@
  * Run: deno task test:publish
  */
 
+import { excerpt } from "./excerpt.ts";
+
 /**
  * Every file the package publishes today, in full.
  *
@@ -479,7 +481,7 @@ function reachableFromEntryPoint(): { paths: string[] } | { why: string } {
   if (out.code !== 0) {
     return {
       why: `deno info exited ${out.code}: ${
-        new TextDecoder().decode(out.stderr).trim().slice(-500)
+        excerpt(new TextDecoder().decode(out.stderr), 500)
       }`,
     };
   }
@@ -1007,7 +1009,7 @@ const text = new TextDecoder().decode(out.stdout) +
 if (out.code !== 0) {
   record(bad(
     "deno publish --dry-run",
-    `exited ${out.code}. Output:\n${text.trim().slice(-1500)}`,
+    `exited ${out.code}. Output:\n${excerpt(text, 1500)}`,
   ));
 } else {
   // Each shipped file is reported as an absolute file:// URL, one per line.
@@ -1023,7 +1025,7 @@ if (out.code !== 0) {
   if (shipped.length === 0) {
     record(bad(
       "the manifest was parsed",
-      `no file:// lines in:\n${text.slice(-1500)}`,
+      `no file:// lines in:\n${excerpt(text, 1500)}`,
     ));
   } else {
     record(ok("the manifest was parsed"));
