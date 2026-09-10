@@ -659,8 +659,10 @@ export type EventOptions = {
   /**
    * What to do about sqlite3_preupdate_hook, which is a COMPILE-TIME option
    * (`SQLITE_ENABLE_PREUPDATE_HOOK`) and is absent from many builds — including
-   * some macOS system libraries and, at the time of writing, @db/sqlite's own
-   * downloaded prebuilt.
+   * some macOS system libraries. The prebuilt library `@db/sqlite` 0.13.0
+   * downloaded (SQLite 3.46.0) also lacked it: measured 2026-09-09, before this
+   * package vendored its own driver, so that is a dated historical comparison
+   * and not a live configuration anyone using this package is in.
    *
    * - `"auto"` (default) — use it when the library exports it, and carry on
    *   without it when it does not. Read {@linkcode Subscription.capabilities}

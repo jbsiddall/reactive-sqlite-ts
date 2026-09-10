@@ -93,13 +93,17 @@ const check = (name: string, actual: unknown, wanted: unknown) => {
   else fail(name, `got ${a}, wanted ${w}`);
 };
 
+// The child's permissions come from this list alone — it is a fresh `deno run`,
+// not a fork, so nothing is inherited from the parent. `--allow-net` was here
+// and is not any more: the driver is vendored and nothing in a case reaches the
+// network. Do not add a permission back for a case that fails without it
+// without first asking what that case is doing.
 const FLAGS = [
   "--unstable-ffi",
   "--allow-ffi",
   "--allow-env",
   "--allow-read",
   "--allow-write",
-  "--allow-net",
 ];
 const CASE_SCRIPT = new URL("./crash_cases.ts", import.meta.url).pathname;
 /** Generous enough for the slowest legitimate case, short enough to catch a hang. */

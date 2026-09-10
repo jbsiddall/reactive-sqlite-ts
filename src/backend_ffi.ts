@@ -270,7 +270,7 @@ function openLibrary(
 ): Opened {
   if (typeof libPath !== "string" || libPath === "") {
     throw new SqliteHooksError(
-      "libPath must be the path of the libsqlite3 @db/sqlite loaded (the value of DENO_SQLITE_PATH). It has no default.",
+      "libPath must be the path of the libsqlite3 the driver loaded — the value DENO_SQLITE_PATH held when the driver was imported. It has no default.",
     );
   }
   let unavailable = want === "off"
@@ -311,7 +311,7 @@ function openLibrary(
   } catch (cause) {
     const why = cause instanceof Error ? cause.message : String(cause);
     throw new SqliteHooksError(
-      `Cannot use ${libPath} as libsqlite3: ${why}. It must be a shared library exporting the sqlite3_* hook API, and the same file @db/sqlite loaded.`,
+      `Cannot use ${libPath} as libsqlite3: ${why}. It must be a shared library exporting the sqlite3_* hook API, and the same file the driver loaded.`,
       { cause },
     );
   }

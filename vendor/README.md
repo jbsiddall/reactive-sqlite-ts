@@ -1,16 +1,20 @@
 # vendor — our own SQLite, built with the flags we need
 
-This library borrows the `sqlite3*` that `@db/sqlite` opened and calls SQLite
+This library borrows the `sqlite3*` that the driver opened and calls SQLite
 directly over FFI. That only works if the FFI dlopens **the same library the
 driver loaded**. When it does not, the handle belongs to a different build and
 the process dies of SIGSEGV with no message — verified here as exit 139.
 
-Left alone, `@db/sqlite` downloads its own prebuilt into `$DENO_DIR/plug/`, and
-`src/lib_path.ts` finds whatever `libsqlite3.so.0` the machine happens to have.
-Those are two different files by construction. Vendoring one library and
-pointing both at it removes the whole class.
+The driver in `driver/` reads `DENO_SQLITE_PATH` at import time and otherwise
+falls back to the build below; `src/lib_path.ts` finds whatever
+`libsqlite3.so.0` the machine happens to have. Left to their own defaults those
+are two different files, so one library, chosen once and given to both, removes
+the whole class.
 
-It also buys capabilities neither of those has. Measured on this container:
+It also buys capabilities the system library does not have. The table below was
+committed on 2026-09-09 and so was measured on or before that date; the commit
+date is a bound, not the measurement date, and nothing here has re-measured it
+since.
 
 ```
                                 @db/sqlite   system (Ubuntu)   vendored
@@ -24,9 +28,14 @@ sqlite3_normalized_sql          --           --                yes
                                 11/34        31/34             34/34
 ```
 
-**The prebuilt `@db/sqlite` downloads has no preupdate hook and no session
-extension at all.** That is the default path — what you get when nobody sets
-`DENO_SQLITE_PATH`. Every changeset feature is simply absent there.
+The first column is a **dated historical comparison, not a live configuration.**
+It is the library `@db/sqlite` 0.13.0 downloaded into `$DENO_DIR/plug/`, which
+was the default path back when this project depended on that package. It has no
+preupdate hook and no session extension at all, so every changeset feature was
+simply absent there. Since the driver was vendored into `driver/` nothing this
+package runs fetches that library, and no user of this package can end up on it;
+it is kept here because it is the only library anyone measured that genuinely
+lacks those symbols.
 
 ## Using it
 
@@ -138,8 +147,9 @@ Two independent proofs, both driving the real library:
 - `smoke_test.c` — the same round trip in C, so it can be cross-compiled and run
   under emulation on an architecture that has no Deno to hand.
 
-Both pass. Point either at the `@db/sqlite` prebuilt and you get a clear
-diagnostic naming the missing symbol instead of a crash.
+Both pass. Point either at a library without the session symbols — the prebuilt
+in the table above was the specimen — and you get a clear diagnostic naming the
+missing symbol instead of a crash.
 
 ## Multi-architecture distribution
 

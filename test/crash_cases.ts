@@ -10,7 +10,7 @@
  *
  * Run one directly:
  *   deno run --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write \
- *     --allow-net test/crash_cases.ts dispose-in-listener
+ *     test/crash_cases.ts dispose-in-listener
  */
 import { resolveLibPath } from "../src/lib_path.ts";
 import { runHardProperty } from "./hard_properties.ts";

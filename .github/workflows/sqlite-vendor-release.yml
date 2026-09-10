@@ -12,7 +12,8 @@
 # adds another 1.60 MiB that history can never drop. @db/sqlite has the same
 # problem and solves it the same way -- it publishes per-platform prebuilts as
 # release assets and fetches them at runtime via @denosaurs/plug. That is
-# working evidence from the exact library we are replacing, not a preference.
+# working evidence from the library this project's driver was vendored from,
+# not a preference.
 #
 # Every asset here has been executed before it is uploaded: x86_64 natively,
 # aarch64 under qemu-user. An artifact that has never run does not ship.

@@ -289,7 +289,6 @@ async function suitePasses(libPath: string): Promise<boolean> {
       "--allow-env",
       "--allow-read",
       "--allow-write",
-      "--allow-net",
       join(ROOT, "test", "suite.ts"),
       "semantic",
     ],

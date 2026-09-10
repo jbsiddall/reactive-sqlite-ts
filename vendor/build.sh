@@ -2,13 +2,12 @@
 #
 # Build a vendored libsqlite3 from the official SQLite amalgamation.
 #
-# Why: `@db/sqlite` downloads its own prebuilt SQLite, and our FFI dlopens
-# whatever libsqlite3 the machine happens to have. When those are two different
-# builds, the `sqlite3*` we borrow from the driver belongs to the other one and
-# the process dies of SIGSEGV with no message (verified: exit 139). Shipping one
-# library we control, and pointing both at it, removes that whole bug class --
-# and lets us compile in the optional features (SESSION, PREUPDATE_HOOK) that
-# neither the distro build nor the driver's prebuilt enables.
+# Why: the driver in `driver/` dlopens whatever libsqlite3 it is pointed at,
+# and the hook code in `src/` borrows the `sqlite3*` handle the driver opened.
+# When those two are different builds the process dies of SIGSEGV with no
+# message (verified: exit 139). Shipping one library we control, and defaulting
+# to it, removes that whole bug class -- and lets us compile in the optional
+# features (SESSION, PREUPDATE_HOOK) that a distro build does not enable.
 #
 # Re-runnable and hermetic apart from the network fetch: the source tarball is
 # pinned by version AND by the SHA3-256 sqlite.org publishes, and the build
@@ -67,7 +66,7 @@ FLAGS=(
   SQLITE_ENABLE_UPDATE_DELETE_LIMIT # UPDATE/DELETE ... ORDER BY ... LIMIT
   SQLITE_ENABLE_FTS4                # legacy FTS, so an existing db that uses it still opens
   SQLITE_SOUNDEX                    # soundex()
-  SQLITE_THREADSAFE=1               # serialized: what distro builds ship, what @db/sqlite expects
+  SQLITE_THREADSAFE=1               # serialized: what distro builds ship, and what `driver/` was written against
   SQLITE_MAX_VARIABLE_NUMBER=250000 # 3.32+ default is 32766; large bulk inserts hit that
   SQLITE_USE_ALLOCA                 # small win, no behaviour change
 )

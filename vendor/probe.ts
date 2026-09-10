@@ -3,9 +3,9 @@
  * you?
  *
  * Most SQLite capabilities are compile-time options, and a library never says
- * which ones it was built with. The distro's `libsqlite3.so.0`, the prebuilt
- * `@db/sqlite` downloads, and a library you built yourself all present the same
- * filename and the same `sqlite3_libversion()`, while differing in whether
+ * which ones it was built with. The distro's `libsqlite3.so.0`, a prebuilt some
+ * other package downloaded, and a library you built yourself all present the
+ * same filename and the same `sqlite3_libversion()`, while differing in whether
  * `sqlite3_preupdate_hook` exists at all. Finding that out by calling the symbol
  * and getting a segfault is the expensive way.
  *
@@ -457,11 +457,16 @@ export function systemLibrary(): string | undefined {
 }
 
 /**
- * The prebuilt `@db/sqlite` downloads for itself, if it has been downloaded.
+ * The prebuilt `@db/sqlite` downloaded for itself, if it is still in the plug
+ * cache on this machine.
  *
- * This is the library that actually gets loaded when nobody sets
- * DENO_SQLITE_PATH -- i.e. the default -- so it belongs in the comparison even
- * though it is a cache artefact. `@denosaurs/plug` stores it under
+ * This is a DATED HISTORICAL COMPARISON, not a live configuration. It was the
+ * library that got loaded when nobody set DENO_SQLITE_PATH, back when this
+ * project depended on that package; since the driver was vendored into
+ * `driver/` nothing here fetches it and no user of this package can end up on
+ * it. It stays in the comparison because it is a cache artefact anyone who ran
+ * the older code still has on disk, and the only library measured that
+ * genuinely lacks the session symbols. `@denosaurs/plug` stores it under
  * $DENO_DIR/plug/<host>/<sha256>.so beside a metadata.json naming the URL, so
  * the metadata is what identifies it; the hashed filename says nothing.
  *
