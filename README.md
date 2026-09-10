@@ -18,17 +18,49 @@ API, and `node:sqlite` (Node's builtin, also Deno's) offers `setAuthorizer` and
 the session extension but no update, commit or rollback hook. This library fills
 that one gap and nothing else.
 
-> **Status: pre-1.0, incomplete, API unstable.** Not on a registry yet. Some
-> events below are not implemented — see the table.
+> **Status: pre-1.0, incomplete, API unstable.** Not on a registry yet — until a
+> JSR publish, the TypeScript is consumed as source from this repository, pinned
+> to a commit. Some events below are not implemented — see the table.
 
 ## Install
 
-Nothing is published yet. Both lines below describe the first release.
+No registry yet. A consumer adds two things to its `deno.json`: an import map
+entry pointing this package's specifier at a pinned commit of this repository,
+and one entry for `@std/path`, which the package itself imports:
 
-```sh
-deno add jsr:@jbsiddall/reactive-sqlite   # planned
-npm  install reactive-sqlite              # planned; no npm package or build exists today
+```json
+{
+  "imports": {
+    "@jbsiddall/reactive-sqlite": "https://raw.githubusercontent.com/jbsiddall/reactive-sqlite-ts/c5ed7171a6031ceaffc6cf2cbd4b5bcd0e8879af/mod.ts",
+    "@jbsiddall/reactive-sqlite/driver": "https://raw.githubusercontent.com/jbsiddall/reactive-sqlite-ts/c5ed7171a6031ceaffc6cf2cbd4b5bcd0e8879af/driver/mod.ts",
+    "@std/path": "jsr:@std/path@^1"
+  }
+}
 ```
+
+The two entries mirror the package's exports exactly: the bare specifier maps to
+`mod.ts`, `@jbsiddall/reactive-sqlite/driver` to `driver/mod.ts`. There is no
+trailing-slash key. An import map does not append a default file to a directory
+prefix, so a subpath under one resolves to a directory URL, which
+`raw.githubusercontent.com` answers with a 404 — measured. Name each export.
+With that in place every import in this README resolves, and module loading
+needs no `--allow-net` — measured on 2026-09-10, Deno 2.9.6, x86_64 Linux, by
+importing this exact pinned commit through this import map into a scratch
+project and firing a hook from the downloaded release asset.
+
+**The `@std/path` entry is required, not tidy.** `driver/database.ts` and
+`src/vendored.ts` import it as a bare specifier; without an entry the import
+chain dies with `TypeError: Import "@std/path" not a dependency`, naming the
+file that hit it. One entry covers both sites; nothing else in the chain is
+bare, which was confirmed by the same run.
+
+**Pin a full commit SHA.** `raw.githubusercontent.com` resolves short prefixes
+(`c5ed717` was measured to return 200 and byte-identical content), but a prefix
+is only unambiguous until it isn't, and `main` changes under you. A full SHA
+names one tree forever.
+
+A JSR publish is planned and will replace this section when it happens. There is
+no npm package and none is planned.
 
 Registering hooks means calling `libsqlite3` directly, so a Deno process needs
 FFI permission:
@@ -39,10 +71,9 @@ deno run --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write app.t
 
 ### Installing the prebuilt library, in three steps
 
-**No release has been tagged yet**, so every URL below is a 404 today. The steps
-are the ones the first `sqlite-vendor-v*` tag makes work; the asset names and
-the URL shape are already frozen by the release workflow, which is why they can
-be written down before the tag exists.
+The asset names and the URL shape are frozen by the release workflow; the tagged
+release `sqlite-vendor-v3.53.4` is live, and the steps below are the ones every
+`sqlite-vendor-v*` tag makes work.
 
 A tagged release publishes, for each target, a `.tar.gz` and a bare
 `libsqlite3-<target>.so`. These steps use the bare `.so`, because `Deno.dlopen`
@@ -1129,7 +1160,7 @@ Compare the two sets directly and nothing over such a table ever matches.
 `captureSchemaMap(db)` reads the schema once and answers both directions:
 
 ```ts
-import { captureSchemaMap } from "jsr:@jbsiddall/reactive-sqlite";
+import { captureSchemaMap } from "@jbsiddall/reactive-sqlite";
 
 const map = captureSchemaMap(db);
 map.resolveTable("ft_content"); // { kind: "shadow", canonical: "ft", ... }
@@ -1164,7 +1195,7 @@ decides when a new reading is taken and takes it. It is a trigger, not a policy
 engine: there is no subscription registry and nothing is re-run.
 
 ```ts
-import { watchSchema, withEvents } from "jsr:@jbsiddall/reactive-sqlite";
+import { watchSchema, withEvents } from "@jbsiddall/reactive-sqlite";
 
 let watch;
 const sub = withEvents(db, (e) => watch.observe(e), LIB, { authorize: true });
@@ -1221,7 +1252,7 @@ statement, so nothing is read and nothing is written.
 import {
   captureSchemaMap,
   extractDependencies,
-} from "jsr:@jbsiddall/reactive-sqlite";
+} from "@jbsiddall/reactive-sqlite";
 
 const map = captureSchemaMap(db);
 extractDependencies(db, "SELECT v FROM t", { schemaMap: map, libPath: LIB });
