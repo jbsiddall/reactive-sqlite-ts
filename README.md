@@ -37,11 +37,113 @@ FFI permission:
 deno run --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write app.ts
 ```
 
+### Installing the prebuilt library, in three steps
+
+**No release has been tagged yet**, so every URL below is a 404 today. The steps
+are the ones the first `sqlite-vendor-v*` tag makes work; the asset names and
+the URL shape are already frozen by the release workflow, which is why they can
+be written down before the tag exists.
+
+A tagged release publishes, for each target, a `.tar.gz` and a bare
+`libsqlite3-<target>.so`. These steps use the bare `.so`, because `Deno.dlopen`
+takes a path to a shared object and cannot be handed an archive. Take the
+tarball only when you also want the `build_manifest.json` beside it — the exact
+SQLite version, the compile flags and the source checksums.
+
+`<target>` is `<os>-<arch>-<libc>`, and **the only two that exist are
+`linux-x86_64-gnu` and `linux-aarch64-gnu`.** Both release runners are glibc, so
+every published asset is `-gnu`. **There is no musl build.** Substituting `musl`
+into the names below is not a fallback and not a slower path: the URL resolves
+to nothing and the download is an HTTP 404. Alpine and any other musl host has
+to build its own with `vendor/build.sh`, which ships inside the package.
+
+**1. Download the `.so` for your target.**
+
+```sh
+TAG=sqlite-vendor-v3.53.4
+TARGET=linux-x86_64-gnu   # or linux-aarch64-gnu; there is no musl target
+BASE=https://github.com/jbsiddall/reactive-sqlite-ts/releases/download/$TAG
+
+curl -fL -O "$BASE/libsqlite3-$TARGET.so"
+curl -fL -O "$BASE/SHA256SUMS"
+```
+
+Deno permissions for this step: **none.** It is `curl`, not a Deno program. Do
+it from Deno instead and it costs `--allow-net` for `github.com` plus whatever
+host the release redirect lands on, and `--allow-write` for the directory you
+save into — which is the reason the step is written with `curl`, where the
+answer does not depend on a redirect target this document cannot pin.
+
+**2. Verify what you downloaded against `SHA256SUMS`.**
+
+```sh
+grep " libsqlite3-$TARGET\.so$" SHA256SUMS | sha256sum -c -
+```
+
+Deno permissions for this step: **none**, for the same reason.
+
+`SHA256SUMS` covers all four assets, so a plain `sha256sum -c SHA256SUMS`
+reports `FAILED open or read` for the three you did not download and exits 1.
+Filtering to the one line you can check is what makes a clean exit mean
+something. If the `grep` matches nothing — a mistyped target, `musl` —
+`sha256sum` says `no properly formatted checksum lines found` and still exits 1,
+so a typo cannot read as a pass.
+
+**`SHA256SUMS` is served from the same origin as the assets and is not signed.**
+It detects a corrupted or truncated download. It is not a tamper control and not
+evidence of provenance: whoever could alter the `.so` on that origin could
+recompute the line beside it. Treat it as an integrity check on the transfer and
+nothing else.
+
+**3. Point `DENO_SQLITE_PATH` at the file and run.**
+
+```sh
+export DENO_SQLITE_PATH="$PWD/libsqlite3-$TARGET.so"
+
+deno run --unstable-ffi --allow-ffi --allow-env=DENO_SQLITE_PATH \
+  --allow-read=app.db --allow-write=app.db app.ts
+```
+
+Those are the runtime flags, and each is the narrowest form that works —
+measured on 2026-09-10, x86_64 Linux, Deno 2.9.6:
+
+- `--allow-ffi` **cannot be scoped to the library.**
+  `--allow-ffi=$DENO_SQLITE_PATH` is enough to `dlopen` the file and then dies
+  at the first pointer read with `NotCapable: Requires ffi access`, because
+  reading a C string through a pointer is not covered by a path-scoped grant.
+  Unscoped is not laziness here; it is the only form that runs.
+- `--allow-env=DENO_SQLITE_PATH` is **required, not optional.** Omit it and the
+  process does not fall back quietly — it throws
+  `NotCapable: Requires env access to "DENO_SQLITE_PATH"` before opening
+  anything.
+- `--allow-read` / `--allow-write` are scoped to your database file. An
+  in-memory database needs neither.
+
+The `.so` itself needs no `--allow-read`; loading it is charged to
+`--allow-ffi`.
+
+**Where step 3 is void as a way of choosing anything.** On a host whose `deno`
+links `libsqlite3` itself — a nixpkgs-provided Deno is the case measured here —
+that binary's own `DT_NEEDED` `libsqlite3` answers every `dlopen`, whatever path
+you exported and whatever `SONAME` the file you named carries. As a way of
+SELECTING which SQLite answers, `DENO_SQLITE_PATH` is void there. It is **not**
+inert: naming a library that is not the one answering is how the process dies of
+`SIGSEGV` — exit 139, no exception, no message. That is what pointing it at this
+project's vendored build under a nixpkgs `deno` was measured to do, and a
+downloaded asset is that same build. Use the library that is already answering
+instead — see [On Nix](#on-nix).
+
+How far that measurement reaches: x86_64 only, one nixpkgs store path
+(`xcv2rrfly0za0kdhzvmc0j2a6074zkib-sqlite-3.53.3`), which is what that runner's
+flake pin resolved to on 2026-09-10. Another revision resolves another one, and
+nothing here measures it.
+
 ### The native library
 
-You supply `libsqlite3` yourself and point `DENO_SQLITE_PATH` at it **before**
-importing the driver. Automatic download of a matching library from a GitHub
-Release is planned; it does not exist yet.
+Instead of the release asset above you can point `DENO_SQLITE_PATH` at a
+`libsqlite3` already on the machine — it must be set **before** the driver is
+imported either way. Automatic download of a matching library at run time is
+planned; it does not exist yet, which is why the three steps above are manual.
 
 ```sh
 export DENO_SQLITE_PATH=/usr/lib/x86_64-linux-gnu/libsqlite3.so.0            # Linux

@@ -22,6 +22,7 @@ import { resolveLibPath } from "../src/lib_path.ts";
 import { CASES } from "./crash_cases.ts";
 import { elisionMarker, excerpt, EXCERPT_BUDGET } from "./excerpt.ts";
 import { PROPERTIES, PROPERTY_RUNS, PROPERTY_SEED } from "./properties.ts";
+import { versionPinResults } from "./version_pin.ts";
 
 const LIB = resolveLibPath();
 const { Database, Statement } = await import("../driver/mod.ts");
@@ -4376,6 +4377,17 @@ if (runSemantic) {
     } catch (e) {
       fail(name, `falsified — replay with FC_SEED=${PROPERTY_SEED}: ${msg(e)}`);
     }
+  }
+
+  // The one check here that opens no database: the SQLite version README.md
+  // tells a consumer to download against the version vendor/build.sh builds.
+  // It lives in this run rather than in a task of its own because a task no
+  // CI step invokes is a check that does not run. See ./version_pin.ts for
+  // what it deliberately cannot catch.
+  console.log("\ndocumented SQLite version vs vendor/build.sh");
+  for (const r of versionPinResults()) {
+    if (r.ok) pass(r.name, r.detail);
+    else fail(r.name, r.detail);
   }
 }
 

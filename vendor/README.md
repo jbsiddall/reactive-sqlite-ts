@@ -153,10 +153,12 @@ missing symbol instead of a crash.
 
 ## Multi-architecture distribution
 
-### (a) aarch64: cross-compile here, natively in CI later
+### (a) aarch64: native in CI, cross-compiled from an x86_64 checkout
 
-Cross-compiling from this x86_64 container turned out to be genuinely
-straightforward, so it is wired up rather than merely planned:
+CI builds both architectures natively — `linux-x86_64-gnu` on `ubuntu-24.04` and
+`linux-aarch64-gnu` on `ubuntu-24.04-arm` — so nothing published is
+cross-compiled or emulated. The cross path below is what an x86_64 checkout
+without an arm64 machine still uses, and it still works:
 
 ```sh
 apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user-static
@@ -174,17 +176,17 @@ runs the full SESSION round trip under `qemu-user`, and it passes. That is the
 line between shipping an aarch64 artifact and shipping a guess; an untested
 binary would be worse than none.
 
-Ranked recommendation:
+Ranked, with where each one is used:
 
-1. **GitHub's native arm64 runners** (`runs-on: ubuntu-24.04-arm`) once the repo
-   is eligible — free for public repos, and they remove emulation from the
-   picture entirely: the build, the smoke test and even a Deno-based probe all
-   run natively. This is where to end up.
-2. **Cross-compile + qemu on `ubuntu-latest`** — what the committed workflows do
-   today. Works on any runner, needs no extra billing, and qemu-user is a
-   faithful enough userspace emulator for a library that does nothing but
-   compute and call libc. Its weakness is that it is emulation: it would not
-   catch a genuine arm64 codegen or atomics bug.
+1. **GitHub's native arm64 runners** (`runs-on: ubuntu-24.04-arm`) — what the
+   committed workflows do today. Free for public repos, and they remove
+   emulation from the picture entirely: the build and the smoke test both run on
+   the hardware the artifact targets.
+2. **Cross-compile + qemu** — no longer used by any workflow; it is the local
+   recipe above. Works on any x86_64 machine, and qemu-user is a faithful enough
+   userspace emulator for a library that does nothing but compute and call libc.
+   Its weakness is that it is emulation: it would not catch a genuine arm64
+   codegen or atomics bug, which is why CI does not rely on it.
 3. **Cross-compiling with no execution at all** — rejected. It is exactly the
    "untested binary" case.
 

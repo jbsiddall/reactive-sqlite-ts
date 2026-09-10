@@ -18,8 +18,11 @@
 #
 # Cross-compiling: `--arch aarch64` on an x86_64 Linux host uses
 # aarch64-linux-gnu-gcc (Debian/Ubuntu: `apt-get install gcc-aarch64-linux-gnu`).
-# The result cannot be run natively, so smoke_test.sh executes it under
-# qemu-user before anyone is asked to trust it.
+# The result cannot be run on that host, so smoke_test.sh executes it under
+# qemu-user before anyone is asked to trust it. Nothing published takes this
+# path: CI builds each architecture on its own native runner and passes no
+# --arch at all, so the released aarch64 library is neither cross-compiled nor
+# validated under emulation.
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
