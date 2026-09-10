@@ -2968,9 +2968,13 @@ const SEMANTIC: Record<string, () => void> = {
   },
 
   "our update hook is still the one SQLite has installed, not the driver's"() {
-    // SQLite keeps ONE update hook per connection. @db/sqlite 0.13.0 declares
-    // sqlite3_update_hook without calling it; if a release ever calls it, ours
-    // is displaced and every change event stops with no error anywhere. Only a
+    // SQLite keeps ONE update hook per connection, and the connection here is
+    // opened by the vendored driver in `driver/`. That driver declares
+    // sqlite3_update_hook in `driver/ffi.ts` and calls it nowhere. The day an
+    // edit there starts calling it, ours is displaced and every change event
+    // stops with no error anywhere. No upstream version is named on purpose:
+    // the thing that can break this is a future edit in THIS repository, and a
+    // release number would send a reader to check somebody else's tree. Only a
     // real write proves otherwise — a symbol still looks fine when displaced.
     const db = memory();
     const seen: Change[] = [];
