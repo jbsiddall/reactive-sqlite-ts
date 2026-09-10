@@ -106,6 +106,7 @@ const MUST_NOT_SHIP: readonly string[] = [
   "CONTRIBUTING.md",
   "DOMAIN_KNOWLEDGE.md",
   "DRIVER_DEFECTS.md",
+  "TODO.md",
 ];
 
 const root = new URL("../", import.meta.url).pathname.replace(/\/$/, "");

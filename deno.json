@@ -155,6 +155,7 @@
       "CONTRIBUTING.md",
       "DOMAIN_KNOWLEDGE.md",
       "DRIVER_DEFECTS.md",
+      "TODO.md",
       "vendor/probe.ts",
       "vendor/select.ts",
       "vendor/session_demo.ts",
