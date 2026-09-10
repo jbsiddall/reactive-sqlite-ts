@@ -70,6 +70,10 @@
       "description": "Ask whether the commits on this branch satisfy the four constraints that are held by attention alone: the assistant co-author trailer present exactly once, author and committer both the human, no session or generator strings anywhere in the message, and no file:line citation in a body. Shells out to `git log` over the range after a named baseline commit and cross-checks the count with `git rev-list`. LOCAL ONLY: this task is in no CI workflow, and CI's shallow checkout could not see the range even if it were.",
       "command": "deno run --allow-run=git --allow-read test/commit_trailers.ts"
     },
+    "test:installed-import": {
+      "description": "Ask whether the package can be imported by the specifier its users will type. Every other test loads the code from a file: URL -- the one configuration in which the defect this exists for cannot occur -- so this one serves the tree over loopback HTTP and imports each entry point from a non-file: URL, which is what a `jsr:` specifier resolves to. Two fixtures run first and prove the harness can still tell a throwing module from an inert one; without them a broken harness would report green. --allow-import is scoped to the one loopback port, and --allow-net is only what listening on it costs. Needs a libsqlite3 (see //libsqlite3), because the driver entry point dlopens one.",
+      "command": "deno run --no-lock --reload=http://127.0.0.1:8977 --unstable-ffi --allow-ffi --allow-env --allow-read --allow-net=127.0.0.1:8977 --allow-import=127.0.0.1:8977,jsr.io:443 test/installed_import.ts"
+    },
     "test:publish": {
       "description": "Assert what the published package actually contains — LICENSE and NOTICE present, test/ and tools/ absent. Spawns `deno publish --dry-run`, which validates without uploading. --allow-run is unscoped because the child is Deno.execPath(), known only at runtime.",
       "command": "deno run --allow-run --allow-read --allow-env test/publish_manifest.ts"

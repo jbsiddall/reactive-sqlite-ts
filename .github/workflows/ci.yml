@@ -212,6 +212,14 @@ jobs:
         if: "!cancelled()"
         run: deno task test:crash
 
+      # The one check that imports the package the way a consumer will, from a
+      # non-file: URL. Every other step here loads the code from the working
+      # tree, which is the single configuration in which an import-time
+      # dependence on a file: path cannot fail.
+      - name: Installed import
+        if: "!cancelled()"
+        run: deno task test:installed-import
+
       # What actually ships. Asserts on the file list deno publish reports,
       # not on the exclude patterns, so a rule that catches LICENSE or NOTICE
       # by accident fails here rather than in a published package.

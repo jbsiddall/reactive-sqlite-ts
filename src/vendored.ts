@@ -31,16 +31,34 @@ export class NoVendoredLibraryError extends Error {
 }
 
 /**
- * The `vendor/` directory, reached from `src/` rather than from inside it.
+ * The `vendor/` directory, reached from `src/` rather than from inside it, or
+ * null when this copy of the package has no such directory to reach.
  *
  * The build artifacts stay where `build.sh` writes them; only the code that
  * finds them moved, so this is one level up and back down rather than the
  * directory this file happens to live in.
+ *
+ * NOT A MODULE-SCOPE CONSTANT, AND THE SCHEME IS CHECKED BEFORE THE CONVERSION
+ * -- both deliberately, and neither is a style preference. `fromFileUrl`
+ * throws a TypeError on any URL that is not `file:`, and an INSTALLED copy of
+ * this package has one: a `jsr:` specifier resolves to a module URL under
+ * `https://jsr.io/`. As a module-scope constant that TypeError fired while
+ * this file was being EVALUATED, and `driver/ffi.ts` imports this file
+ * unconditionally -- so importing the driver threw before it could read
+ * `DENO_SQLITE_PATH`, setting that variable did not help, and what a user saw
+ * was a path library's TypeError instead of this module's
+ * `NoVendoredLibraryError`. Returning null keeps the failure where it belongs:
+ * at the point of use, with a message that says what to do.
+ *
+ * The check that would have caught it is `test/installed_import.ts`, and it
+ * did not exist because it could not have: every other test here loads this
+ * code from a `file:` URL, which is the one configuration where the bug is
+ * absent. Do not fold this back into a constant.
  */
-const VENDOR_DIR = join(
-  dirname(dirname(fromFileUrl(import.meta.url))),
-  "vendor",
-);
+function vendorDir(): string | null {
+  if (!import.meta.url.startsWith("file:")) return null;
+  return join(dirname(dirname(fromFileUrl(import.meta.url))), "vendor");
+}
 
 /**
  * The target triple for the current process.
@@ -73,7 +91,9 @@ export function libraryFileName(
 
 /** Every target directory that currently has a built library. */
 export function availableTargets(): Target[] {
-  const libRoot = join(VENDOR_DIR, "lib");
+  const dir = vendorDir();
+  if (dir === null) return [];
+  const libRoot = join(dir, "lib");
   const found: Target[] = [];
   try {
     for (const entry of Deno.readDirSync(libRoot)) {
@@ -104,11 +124,16 @@ export function availableTargets(): Target[] {
  */
 export function vendoredLibraryPath(): string {
   const target = currentTarget();
-  const path = join(VENDOR_DIR, "lib", target, libraryFileName());
-  try {
-    if (Deno.statSync(path).isFile) return path;
-  } catch {
-    // fall through to the diagnostic
+  const dir = vendorDir();
+  const path = dir === null
+    ? null
+    : join(dir, "lib", target, libraryFileName());
+  if (path !== null) {
+    try {
+      if (Deno.statSync(path).isFile) return path;
+    } catch {
+      // fall through to the diagnostic
+    }
   }
   const available = availableTargets();
   throw new NoVendoredLibraryError(
@@ -116,7 +141,10 @@ export function vendoredLibraryPath(): string {
       `No vendored SQLite for this platform.`,
       ``,
       `  wanted:    ${target}  (${Deno.build.os}/${Deno.build.arch})`,
-      `  expected:  ${path}`,
+      `  expected:  ${
+        path ??
+          "(nowhere: this package was installed from a registry, and a registry carries source, not built libraries)"
+      }`,
       `  available: ${
         available.length ? available.join(", ") : "(none built)"
       }`,
