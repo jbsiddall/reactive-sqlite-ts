@@ -92,9 +92,13 @@ jobs:
         run: vendor/smoke_test.sh
 
       # The cross-compiled aarch64 artefact carried a third NEEDED entry,
-      # ld-linux-aarch64.so.1, that the x86_64 one did not. It was suspected to
-      # be an artefact of cross-linking. This step is how that stops being a
-      # suspicion: the list is printed for every native build, every run.
+      # ld-linux-aarch64.so.1, that the x86_64 one did not, and it was suspected
+      # to be an artefact of cross-linking. It is not: the first NATIVE aarch64
+      # build on ubuntu-24.04-arm produced the same three entries. On aarch64
+      # glibc the dynamic loader is a normal DT_NEEDED; on x86_64 it is not.
+      # The suspicion was wrong, so nothing downstream should treat that entry
+      # as a defect to be eliminated. The list is printed on every run so the
+      # next surprise is caught the same way this one was.
       - name: Report the library's NEEDED entries
         run: |
           set -euo pipefail
