@@ -166,12 +166,11 @@ reported `3.53.3` under that Deno, and still crashed where the original crashed.
 So renaming is not a fix and is not proposed as one.
 
 **`dladdr` cannot see any of this, and that is a fact about the instrument.**
-Taking the address of `sqlite3_libversion` with
-`Deno.dlopen(path, { name: {
-type: "pointer" } })` and passing it to `dladdr`
-from `libc.so.6` reported the NAMED file on three of the four arms measured
-under the nixpkgs Deno, including both arms that then died of `SIGSEGV`. It
-disagreed only where two names inside one store path differ: named
+Take the address of `sqlite3_libversion` by declaring it to `Deno.dlopen` as
+`{ type: "pointer" }` rather than as a function, then pass that address to
+`dladdr` from `libc.so.6`. Doing so reported the NAMED file on three of the four
+arms measured under the nixpkgs Deno, including both arms that then died of
+`SIGSEGV`. It disagreed only where two names inside one store path differ: named
 `libsqlite3.so.3.53.3`, reported `libsqlite3.so`. So `dladdr` agrees with the
 caller's path while the version string disagrees, in the same process, in the
 same run. **Which instrument is lying is not known**, and no provenance check is
