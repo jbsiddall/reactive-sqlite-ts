@@ -682,19 +682,22 @@ console.log("\nthe attribution block");
  * Delete a clause from a real file, tolerating however it is wrapped.
  *
  * Every occurrence, not the first, and that is measured rather than reasoned.
- * The regexp was written without `g` first, and the deletion fixtures were run
- * against the real files: 61 passed, 7 failed, and all seven failures were
- * deletion controls reporting that the checker had ACCEPTED a file the fixture
- * had just damaged. The counts behind them, in `build.sh` / `README.md`:
- * `SQLITE_ENABLE_SESSION` 2/3, `SQLITE_ENABLE_PREUPDATE_HOOK` 2/2,
- * `build_manifest.json` 2/2, `build.sh` 1/13, `Release assets` 0/2.
+ * The regexp was written without `g` first and the deletion fixtures were run
+ * against the real files. The failures were EXACTLY the clauses that occur more
+ * than once in the file they are checked against -- seven of them when this was
+ * written -- each reporting by name that the checker had ACCEPTED a file the
+ * fixture had just damaged. That equality is the finding, and it re-derives:
+ * count the occurrences and you have predicted the failures. No total is
+ * recorded here on purpose, because a pass count is a property of how many
+ * assertions this file happens to contain and stops reproducing the next time
+ * it grows one.
  *
  * The mechanism is worth stating because it is not the obvious one. The
  * `damaged === text` guard does not catch this: one occurrence IS removed, so
  * the text really does change and the fixture looks well-formed. What survives
- * is the clause, in the occurrences the guard never looked at, so the content
- * check stays green and the fixture proves nothing -- the failure mode this
- * whole file exists to refuse.
+ * is the clause, in the occurrences the guard never looked at. The fixture then
+ * proves nothing ABOUT THE CLAUSE -- and with `g` in place the control says so,
+ * out loud, instead of going green.
  */
 function withoutClause(text: string, needle: string): string {
   const pattern = flat(needle)
