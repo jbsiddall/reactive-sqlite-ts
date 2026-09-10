@@ -26,6 +26,52 @@ deno task test:docs-literals  # no code span in the docs is wrapped across a lin
 deno task test:commits  # the commit-message constraints nothing else enforces
 ```
 
+### Which library you pin is a choice about coverage, not only about segfaults
+
+The export above reads as mechanical -- point both at one library or the process
+dies -- and it is that. It is not neutral. Which `libsqlite3` you name decides
+what the suite is able to prove, and the two libraries reachable here buy
+different halves of the same row. Neither is free.
+
+Measured on 2026-09-10, on one machine, with these commands as written:
+
+| Pinned                                                     | `deno task test`                                                                | `deno task test:capability-coverage`                                                                                                   |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| system 3.45.1, `/usr/lib/x86_64-linux-gnu/libsqlite3.so.0` | 459 passed, and one visible `SKIP` line for the `normalized-sql behaviour` case | 1 of 7 refusal branches exercised against real absence, 0 NOT EXERCISABLE, and no `WEAK CONTROLS` line                                 |
+| vendored 3.53.4, built by `deno task vendor:build`         | 460 passed, no `SKIP`                                                           | 0 of 7 exercised, 1 of 7 NOT EXERCISABLE (`normalizedSql`), its one positive control `skipped, not passed`, and a `WEAK CONTROLS` line |
+
+The trade is symmetric, and it is the same capability on both sides.
+`normalizedSql` is the one row these two libraries differ on. Pin the system
+library and the refusal branch is proved against a library that genuinely lacks
+the symbol, while the present branch never runs at all. Pin the vendored build
+and the present branch runs, while the refusal branch has no library left that
+can exercise it. Gaining either half costs the other, and no third library would
+help: the two halves want the symbol present and absent, so no single pin can
+buy both, and only running the suite twice can.
+
+What saves this from being silent is that both halves announce themselves: the
+suite prints a `SKIP` line naming the library it skipped on, and the audit
+prints `NOT EXERCISABLE` and `WEAK CONTROLS`. A green run is not the whole
+report under either pin. Read those lines. The count is also a tell -- a run
+that printed 459 was on the system library and one that printed 460 was on the
+vendored build.
+
+None of this is decided here and none of it is a fix. Nothing above repairs
+anything, no pin is recommended, and the open question of which library CI
+should cover is below, unchanged by these numbers except that they say what
+either answer costs.
+
+This paragraph is a DATED STAMP, which is the weakest of the three grades of
+claim used in this repository, and nothing enforces it: **2026-09-10, system
+3.45.1, vendored 3.53.4, one differing row, carrier `normalizedSql`.** It is
+stamped rather than checked because the other two grades are unavailable for it.
+There is no check that can fail when a distribution rebuilds its libsqlite3 with
+`SQLITE_ENABLE_NORMALIZE`, and no file in this tree the readings can be
+re-derived from, because they are readings of two builds this project does not
+control. A reader meeting this a year from now should re-run the two commands
+rather than believe it. Which library CI pins is a stronger grade and is not
+stamped here: re-derive it at `.github/workflows/ci.yml`.
+
 ### Which of these CI runs, and why the rest do not
 
 CI runs everything above except `test:table` and `test:commits`, and those two
@@ -113,10 +159,18 @@ that proved something.
 
 CI pins `DENO_SQLITE_PATH` at `/usr/lib/x86_64-linux-gnu/libsqlite3.so.0` — the
 system 3.45.1 — so every suite that has ever run there ran against that library.
-The procedure we run before pushing pins the vendored 3.53.4. Both are in the
+The procedure run before pushing pins the vendored 3.53.4. Both are in the
 ledger above, so neither is untested, but the two differ in exactly the places
 the ledger's right-hand column is about: `normalizedSql` is present in one and
 absent in the other, and it is the absent branch that CI exercises.
+
+What each side of that costs is measured under "Which library you pin is a
+choice about coverage" above, with the date and the versions it was read on; the
+figures are not repeated here, because two copies of a stamp go stale
+separately. The short of it is that CI's pin is the one that gives the
+capability-coverage audit its only positive control, and the local pin is the
+one that runs the branch CI skips. Neither is the safe default, which is why
+this is open rather than obvious.
 
 This is the same mechanism-versus-outcome split the capability table carries:
 the mechanism is "whatever `DENO_SQLITE_PATH` names", and which library that
@@ -124,7 +178,9 @@ turns out to be is a separate fact that has to be stated rather than inferred.
 
 Not decided here, because it is a decision about what CI should cover and not a
 repair: whether CI should pin the vendored build instead, or run the suite
-twice, once against each.
+twice, once against each. Running it twice is the only one of those that does
+not give up a half, and it is also the only one that doubles the CI bill for the
+library steps; that is the shape of the decision, not a recommendation.
 
 **Trigger:** decide it before the vendored library becomes the one this package
 ships to users — that is the point at which a green CI run against 3.45.1 stops
