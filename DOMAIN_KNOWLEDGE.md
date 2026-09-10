@@ -778,3 +778,41 @@ time rather than through a static import, or an exclusion publish tolerates.
 The two directions that CAN be moved on the real tree were both observed: adding
 an unimported `src/` file fails the check as a WIDENING, and excluding `NOTICE`
 fails it as a NARROWING.
+
+## What compile flags cost the vendored build (2026-09-10, SQLite 3.53.4)
+
+Measured on Ubuntu 24.04, `cc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0`, x86_64,
+`-fPIC -O2 -DNDEBUG`, one translation unit.
+
+**The baseline reproduces byte for byte.** `vendor/build.sh` run into a scratch
+directory produced a `libsqlite3.so` with the same SHA-256 as the committed
+`vendor/lib/linux-x86_64-gnu/libsqlite3.so` (`db8ca7c4…70113`, 1,606,768 bytes).
+That is the control: without it, a size delta measured here would be a
+difference between two builds rather than a difference made by the flags.
+
+**`SQLITE_ENABLE_PERCENTILE`, `SQLITE_ENABLE_CARRAY`, `SQLITE_ENABLE_STAT4` and
+`SQLITE_ENABLE_SNAPSHOT` cost 20,992 bytes together** — 20.5 KiB, +1.30% on the
+baseline, taking the library to 1,627,760 bytes. All four are compile options of
+the amalgamation itself in 3.53.4: no extra source file, no second download.
+`PRAGMA compile_options` goes from 58 entries to 62.
+
+**Say which count is being quoted.** `pragma_function_list` has one ROW per
+overload, so the same library reports 194 rows and 170 distinct names. Those
+four flags take it to 198 rows / 174 distinct names. Diffed rather than counted,
+the four new names are `median`, `percentile`, `percentile_cont` and
+`percentile_disc`. Any figure quoted as "SQL functions" without saying
+rows-or-names is ambiguous by about 14%.
+
+**`carray` is invisible to both lists and still works.** With
+`SQLITE_ENABLE_CARRAY` the module lists are byte-identical to the baseline's and
+nothing named `carray` appears in `pragma_function_list` either, yet
+`SELECT * FROM carray(0,0)` compiles in the new build and fails with
+`no such table: carray` in the old one. So a capability audit that enumerates
+`pragma_module_list` reports this flag as having done nothing. Prepare the
+statement instead.
+
+**`ext/misc` is not in the amalgamation.** Building any of those extensions in
+means fetching `sqlite-src-<version>.zip` as well — 14.5 MiB against the
+amalgamation's 2.5 MiB — pinning a second hash, and calling their
+`sqlite3_*_init` from `SQLITE_EXTRA_INIT`. That is a change to the build's
+one-download story, not just another `-D`.
