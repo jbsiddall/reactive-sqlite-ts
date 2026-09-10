@@ -35,7 +35,7 @@ import { useVendoredSqlite } from "./src/vendored.ts";
 const LIB = useVendoredSqlite(); // sets DENO_SQLITE_PATH; throws if none matches
 
 // AFTER, so the driver reads the variable we just set. Static imports hoist.
-const { Database } = await import("jsr:@db/sqlite@0.12");
+const { Database } = await import("../driver/mod.ts");
 const { withEvents } = await import("../src/hooks.ts");
 ```
 
@@ -61,6 +61,16 @@ segfault being the way you find out.
 
 Neither is in `deno task test`: both need `--unstable-ffi --allow-ffi`, and CI
 has no committed library to point them at.
+
+**These tasks run from a checkout, not from an installed package.** Of this
+directory only `build.sh` and this file are published; the probe, the demo and
+the smoke test are development apparatus that no shipped code reaches, and
+shipping them would put files in the package that nothing in the package can
+use. What a consumer gets is the one thing they might actually need from here:
+the ability to rebuild the native library themselves, from the package they
+already have, without going and finding a repository first. The shipped set is
+pinned in `test/publish_manifest.ts` in both directions, so dropping `build.sh`
+fails exactly as loudly as re-adding a demo.
 
 ## What is built
 
@@ -265,7 +275,8 @@ Fix it one of two ways:
      (needs a C compiler and network access; ~1 minute)
   2. Point at a libsqlite3 you trust:  DENO_SQLITE_PATH=/path/to/libsqlite3.so
      It must have SQLITE_ENABLE_PREUPDATE_HOOK and SQLITE_ENABLE_SESSION
-     compiled in -- check with: deno task vendor:probe /path/to/libsqlite3.so
+     compiled in. vendor/README.md says why and vendor/build.sh is a
+     build that has them; both ship with this package.
 
 On musl (Alpine) set REACTIVE_SQLITE_LIBC=musl so the right artifact is chosen.
 ```
@@ -275,13 +286,14 @@ bare `exit 139`.
 
 ## Files
 
-| file                             | what it is                                               |
-| -------------------------------- | -------------------------------------------------------- |
-| `build.sh`                       | fetch, verify, compile, verify again, write the manifest |
-| `smoke_test.c` / `smoke_test.sh` | the SESSION round trip in C, runnable under qemu         |
-| `probe.ts`                       | which capabilities does a given `libsqlite3` have        |
-| `session_demo.ts`                | the SESSION round trip over Deno FFI                     |
-| `select.ts`                      | read the build manifest beside a built library           |
-| `../src/vendored.ts`             | pick the artifact for this platform, or fail readably    |
-| `lib/<target>/`                  | build output — gitignored                                |
-| `.src/`                          | downloaded amalgamation — gitignored                     |
+| file                             | what it is                                               | in the package |
+| -------------------------------- | -------------------------------------------------------- | -------------- |
+| `README.md`                      | this file                                                | yes            |
+| `build.sh`                       | fetch, verify, compile, verify again, write the manifest | yes            |
+| `smoke_test.c` / `smoke_test.sh` | the SESSION round trip in C, runnable under qemu         | no             |
+| `probe.ts`                       | which capabilities does a given `libsqlite3` have        | no             |
+| `session_demo.ts`                | the SESSION round trip over Deno FFI                     | no             |
+| `select.ts`                      | read the build manifest beside a built library           | no             |
+| `../src/vendored.ts`             | pick the artifact for this platform, or fail readably    | yes            |
+| `lib/<target>/`                  | build output — gitignored                                | no             |
+| `.src/`                          | downloaded amalgamation — gitignored                     | no             |

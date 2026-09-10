@@ -3,6 +3,14 @@
  *
  * Choosing the library moved to `src/vendored.ts`, which ships; this is the
  * part only the vendoring tools in this directory read.
+ *
+ * It does not ship, and it did not move to `src/` to keep it in the package.
+ * Its only caller is `probe.ts`, which is development apparatus and leaves the
+ * package too; a manifest reader in `src/` would be a module the published
+ * entry point can never reach, which is the thing the shipped set is pinned to
+ * prevent. Nothing goes in the package that no shipped code reaches, except
+ * what is shipped FOR the consumer to read and run -- `README.md` and
+ * `build.sh`, and this is neither.
  */
 
 import { dirname, fromFileUrl, join } from "@std/path";

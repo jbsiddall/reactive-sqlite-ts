@@ -42,6 +42,9 @@
  * to leave this file green before {@linkcode attributionFindings} existed. So
  * the attribution block is asserted on its CONTENT: every clause it must carry
  * is named, and each one has a fixture that deletes it and must be rejected.
+ * {@linkcode REPRODUCTION_CLAUSES} does the same for the two `vendor/` files
+ * that ship, which are in the package because of a claim about what they let a
+ * consumer do rather than because they exist.
  *
  * Run: deno task test:publish
  */
@@ -77,13 +80,12 @@ const MANIFEST: readonly string[] = [
   "src/schema_map.ts",
   "src/schema_watch.ts",
   "src/vendored.ts",
+  // vendor/ ships exactly what a consumer needs to REPRODUCE the native
+  // library we distribute as a Release asset, and nothing else. Pinning the
+  // set whole is what makes that hold in both directions: dropping build.sh
+  // NARROWS the set and fails, re-adding the demos WIDENS it and fails.
   "vendor/README.md",
   "vendor/build.sh",
-  "vendor/probe.ts",
-  "vendor/select.ts",
-  "vendor/session_demo.ts",
-  "vendor/smoke_test.c",
-  "vendor/smoke_test.sh",
 ];
 
 /**
@@ -222,6 +224,132 @@ function attributionFindings(notice: string): Finding[] {
       ? ok(`NOTICE ${what}`)
       : bad(`NOTICE ${what}`, `missing: ${JSON.stringify(needle)}`)
   );
+}
+
+/**
+ * A file that ships, and every clause that has to be in it for it to be worth
+ * shipping.
+ *
+ * PRESENCE IS NOT ENOUGH HERE EITHER, AND FOR A SHARPER REASON THAN THE NOTICE.
+ * The two survivors in `vendor/` are in the package because of a claim we make
+ * about them: that a consumer who does not trust the native library we
+ * distribute as a Release asset can rebuild it from what they installed. A
+ * `build.sh` that exists but fetches whatever SQLite is current, or skips the
+ * checksum, or builds without the two options this library cannot work
+ * without, satisfies presence completely and falsifies the claim completely.
+ * That is the trimmed-NOTICE shape one file over, so it gets the same
+ * treatment: name the clauses, and delete each one in a fixture that must be
+ * rejected by that clause's own name.
+ *
+ * The values are deliberately not pinned -- `SQLITE_VERSION="` is a clause,
+ * `3.53.4` is not. A version bump is ordinary maintenance and must not need
+ * this file edited; dropping the pin is not, and does.
+ */
+const REPRODUCTION_CLAUSES: readonly {
+  file: string;
+  what: string;
+  needle: string;
+}[] = [
+  {
+    file: "vendor/build.sh",
+    what: "pins the SQLite version it builds",
+    needle: 'SQLITE_VERSION="',
+  },
+  {
+    file: "vendor/build.sh",
+    what: "pins the checksum sqlite.org publishes",
+    needle: 'SQLITE_SHA3_256="',
+  },
+  {
+    file: "vendor/build.sh",
+    what: "refuses to build on a checksum mismatch",
+    needle: "SHA3-256 mismatch",
+  },
+  {
+    file: "vendor/build.sh",
+    what: "compiles the preupdate hook in",
+    needle: "SQLITE_ENABLE_PREUPDATE_HOOK",
+  },
+  {
+    file: "vendor/build.sh",
+    what: "compiles the session extension in",
+    needle: "SQLITE_ENABLE_SESSION",
+  },
+  {
+    file: "vendor/build.sh",
+    what: "records what it built beside the library",
+    needle: "build_manifest.json",
+  },
+  {
+    file: "vendor/README.md",
+    what: "names the script that rebuilds the library",
+    needle: "build.sh",
+  },
+  {
+    file: "vendor/README.md",
+    what: "names the preupdate hook as required",
+    needle: "SQLITE_ENABLE_PREUPDATE_HOOK",
+  },
+  {
+    file: "vendor/README.md",
+    what: "names the session extension as required",
+    needle: "SQLITE_ENABLE_SESSION",
+  },
+  {
+    file: "vendor/README.md",
+    what: "says the binaries are distributed as Release assets",
+    needle: "Release assets",
+  },
+];
+
+/** The two shipped `vendor/` files, by their published path. */
+type FileTexts = Readonly<Record<string, string>>;
+
+const VERSIONS_AGREE =
+  "vendor/README.md documents the SQLite version vendor/build.sh builds";
+
+/**
+ * The cross-file half, and the reason no version literal appears above.
+ *
+ * Bumping SQLite means editing two files, and the one that gets forgotten is
+ * the prose. This reads the version out of `build.sh` and requires `README.md`
+ * to say it, so a bump that updates only the script fails -- while a bump that
+ * updates both passes without anyone touching this test.
+ */
+function versionAgreement(texts: FileTexts): Finding {
+  const build = texts["vendor/build.sh"];
+  const readme = texts["vendor/README.md"];
+  if (build === undefined || readme === undefined) {
+    return bad(VERSIONS_AGREE, "one of the two files could not be read");
+  }
+  const version = /SQLITE_VERSION="([^"]+)"/.exec(build)?.[1];
+  if (version === undefined) {
+    return bad(VERSIONS_AGREE, "build.sh pins no SQLITE_VERSION to compare");
+  }
+  return readme.includes(version) ? ok(VERSIONS_AGREE) : bad(
+    VERSIONS_AGREE,
+    `build.sh builds ${version}; README.md never says that version`,
+  );
+}
+
+/**
+ * Whether the shipped `vendor/` files still say what makes them worth
+ * shipping.
+ *
+ * Pure over the file texts, so the fixtures below run the same code the real
+ * files do.
+ */
+function reproductionFindings(texts: FileTexts): Finding[] {
+  const findings = REPRODUCTION_CLAUSES.map(({ file, what, needle }) => {
+    const name = `${file} ${what}`;
+    const text = texts[file];
+    if (text === undefined) return bad(name, `${file} could not be read`);
+    return flat(text).includes(flat(needle))
+      ? ok(name)
+      : bad(name, `missing: ${JSON.stringify(needle)}`);
+  });
+  findings.push(versionAgreement(texts));
+  return findings;
 }
 
 /** Whether any pinned-never prefix leaked into the shipped set. */
@@ -471,12 +599,18 @@ for (const fixture of GRAPH_FIXTURES) {
 
 console.log("\nthe attribution block");
 
-/** Delete a clause from the real NOTICE, tolerating however it is wrapped. */
-function withoutClause(notice: string, needle: string): string {
+/**
+ * Delete a clause from a real file, tolerating however it is wrapped.
+ *
+ * Every occurrence, not the first. A clause that appears twice and is deleted
+ * once is still present, so the fixture would go green having proved nothing
+ * -- the failure mode this whole file exists to refuse.
+ */
+function withoutClause(text: string, needle: string): string {
   const pattern = flat(needle)
     .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
     .replaceAll(" ", "\\s+");
-  return notice.replace(new RegExp(pattern), "");
+  return text.replace(new RegExp(pattern, "g"), "");
 }
 
 const noticeText = ((): string | null => {
@@ -533,6 +667,89 @@ if (noticeText === null) {
           ? "the fixture deleted nothing, so it proves nothing"
           : `only ${lost} clauses went red`,
       ),
+  );
+}
+
+console.log("\nwhat the shipped vendor/ files must still say");
+
+const vendorTexts: Record<string, string> = {};
+for (const file of new Set(REPRODUCTION_CLAUSES.map((c) => c.file))) {
+  try {
+    vendorTexts[file] = Deno.readTextFileSync(`${root}/${file}`);
+  } catch {
+    record(bad(`${file} was read`, `no readable file at ${root}/${file}`));
+  }
+}
+
+// The accepted side: the real files, clause by clause.
+for (const f of reproductionFindings(vendorTexts)) record(f);
+
+// Each clause deleted in turn, and rejected BY ITS OWN NAME.
+for (const clause of REPRODUCTION_CLAUSES) {
+  const name =
+    `control: deleting "${clause.what}" from ${clause.file} is rejected`;
+  const text = vendorTexts[clause.file];
+  if (text === undefined) {
+    record(bad(name, `${clause.file} was not read, so nothing was proved`));
+    continue;
+  }
+  const damaged = withoutClause(text, clause.needle);
+  if (damaged === text) {
+    record(bad(name, "the fixture deleted nothing, so it proves nothing"));
+    continue;
+  }
+  const named = reproductionFindings({ ...vendorTexts, [clause.file]: damaged })
+    .filter((f) => !f.ok)
+    .map((f) => f.what);
+  record(
+    named.includes(`${clause.file} ${clause.what}`) ? ok(name) : bad(
+      name,
+      named.length === 0
+        ? "accepted it"
+        : `rejected it, but named ${named.join(", ")} instead`,
+    ),
+  );
+}
+
+// A version bump that updates the script and forgets the prose.
+{
+  const name = "control: a bumped build.sh with a stale README.md is rejected";
+  const build = vendorTexts["vendor/build.sh"];
+  if (build === undefined) {
+    record(bad(name, "vendor/build.sh was not read, so nothing was proved"));
+  } else {
+    const bumped = build.replace(
+      /SQLITE_VERSION="[^"]+"/,
+      'SQLITE_VERSION="99.99.99"',
+    );
+    const named = reproductionFindings({
+      ...vendorTexts,
+      "vendor/build.sh": bumped,
+    }).filter((f) => !f.ok).map((f) => f.what);
+    record(
+      bumped !== build && named.includes(VERSIONS_AGREE) ? ok(name) : bad(
+        name,
+        bumped === build
+          ? "the fixture changed nothing, so it proves nothing"
+          : `did not name the disagreement; named ${
+            named.join(", ") || "nothing"
+          }`,
+      ),
+    );
+  }
+}
+
+// A file that vanished entirely, rather than one that was trimmed.
+{
+  const name = "control: an unreadable shipped file is rejected, not skipped";
+  const named = reproductionFindings({}).filter((f) => !f.ok).map((f) =>
+    f.what
+  );
+  record(
+    named.length === REPRODUCTION_CLAUSES.length + 1 ? ok(name) : bad(
+      name,
+      `expected every clause to go red, got ${named.length}`,
+    ),
   );
 }
 

@@ -95,6 +95,25 @@
   "imports": {
     "@std/path": "jsr:@std/path@1.1.6"
   },
+  "//publish": [
+    "vendor/README.md and vendor/build.sh SHIP, and the argument is",
+    "supply-chain rather than tidiness: the native library is distributed as a",
+    "Release asset, so a consumer who does not trust that binary has to be able",
+    "to reproduce it from the package they installed, without first locating a",
+    "repository. That is only true if build.sh travels with the package, and it",
+    "is only useful if README.md travels with it to say what the build is for.",
+    "",
+    "Everything else in vendor/ is excluded for the mirror-image reason: it is",
+    "development apparatus that no shipped code reaches. probe.ts, select.ts,",
+    "session_demo.ts and the smoke test are run from a checkout, against a",
+    "library, by someone changing the build -- not by anyone consuming the",
+    "package. select.ts in particular reads the build manifest for probe.ts and",
+    "nothing else, so it leaves with its only caller rather than moving to src/,",
+    "where it would be an unreachable module inside the shipped set.",
+    "",
+    "test/publish_manifest.ts is what holds this: the shipped set is pinned",
+    "WHOLE, so dropping build.sh fails as loudly as re-adding the demos."
+  ],
   "publish": {
     "exclude": [
       ".github/",
@@ -103,7 +122,12 @@
       "tools/",
       "CONTRIBUTING.md",
       "DOMAIN_KNOWLEDGE.md",
-      "DRIVER_DEFECTS.md"
+      "DRIVER_DEFECTS.md",
+      "vendor/probe.ts",
+      "vendor/select.ts",
+      "vendor/session_demo.ts",
+      "vendor/smoke_test.c",
+      "vendor/smoke_test.sh"
     ]
   }
 }
