@@ -166,31 +166,37 @@ downloads for itself when `DENO_SQLITE_PATH` is unset. Each cell is the value
 
 <!-- capability-table:begin -->
 
-Observed **2026-09-09**, by running `probeCapabilities()` against each library
-at the path below, each in its own process. Every `no` is a measured negative —
-the symbol was looked for in that file, on that date, and was not there — not an
-unchecked cell. In the repository the `table` task rewrites this block and the
-`test:table` gate fails if it is stale; neither script is in the published
-package.
+Observed **2026-09-10** for the `system` and `vendored` columns, by running
+`probeCapabilities()` against each library at the path below, each in its own
+process. The third column is a dated historical comparison and is NOT current:
+its cells are re-read from the cached prebuilt on every run, but nothing
+refreshes that cache, so the file stays as downloaded on **2026-09-09** and the
+column reports what that release shipped rather than what `@db/sqlite` ships
+now. Every `no` is a measured negative — the symbol was looked for in that file,
+on the date given for its column, and was not there — not an unchecked cell. In
+the repository the `table` task rewrites this block and the `test:table` gate
+fails if it is stale; neither script is in the published package.
 
-| Capability      | system 3.45.1 | vendored 3.53.4 | @db/sqlite prebuilt 3.46.0 |
-| --------------- | ------------- | --------------- | -------------------------- |
-| `hooks`         | yes           | yes             | yes                        |
-| `preupdate`     | yes           | yes             | no                         |
-| `wal`           | yes           | yes             | yes                        |
-| `trace`         | yes           | yes             | yes                        |
-| `progress`      | yes           | yes             | no                         |
-| `busy`          | yes           | yes             | yes                        |
-| `authorize`     | yes           | yes             | yes                        |
-| `collation`     | yes           | yes             | yes                        |
-| `normalizedSql` | no            | yes             | no                         |
+| Capability      | system 3.45.1 | vendored 3.53.4 | @db/sqlite prebuilt 3.46.0 (frozen 2026-09-09) |
+| --------------- | ------------- | --------------- | ---------------------------------------------- |
+| `hooks`         | yes           | yes             | yes                                            |
+| `preupdate`     | yes           | yes             | no                                             |
+| `wal`           | yes           | yes             | yes                                            |
+| `trace`         | yes           | yes             | yes                                            |
+| `progress`      | yes           | yes             | no                                             |
+| `busy`          | yes           | yes             | yes                                            |
+| `authorize`     | yes           | yes             | yes                                            |
+| `collation`     | yes           | yes             | yes                                            |
+| `normalizedSql` | no            | yes             | no                                             |
 
 - `system` — the path `resolveLibPath()` returns with `DENO_SQLITE_PATH` unset —
   not necessarily the library the suite runs against, which is normally pinned
 - `vendored` — `vendor/lib/<target>/`, built by `deno task vendor:build` and
   matching the `build_manifest.json` beside it
-- `@db/sqlite prebuilt` — `$DENO_DIR/plug/`, downloaded by `@db/sqlite` 0.13.0
-  when `DENO_SQLITE_PATH` is unset
+- `@db/sqlite prebuilt` — `$DENO_DIR/plug/`, the copy `@db/sqlite` 0.13.0
+  downloaded into this machine's cache when `DENO_SQLITE_PATH` was unset — a
+  HISTORICAL column, frozen at 2026-09-09 because nothing refreshes that cache;
+  it says what that release shipped, not what `@db/sqlite` ships today
 
 <!-- capability-table:end -->
 

@@ -113,6 +113,28 @@ function rowLabel(key: string): string {
 }
 
 /**
+ * The day the cached prebuilt was last known to be current.
+ *
+ * STATED, NOT MEASURED, and this is the one place in this file that says so
+ * rather than reading it off the artefact. The cells in that column ARE
+ * re-read from the real bytes on every run -- nothing about them is carried
+ * forward -- but nothing refreshes `$DENO_DIR/plug` either, so the FILE is
+ * whatever `@db/sqlite` last downloaded here, and the column therefore reports
+ * a past release rather than the current one. Stamping it with the run date
+ * would convert a historical comparison into a claimed-current one.
+ *
+ * WHY NOT THE FILE'S OWN MTIME: because it is not trustworthy as a vintage.
+ * MEASURED 2026-09-10: the `.so` in this machine's cache carries mtime
+ * 2026-09-09 16:39:44 while the sibling `.metadata.json` carries 2026-09-10
+ * 01:28:25 -- a copy-out-and-back of the cache moved one and not the other.
+ * Two mtimes on one artefact disagreeing by a day is exactly the reading that
+ * cannot be used, so the date is written down and `frozenStale()` below turns
+ * it into something the machine can contradict: if the library is ever
+ * re-downloaded, its mtime passes this date and the gate goes red.
+ */
+const PREBUILT_FROZEN = "2026-09-09";
+
+/**
  * The known answer. Established by measurement first (running this file's
  * `--probe` mode against the downloaded prebuilt on 2026-09-09), then pinned,
  * so a run that quietly probed the wrong library three times cannot pass:
@@ -160,9 +182,13 @@ function provenanceOf(prebuiltRelease: string | undefined): Record<
     // with the file, by version and by SHA-256.
     "vendored":
       "`vendor/lib/<target>/`, built by `deno task vendor:build` and matching the `build_manifest.json` beside it",
-    "@db/sqlite prebuilt": `\`$DENO_DIR/plug/\`, downloaded by \`@db/sqlite\` ${
+    // Past tense on purpose. The cells are re-read from these bytes every
+    // run; the bytes are whatever was downloaded once and never refreshed.
+    // The release stays MEASURED -- read out of the artefact's metadata.json
+    // -- while the date beside it is the stated `PREBUILT_FROZEN` above.
+    "@db/sqlite prebuilt": `\`$DENO_DIR/plug/\`, the copy \`@db/sqlite\` ${
       prebuiltRelease ?? "(release unknown — its metadata.json names none)"
-    } when \`DENO_SQLITE_PATH\` is unset`,
+    } downloaded into this machine's cache when \`DENO_SQLITE_PATH\` was unset — a HISTORICAL column, frozen at ${PREBUILT_FROZEN} because nothing refreshes that cache; it says what that release shipped, not what \`@db/sqlite\` ships today`,
   };
 }
 
@@ -359,7 +385,18 @@ function cell(v: boolean): string {
 
 /** The table body: everything whose value was measured. */
 function tableOf(columns: Column[]): string {
-  const head = ["Capability", ...columns.map((c) => `${c.name} ${c.version}`)];
+  // The third column is marked IN THE HEADER, not only in the bullet below
+  // it, because a reader scanning the grid may never reach the bullets. Keyed
+  // off `c.name` rather than by rewriting it: `PINNED.column` and the
+  // `provenanceOf()` record are both keyed by that same string.
+  const head = [
+    "Capability",
+    ...columns.map((c) =>
+      c.name === PINNED.column
+        ? `${c.name} ${c.version} (frozen ${PREBUILT_FROZEN})`
+        : `${c.name} ${c.version}`
+    ),
+  ];
   const lines = [
     `| ${head.join(" | ")} |`,
     `| ${head.map(() => "---").join(" | ")} |`,
@@ -456,12 +493,18 @@ function blockFor(columns: Column[], date: string): string {
   const provenance = provenanceOf(prebuiltRelease);
   const paths = columns.map((c) => `- \`${c.name}\` — ${provenance[c.name]}`);
   return [
-    `Observed **${date}**, by running \`probeCapabilities()\` against each ` +
-    `library at the path below, each in its own process. Every \`no\` is a ` +
-    `measured negative — the symbol was looked for in that file, on that ` +
-    `date, and was not there — not an unchecked cell. In the repository the ` +
-    `\`table\` task rewrites this block and the \`test:table\` gate fails if ` +
-    `it is stale; neither script is in the published package.`,
+    `Observed **${date}** for the \`system\` and \`vendored\` columns, by ` +
+    `running \`probeCapabilities()\` against each library at the path below, ` +
+    `each in its own process. The third column is a dated historical ` +
+    `comparison and is NOT current: its cells are re-read from the cached ` +
+    `prebuilt on every run, but nothing refreshes that cache, so the file ` +
+    `stays as downloaded on **${PREBUILT_FROZEN}** and the column reports ` +
+    `what that release shipped rather than what \`@db/sqlite\` ships now. ` +
+    `Every \`no\` is a measured negative — the symbol was looked for in that ` +
+    `file, on the date given for its column, and was not there — not an ` +
+    `unchecked cell. In the repository the \`table\` task rewrites this ` +
+    `block and the \`test:table\` gate fails if it is stale; neither script ` +
+    `is in the published package.`,
     ``,
     table,
     ``,
@@ -512,6 +555,26 @@ function manifestDisagreement(
   }
   if (manifestSha !== fileSha) {
     return `build_manifest.json records librarySha256 ${manifestSha}, the file is ${fileSha}`;
+  }
+  return null;
+}
+
+/**
+ * Why the frozen date on the prebuilt column is no longer true, or `null`.
+ *
+ * Pure, and fixtured below, because the only way to see it fire against the
+ * real cache would be to re-download or touch `$DENO_DIR/plug` -- mutating the
+ * developer's cache to test an assertion about it. `mtime` is null on file
+ * systems that do not report one; that is a refusal, not a pass, because a
+ * control that cannot read its input has not checked anything.
+ */
+function frozenStale(mtime: Date | null, frozen: string): string | null {
+  if (mtime === null) {
+    return `no mtime for the cached library, so the frozen date ${frozen} cannot be contradicted`;
+  }
+  const day = mtime.toISOString().slice(0, 10);
+  if (day > frozen) {
+    return `the cached library was written ${day}, after the frozen date ${frozen} — the prebuilt column is being presented as older than it is`;
   }
   return null;
 }
@@ -638,6 +701,20 @@ async function gate(columns: Column[]): Promise<void> {
       `known answer: ${PINNED.column}.${PINNED.row} is ${PINNED.value}`,
       `measured ${actual}`,
     );
+  }
+
+  // The frozen date is the one identifying string in the block that is not
+  // read off the artefact, so this is what would have to change on disk for it
+  // to become wrong: the cached library being written again.
+  if (pinned !== undefined) {
+    const what =
+      `the cached prebuilt has not been rewritten since ${PREBUILT_FROZEN}`;
+    const stale = frozenStale(
+      Deno.statSync(pinned.path).mtime,
+      PREBUILT_FROZEN,
+    );
+    if (stale === null) pass(what);
+    else fail(what, stale);
   }
 }
 
@@ -1207,6 +1284,39 @@ async function structure(): Promise<void> {
     if (line.includes("release unknown") && !/\d+\.\d+\.\d+/.test(line)) {
       pass(what);
     } else fail(what, `rendered ${line}`);
+  }
+  {
+    // The frozen-date control, seen rejecting. A date after the frozen one is
+    // the re-download case; the same day and an earlier day are both fine, and
+    // an unreadable mtime refuses rather than passes.
+    for (
+      const c of [
+        {
+          name: "written the frozen day",
+          mtime: "2026-09-09T16:39:44Z",
+          bad: false,
+        },
+        {
+          name: "written before it",
+          mtime: "2026-09-01T00:00:00Z",
+          bad: false,
+        },
+        {
+          name: "re-downloaded the day after",
+          mtime: "2026-09-10T01:28:25Z",
+          bad: true,
+        },
+        { name: "no mtime at all", mtime: null, bad: true },
+      ]
+    ) {
+      const got = frozenStale(
+        c.mtime === null ? null : new Date(c.mtime),
+        "2026-09-09",
+      );
+      const what = `frozen-date control: ${c.name}`;
+      if ((got !== null) === c.bad) pass(`${what} → ${got ?? "ok"}`);
+      else fail(what, `said ${got ?? "ok"}`);
+    }
   }
   {
     // Pays for fixturing the parser on strings: the file the real cache holds

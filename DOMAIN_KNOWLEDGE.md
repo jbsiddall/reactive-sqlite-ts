@@ -934,5 +934,9 @@ change on this data CAN move the printed rows; on these 18 it did not.
 **The per-flag byte deltas are not additive.** Against the 1,606,768-byte
 baseline: PERCENTILE +288, CARRAY +224, STAT4 +12,288, SNAPSHOT +4,096. Those
 sum to 16,896, while all four built together cost +20,992 — the figure quoted
-above. Quoting a per-flag delta as a share of a combined total, or adding them
-up to predict one, is wrong by about 24%.
+above. The 4,096-byte gap has two sizes because it has two denominators, and the
+earlier single figure named neither. Reading a per-flag delta as a share of the
+combined total understates the flags: the parts account for 16,896 of the 20,992
+bytes, so 19.5% of the combined total is unattributed to any one flag. Adding
+the parts up to predict the combined total errs the other way: 20,992 is 24.2%
+more than the 16,896-byte sum of parts.
