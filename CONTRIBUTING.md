@@ -175,23 +175,68 @@ redundant with the live controls; on such a library they are all there is. The
 COUNT of not-exercisable rows is pinned per SQLite version and `--check` fails
 on drift, so rows cannot quietly become unmeasured while the tool still exits 0.
 
-### Recommendation: the prebuilt column should not survive vendoring
+### Superseded: the prebuilt column did not survive vendoring, but its numbers did
 
-The `@db/sqlite prebuilt` column in README's capability table is the only
-library reachable here that genuinely lacks `preupdate` and `progress`, so it is
-the only thing that could ever cover those two refusals. It is also not a
-library this project chooses, pins or ships: it is whatever `@db/sqlite` 0.13.0
-downloads into `$DENO_DIR/plug/` when `DENO_SQLITE_PATH` is unset, it changes
-without notice, and once the vendored library ships it is not a configuration
-any user of this package is in.
+The reasoning this section used to carry: the `@db/sqlite prebuilt` column in
+README's capability table was, before vendoring, the only library reachable here
+that genuinely lacked `preupdate` and `progress`, so it was the only thing that
+could ever cover those two refusals. It is also not a library this project
+chooses, pins or ships: it is whatever `@db/sqlite` 0.13.0 downloads into
+`$DENO_DIR/plug/` when `DENO_SQLITE_PATH` is unset, it changes without notice,
+and once the vendored library ships it is not a configuration any user of this
+package is in.
 
-Recommendation: **drop the column** when the table is regenerated at vendoring,
-and keep this section as the record of what went with it. Reporting a library
-nobody runs, cannot pin, and is being actively steered away from is worse than
-reporting two columns and saying plainly that five refusal branches have no
-library here that can reach them. The alternative — keeping the column to hold
-onto two rows of coverage — buys coverage of a configuration the project is
-telling people not to use.
+On that reasoning an earlier revision of this section recommended **dropping the
+column** at vendoring. That recommendation is **superseded**, and the reasoning
+was rejected for two things it did not account for.
+
+First, dropping the column does not leave the tables silent about the prebuilt;
+it leaves them asserting a state the tree does not have. The comparison tables
+and the README capability table are read as a description of what a library here
+does, and a table from which the only `preupdate`-lacking library has been
+deleted reads as "every library reachable here has `preupdate`". That is a
+stronger claim than the one being retired, and it is false.
+
+Second, the column is a **measured negative**, and Rule 1b applies to it: no
+other library reachable from this tree can reproduce it. Deleting it destroys
+the only observation that distinguishes "these two refusal branches have never
+been exercised" from "these two refusal branches cannot be exercised". Coverage
+of a configuration nobody should use is indeed worth little; the measurement
+that the configuration behaves differently is not the same thing, and it is not
+replaceable.
+
+So the column survives — **not as a column**. It is carried forward as a dated
+historical comparison, with its observation date unchanged and stated beside the
+figures, and the table says on its face that this is what the entry is. A dated
+observation of a library the project no longer runs is honest; the same figures
+in a live column, implying they would be reproduced by a run today, are not.
+
+#### What vendoring changed: not-covered became not-coverable
+
+Before vendoring, the two refusal branches were **not covered**: no run in the
+gate exercised them, but a run that set `DENO_SQLITE_PATH` aside could. After
+vendoring they are **not coverable from this tree**. Three measurements
+establish that, and the third is the one that matters:
+
+- A prebuilt IS present in this machine's `$DENO_DIR/plug/` — one artefact,
+  whose sidecar metadata names the 0.13.0 release URL, with an `.so` mtime
+  earlier than the vendoring commit. It is a leftover of the pre-vendoring tree,
+  inspected read-only. Its presence is why the column can still be produced HERE
+  and is not evidence that it can be produced anywhere else.
+- Nothing in the tree downloads one. Every reference to the plug cache in code
+  READS an existing directory; none fetches.
+- No task in `deno.json` grants `--allow-net`. So on a machine without that
+  leftover, a fetch is not merely absent from the code: it is refused by the
+  permission set. The failure mode is a denied permission, not a missing call
+  someone could add back in passing.
+
+The cheap reading — "the column is still produced, so the coverage is still
+there" — predicts that a fresh clone on a clean machine reproduces it. It does
+not: with an empty plug cache the tool prints that no prebuilt is present in
+`$DENO_DIR/plug` and skips. That prediction is absent, which settles it. What
+remains on this machine is an unreproducible leftover, and a number that only
+one machine in the world can regenerate is a historical record whatever the
+tooling calls it.
 
 ### Which callbacks can be on the stack at once
 
