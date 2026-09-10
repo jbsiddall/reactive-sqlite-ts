@@ -1,9 +1,11 @@
 # Driver defects
 
 **The driver is now ours.** It lives in `driver/`, vendored from
-[the Deno SQLite3 driver](https://github.com/denodrivers/sqlite3) 0.13.0 (see
-`NOTICE`). This file is therefore no longer a bug report about somebody else's
-code: it is the record of which defects the vendoring fixed, which one it
+[the Deno SQLite3 driver](https://github.com/denodrivers/sqlite3) at release
+0.13.0. `NOTICE` carries the attribution for that vendoring — project,
+copyright, licence and what was modified — and not the release number, which is
+recorded here. This file is therefore no longer a bug report about somebody
+else's code: it is the record of which defects the vendoring fixed, which one it
 deliberately carried, and where the vendored code diverges without any defect
 being claimed on either side.
 

@@ -25,9 +25,12 @@ Two things license 0.13.0 and they say different things, so both are here. It is
 the release these facts were READ AND MEASURED AGAINST: the JSR source
 (`https://jsr.io/@db/sqlite/0.13.0/src/statement.ts`), confirmed by running
 against it. And it is the release `driver/` was VENDORED FROM, recorded in
-`DRIVER_DEFECTS.md` and `NOTICE` — which is why observations of somebody else's
-0.13.0 still describe the ancestor of the code in this tree, and why they are
-worth keeping now that the package is gone from `imports`.
+`DRIVER_DEFECTS.md` — which is why observations of somebody else's 0.13.0 still
+describe the ancestor of the code in this tree, and why they are worth keeping
+now that the package is gone from `imports`. `NOTICE` is not a second record of
+that number and is not expected to be: it discharges an attribution obligation —
+project, copyright, licence, and what was modified — and a release number is no
+part of one.
 
 What does NOT license it is the prebuilt in `$DENO_DIR/plug/`. That artefact's
 metadata names the same release, so it is the obvious thing to reach for, but
