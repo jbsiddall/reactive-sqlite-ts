@@ -1,0 +1,157 @@
+# The ONE definition of how the vendored SQLite libraries are built, validated
+# and packaged. Both sqlite-vendor.yml (contents: read) and
+# sqlite-vendor-release.yml (contents: write) call this and nothing else.
+#
+# WHY A REUSABLE WORKFLOW RATHER THAN TWO COPIES
+# ----------------------------------------------
+# The read-only sibling exists so a reviewer can watch the build go green. That
+# proves nothing about the publishing twin unless the two run the SAME thing.
+# When they were two copies, the day they drifted was the day a tag push
+# quietly produced a differently-built artefact, and the green sibling said so
+# with total confidence.
+#
+# It is a reusable WORKFLOW and not a composite action for one specific reason:
+# the matrix -- and therefore `runs-on` -- lives INSIDE it. A composite action
+# shares steps but cannot carry a matrix, so both callers would still name
+# their own runners, and "which runners does a release build on" would still be
+# answered in two places. That duplication is the exact defect the factoring
+# exists to remove, so the form that cannot remove it was not chosen.
+#
+# PERMISSIONS AT THE CALL BOUNDARY: this workflow declares `contents: read` and
+# needs nothing more -- it builds, validates, packages and checksums, and never
+# uploads anything anywhere but the run's own artifact store. The `contents:
+# write` half of the release lives in the CALLER, in a separate job that only
+# downloads what this produced. So there is no permission to plumb through, and
+# the shared half can never publish even when a caller could.
+#
+# NATIVE ON BOTH ARCHITECTURES
+# ----------------------------
+# aarch64 was cross-compiled with gcc-aarch64-linux-gnu and validated under
+# qemu-user, because that was the only way to get an arm64 artefact off an
+# x86_64 runner. GitHub-hosted arm64 runners (`ubuntu-24.04-arm`) removed the
+# need: both targets now compile and execute on their own hardware, and
+# vendor/build.sh takes no `--arch` here at all -- it reads `uname -m`.
+#
+# THE ASSET NAMING CONTRACT (frozen; a consumer constructs URLs from it)
+#
+#   <target>  is what vendor/build.sh names its output directory:
+#             "${OS}-${ARCH}-${LIBC}" -- e.g. linux-x86_64-gnu, linux-aarch64-gnu.
+#
+#   libsqlite3-<target>.tar.gz    libsqlite3.so + build_manifest.json
+#   libsqlite3-<target>.so        the bare library, loadable by Deno.dlopen
+#   SHA256SUMS                    plain names, covering BOTH of the above
+#
+#   https://github.com/<owner>/<repo>/releases/download/sqlite-vendor-v<sqlite version>/<name>
+#
+# LIBC IS SNIFFED FROM THE BUILD HOST (`ldd --version` in build.sh), and both
+# runners are glibc, so every asset published here is `-gnu`. There is no musl
+# artefact. A consumer substituting `musl` into the template above gets a 404;
+# the template implies only the targets in the matrix below.
+name: sqlite-vendor-build
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      # Both targets always report. Learning that aarch64 failed is worth more
+      # than the minute cancelling x86_64 would save.
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64-gnu
+            runs-on: ubuntu-24.04
+          - target: linux-aarch64-gnu
+            runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # Nothing in Actions checks that a `runs-on` label agrees with the target
+      # triple sitting beside it in the matrix. This does, before anything is
+      # built, so a mislabelled runner cannot produce an x86_64 library under
+      # an aarch64 name.
+      - name: Assert this runner IS the target natively
+        run: .github/scripts/assert_native_target.sh "${{ matrix.target }}"
+
+      # No cross toolchain and no qemu: the compiler is the host's cc, and the
+      # result runs on the machine that made it. --keep-src leaves sqlite3.h in
+      # place for smoke_test.sh to compile against.
+      - name: Build
+        run: vendor/build.sh --keep-src
+
+      - name: Smoke test (native)
+        run: vendor/smoke_test.sh
+
+      # The cross-compiled aarch64 artefact carried a third NEEDED entry,
+      # ld-linux-aarch64.so.1, that the x86_64 one did not. It was suspected to
+      # be an artefact of cross-linking. This step is how that stops being a
+      # suspicion: the list is printed for every native build, every run.
+      - name: Report the library's NEEDED entries
+        run: |
+          set -euo pipefail
+          so="vendor/lib/${{ matrix.target }}/libsqlite3.so"
+          file "$so"
+          echo "--- objdump -p ${so} | grep NEEDED ---"
+          objdump -p "$so" | grep NEEDED
+
+      - name: Package
+        run: .github/scripts/package_target.sh "${{ matrix.target }}" "vendor/lib/${{ matrix.target }}" out
+
+      - name: Upload this target's assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: vendor-assets-${{ matrix.target }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # Packaging and checksum generation need no permission and no tag, so they
+  # run here -- in the shared half -- and are therefore exercised by the
+  # read-only sibling on every PR. Only the upload itself stays unexercised
+  # until a tag exists. This is also where the asset NAMES are first computed,
+  # and those names are permanent from the first release onward.
+  collect:
+    name: collect and checksum
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Download every target's assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: vendor-assets-*
+          merge-multiple: true
+          path: out
+
+      # Asserts the SET, not just each member: a target the matrix never
+      # enumerates schedules no job, so no assertion inside a build can fire
+      # for it, and the release would ship an architecture short with every
+      # job green. Then generates SHA256SUMS over BOTH assets per target and
+      # verifies what it wrote.
+      #
+      # SHA256SUMS is served from the same origin as the assets and is not
+      # signed. It detects a corrupted download. It is not evidence of
+      # provenance and must not be described as one.
+      - name: Assert the artefact set and generate SHA256SUMS
+        run: .github/scripts/collect_release_assets.sh out
+
+      - name: Upload the release asset set
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: out/*
+          if-no-files-found: error
+          retention-days: 7

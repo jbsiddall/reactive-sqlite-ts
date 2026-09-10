@@ -1,10 +1,29 @@
 # Publish the vendored SQLite libraries as GitHub Release assets.
 #
-# Separate from sqlite-vendor.yml because this one holds `contents: write`, and
-# the rule is that a workflow which can publish never runs on unreviewed code.
-# This one runs only on a tag a human pushed.
+# Separate from sqlite-vendor.yml because this one can write to the repository,
+# and the rule is that a workflow which can publish never runs on unreviewed
+# code. It runs only on a tag a human pushed. There is deliberately no
+# workflow_dispatch and no other trigger here; adding one would end that
+# guarantee, and the request has been refused before.
 #
 #   git tag sqlite-vendor-v3.53.4 && git push origin sqlite-vendor-v3.53.4
+#
+# The build is NOT defined here. It is sqlite-vendor-build.yml, the same file
+# the read-only sibling calls, so the sibling's green run is evidence about the
+# steps, the runners and the asset names this workflow will use. Only the
+# `publish` job below is unique to this file, and it is the only job holding
+# `contents: write`.
+#
+# WHAT IS AND IS NOT ASYMMETRIC BETWEEN THE TWO WORKFLOWS
+# -------------------------------------------------------
+# It used to be the build: x86_64 ran natively and aarch64 was cross-compiled
+# and executed under qemu-user. That is over -- both architectures now build
+# and run on their own native hardware (see sqlite-vendor-build.yml). What
+# remains asymmetric is the PUBLISH: the shared workflow builds, validates,
+# packages and checksums on every pull request, and the one step no sibling run
+# has ever exercised is the upload below, because it needs a tag and a
+# permission the sibling does not have. Every asset is still executed before it
+# is uploaded; an artifact that has never run does not ship.
 #
 # WHY RELEASE ASSETS RATHER THAN COMMITTED BINARIES
 # -------------------------------------------------
@@ -14,9 +33,6 @@
 # release assets and fetches them at runtime via @denosaurs/plug. That is
 # working evidence from the library this project's driver was vendored from,
 # not a preference.
-#
-# Every asset here has been executed before it is uploaded: x86_64 natively,
-# aarch64 under qemu-user. An artifact that has never run does not ship.
 name: sqlite-vendor-release
 
 on:
@@ -24,46 +40,37 @@ on:
     tags:
       - "sqlite-vendor-v*"
 
+# Least privilege at the top; the single job that needs to write says so for
+# itself. The shared build workflow additionally declares `contents: read` on
+# its own account, so it cannot publish even from here.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
+  build:
+    uses: ./.github/workflows/sqlite-vendor-build.yml
+
+  publish:
+    name: publish the release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      # Exactly what the shared workflow asserted and checksummed. Nothing is
+      # rebuilt, repackaged or re-checksummed here: if this job could produce
+      # an asset, the sibling's run would stop being evidence about it.
+      - name: Download the asset set the shared build produced
+        uses: actions/download-artifact@v4
         with:
-          fetch-depth: 1
+          name: release-assets
+          path: out
 
-      - name: Install the cross toolchain and qemu
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user-static
-
-      - name: Build and validate x86_64
-        run: |
-          vendor/build.sh --keep-src
-          vendor/smoke_test.sh
-
-      - name: Build and validate aarch64
-        run: |
-          vendor/build.sh --arch aarch64 --keep-src
-          vendor/smoke_test.sh --arch aarch64
-
-      # One tarball per target, each carrying its manifest, so an asset is
-      # self-describing: SQLite version, flag list, source checksum.
-      - name: Package
-        id: package
+      - name: Show what is about to be published
         run: |
           set -euo pipefail
-          mkdir -p out
-          for dir in vendor/lib/*/; do
-            target="$(basename "$dir")"
-            tar -czf "out/libsqlite3-${target}.tar.gz" -C "$dir" libsqlite3.so build_manifest.json
-          done
-          ( cd out && sha256sum ./*.tar.gz > SHA256SUMS )
+          ls -l out
+          echo "--- SHA256SUMS ---"
           cat out/SHA256SUMS
 
       - name: Publish
@@ -73,8 +80,38 @@ jobs:
           fail_on_unmatched_files: true
           body: |
             Vendored SQLite shared libraries, built from the pinned amalgamation
-            by `vendor/build.sh` and validated by `smoke_test.sh` (aarch64 under
-            qemu-user) before upload.
+            by `vendor/build.sh` and validated by `smoke_test.sh` before upload.
+            Both architectures are built and executed on native runners; nothing
+            here is cross-compiled or emulated.
 
-            Each tarball contains `libsqlite3.so` and its `build_manifest.json`
-            (SQLite version, exact compile-flag list, source SHA3-256/SHA-256).
+            **Assets, per target.** `<target>` is the triple `vendor/build.sh`
+            names its output directory with — `"${OS}-${ARCH}-${LIBC}"` — which
+            is what `src/vendored.ts` computes from `Deno.build.{os,arch}`:
+
+            | target | tarball | bare library |
+            | --- | --- | --- |
+            | `linux-x86_64-gnu` | `libsqlite3-linux-x86_64-gnu.tar.gz` | `libsqlite3-linux-x86_64-gnu.so` |
+            | `linux-aarch64-gnu` | `libsqlite3-linux-aarch64-gnu.tar.gz` | `libsqlite3-linux-aarch64-gnu.so` |
+
+            **The documented install fetches the bare `libsqlite3-<target>.so`.**
+            `Deno.dlopen` takes a path to a shared object and cannot be handed a
+            `.tar.gz`. Take the tarball instead when you want the
+            `build_manifest.json` beside it — the exact SQLite version, the full
+            compile-flag list and the source checksums the library was built
+            from.
+
+            Both runners are glibc, so every asset here is `-gnu`. **There is no
+            musl build**; substituting `musl` into the names above resolves to
+            nothing.
+
+            Every asset URL is a pure function of the tag and the target:
+
+            ```
+            https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/libsqlite3-<target>.so
+            ```
+
+            `SHA256SUMS` covers every tarball and every bare library, under
+            those plain names, so `sha256sum -c SHA256SUMS` works wherever you
+            downloaded them. It is served from this same release and is not
+            signed: it will catch a corrupted download, and it is not evidence
+            of provenance.

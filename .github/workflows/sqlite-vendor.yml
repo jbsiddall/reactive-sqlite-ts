@@ -4,25 +4,38 @@
 # was never given the permission, so it needs no guards. The publishing twin is
 # sqlite-vendor-release.yml.
 #
+# The build itself is NOT defined here. Both this workflow and the release twin
+# call sqlite-vendor-build.yml, so a green run here is evidence about the same
+# steps, the same runners and the same asset names a tag push would use. Read
+# that file for the matrix, the naming contract and why it is a reusable
+# workflow rather than a composite action.
+#
 # WHY THIS EXISTS AT ALL
 # ----------------------
 # vendor/lib/ is gitignored (see that directory's README, "Committing the
 # binaries"). Nothing keeps the build script working except a job that runs it,
-# so this one runs it on both target architectures and proves each result
-# actually executes -- the aarch64 one under qemu-user, because a
-# cross-compiled library that has never run is not evidence of anything.
+# so this one runs it on both target architectures -- each on its own native
+# runner -- and proves each result actually executes.
 #
 # It deliberately does NOT need Deno for the build: build.sh and smoke_test.sh
-# are bash + cc. Deno appears only for the probe and the SESSION demo, which
-# are x86_64-only here for the obvious reason that this runner has no aarch64
-# Deno to run them with.
+# are bash + cc. Deno appears only for the probe and the SESSION demo below,
+# which stay x86_64-only: they are capability checks on the build recipe, not
+# on the machine, and the flags they probe are compiled in from the same
+# FLAGS list on both runners.
 name: sqlite-vendor
 
 on:
   pull_request:
     paths:
       - "vendor/**"
+      # Every file the build is now made of. The factoring moved most of this
+      # workflow's substance into a sibling file and a script directory; a
+      # filter still naming only this file would have stopped watching the
+      # parts that matter most.
       - ".github/workflows/sqlite-vendor.yml"
+      - ".github/workflows/sqlite-vendor-build.yml"
+      - ".github/workflows/sqlite-vendor-release.yml"
+      - ".github/scripts/**"
   workflow_dispatch:
 
 permissions:
@@ -33,35 +46,25 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Build, validate, package and checksum -- byte-for-byte the same definition
+  # the release runs. Everything except the upload.
   build:
-    runs-on: ubuntu-latest
+    uses: ./.github/workflows/sqlite-vendor-build.yml
+
+  # Capability checks that need Deno, and therefore do not belong in the shared
+  # build (the release path has never run them and does not need to: they
+  # interrogate the compile-flag set, which is the same on both runners).
+  capabilities:
+    name: capability probe (x86_64)
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      # gcc-aarch64-linux-gnu cross-compiles; libc6-dev-arm64-cross supplies the
-      # target headers (without it the build dies on bits/libc-header-start.h);
-      # qemu-user-static is what lets the result be run and therefore trusted.
-      - name: Install the cross toolchain and qemu
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user-static
-
-      # --keep-src leaves sqlite3.h in place for smoke_test.sh to compile against.
       - name: Build x86_64
         run: vendor/build.sh --keep-src
-
-      - name: Build aarch64 (cross)
-        run: vendor/build.sh --arch aarch64 --keep-src
-
-      - name: Smoke test x86_64 (native)
-        run: vendor/smoke_test.sh
-
-      - name: Smoke test aarch64 (under qemu-user)
-        run: vendor/smoke_test.sh --arch aarch64
 
       - name: Install Deno
         uses: denoland/setup-deno@v2
@@ -74,14 +77,3 @@ jobs:
 
       - name: SESSION extension end-to-end (x86_64)
         run: deno task vendor:session-demo
-
-      # Downloadable from the run, so a reviewer can try a library without a
-      # compiler. Not a release: this workflow has no write permission.
-      - name: Upload the built libraries
-        uses: actions/upload-artifact@v4
-        with:
-          name: libsqlite3-linux
-          path: |
-            vendor/lib/*/libsqlite3.so
-            vendor/lib/*/build_manifest.json
-          if-no-files-found: error
