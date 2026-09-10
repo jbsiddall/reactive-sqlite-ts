@@ -198,8 +198,16 @@ for f in "${FLAGS[@]}"; do DEFINES+=("-D${f}"); done
 
 # -fPIC: shared library. -O2: sqlite.org's own recommendation; -O3 is not
 # measurably better and lengthens an already slow single-translation-unit build.
-# -Wl,-soname keeps the SONAME stable so a consumer's dlopen path is the only
-# name that matters.
+# -Wl,-soname sets this file's SONAME. It does NOT make the consumer's dlopen
+# path the name that matters, and the sentence that used to stand here said it
+# did. Measured 2026-09-10 on x86_64 Linux under a Deno binary that itself links
+# libsqlite3 dynamically (the Deno 2.9.6 from nixpkgs; the official install does
+# not): sqlite3_libversion() returned the same 3.53.3 whichever of three
+# different files was dlopened -- Debian's 3.45.1, this build's 3.53.4, and
+# nixpkgs' own 3.53.3 -- and a copy of this build given a
+# SONAME colliding with nothing behaved identically. So the SONAME here buys
+# tidiness, not isolation: nothing about this link line guarantees that the file
+# a caller names is the file that answers.
 COMMON=(-fPIC -O2 -DNDEBUG -I"${AMALG}")
 if [ "$OS" = darwin ]; then
   LINK=(-dynamiclib -install_name "@rpath/${SO_NAME}")
@@ -266,6 +274,13 @@ if command -v "$NM" >/dev/null 2>&1 && [ "$OS" = linux ]; then
 fi
 
 SIZE_BYTES="$(stat -c%s "${OUT_DIR}/${SO_NAME}" 2>/dev/null || stat -f%z "${OUT_DIR}/${SO_NAME}")"
+# Read separately, and required to be non-empty, rather than substituted into
+# the printf below: a failing `--version` there is swallowed and writes
+# `"compiler": ""`, which is what a successful build of an unidentifiable
+# compiler would also write. Failure and success must not produce the same
+# manifest.
+COMPILER_ID="$("$CC" --version 2>/dev/null | head -1 | sed 's/"/\\"/g')"
+[ -n "$COMPILER_ID" ] || { echo "could not identify the compiler: ${CC} --version produced nothing" >&2; exit 1; }
 SO_SHA256="$(sha256sum "${OUT_DIR}/${SO_NAME}" | awk '{print $1}')"
 
 # ---------------------------------------------------------------------------
@@ -281,7 +296,7 @@ SO_SHA256="$(sha256sum "${OUT_DIR}/${SO_NAME}" | awk '{print $1}')"
   printf '  "libraryFile": "%s",\n' "$SO_NAME"
   printf '  "librarySha256": "%s",\n' "$SO_SHA256"
   printf '  "librarySizeBytes": %s,\n' "$SIZE_BYTES"
-  printf '  "compiler": "%s",\n' "$("$CC" --version 2>/dev/null | head -1 | sed 's/"/\\"/g')"
+  printf '  "compiler": "%s",\n' "$COMPILER_ID"
   printf '  "crossCompiled": %s,\n' "$([ "$CROSS" -eq 1 ] && echo true || echo false)"
   printf '  "builtAtUtc": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf '  "flags": [\n'

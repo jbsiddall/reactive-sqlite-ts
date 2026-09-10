@@ -135,6 +135,109 @@ accident of how `vendor/build.sh` links today — one `-Wl,-soname` away from
 three identical, plausible columns and no error. `tools/capability_table.ts`
 probes each library in its own child process anyway, for that reason.
 
+### A Deno that links libsqlite3 itself answers every `dlopen` from its own copy
+
+**Observed 2026-09-10**, on `ubuntu-24.04` x86_64 in CI, Deno 2.9.6 in both
+roles. This is the sharpest thing in this file about `DENO_SQLITE_PATH`, and it
+was not suspected before it was measured.
+
+**The two Deno builds differ in how they get SQLite, and that is the whole
+mechanism.** The official Deno 2.9.6 install carries SQLite statically: no
+`libsqlite3` appears in its `DT_NEEDED` and `nm -D` finds no
+`sqlite3_libversion` in it. The Deno 2.9.6 from nixpkgs links it dynamically:
+its `DT_NEEDED` includes the UNVERSIONED `libsqlite3.so`, and `nm -D` finds
+`sqlite3_libversion` exported.
+
+**Under the official Deno, the file you name is the file that answers.**
+`sqlite3_libversion()`, called through a handle from `Deno.dlopen` on an
+explicit path, returned `3.45.1` for Debian's `libsqlite3.so.0`, `3.53.4` for
+the build `vendor/build.sh` produces, and `3.53.3` for nixpkgs' — each its own
+version, three for three.
+
+**Under the nixpkgs Deno, all three returned `3.53.3`** — nixpkgs' version, the
+one its `DT_NEEDED` names. A 3.45.1 file cannot report 3.53.3 and neither can a
+3.53.4 one. The path passed to `Deno.dlopen` did not decide which code ran.
+
+**It is not a SONAME collision, which was the obvious theory and is falsified.**
+`vendor/build.sh` gives its artefact the SONAME `libsqlite3.so`, byte-for-byte
+the unversioned name in that `DT_NEEDED`. A copy of the same artefact with its
+SONAME rewritten to `libreactivesqlite3.so`, colliding with nothing, still
+reported `3.53.3` under that Deno, and still crashed where the original crashed.
+So renaming is not a fix and is not proposed as one.
+
+**`dladdr` cannot see any of this, and that is a fact about the instrument.**
+Taking the address of `sqlite3_libversion` with
+`Deno.dlopen(path, { name: {
+type: "pointer" } })` and passing it to `dladdr`
+from `libc.so.6` reported the NAMED file on three of the four arms measured
+under the nixpkgs Deno, including both arms that then died of `SIGSEGV`. It
+disagreed only where two names inside one store path differ: named
+`libsqlite3.so.3.53.3`, reported `libsqlite3.so`. So `dladdr` agrees with the
+caller's path while the version string disagrees, in the same process, in the
+same run. **Which instrument is lying is not known**, and no provenance check is
+built on either one until it is: a detector reached by the same route as the
+fault is not a detector.
+
+**The version guard in `src/hooks.ts` cannot catch it either**, for the reason
+that follows from the above rather than from any weakness in the guard. It
+compares `sqlite3_libversion()` against the driver's `sqlite_version()`. Both
+travel through the interposed library, so both read `3.53.3` and agree. A guard
+whose two sides share the corrupted channel reports agreement, not health.
+
+**Consequences, and they cross the whole `DENO_SQLITE_PATH` contract.** On such
+a host the variable does not select a SQLite: it is VOID as a choice, not merely
+unreliable, because the answering library is the same one for every value it can
+be given. It is not inert — naming a build other than the one answering is how
+the process comes to die of `SIGSEGV`, so the variable can still break you while
+being unable to help you. The capability set, the version and the compile
+options all belong to a library nobody named. And `tools/capability_table.ts`
+probing each library in a child process, recorded above as sufficient, is
+sufficient only against SONAME dedup within one process, not against this.
+
+### What the nixpkgs configuration does and does not do (2026-09-10)
+
+Measured in one CI job, `ubuntu-24.04` x86_64, nix installed on the runner.
+Three configurations, same job, same commit:
+
+- **nixpkgs Deno + `DENO_SQLITE_PATH` at nixpkgs' own sqlite 3.53.3: WORKS.**
+  459 passed, 0 failed, 1 skipped, counted off the `^  (pass|FAIL|SKIP)` verdict
+  markers of the suite's own log. **It does not work because the path was
+  honoured.** By the section above, the path is not what chose the library; it
+  works because the library that answers regardless is nixpkgs' sqlite and
+  nixpkgs' sqlite happens to be built with the hooks this project needs. The
+  outcome is what a configured success would look like and the reason is not,
+  which is the whole reason this entry exists. Nobody who follows it has
+  configured anything.
+- **official Deno + the vendored 3.53.4 build: WORKS.** 460 / 0 / 0, by the same
+  count over the same markers. The one-test delta is the
+  `SQLITE_ENABLE_NORMALIZE` case and nothing else.
+- **nixpkgs Deno + the vendored 3.53.4 build: DIES.** `SIGSEGV`, exit 139, core
+  dumped, before the suite emits a single verdict line (0 / 0 / 0). Also dies
+  with the SONAME-renamed copy of that same build, identically.
+
+**The skip was PREDICTED BEFORE THE RUN, and could have falsified.** nixpkgs'
+sqlite was known to lack `SQLITE_ENABLE_NORMALIZE`, so exactly one named test
+was predicted to skip and every other test to pass. Had a second test skipped,
+or had a different one skipped, or had that one passed, the prediction would
+have failed and is written here so that a reader can tell it was a prediction
+rather than a description written afterwards. It held: the single skip line
+names `normalized-sql behaviour` and gives the absent option as its reason.
+
+**The working configuration was established behaviourally, not by inspection.**
+A subscription over a real `INSERT`, `UPDATE` and `DELETE` produced three row
+events in that order with the expected old and new rows. The ordering assertion
+was shown load-bearing by mutation: with the `UPDATE` statement deleted the same
+probe printed `event count = 2` and `BEHAVIOUR VERDICT: WRONG` and exited 3.
+Compile options were read with `pragma compile_options` off the library that
+actually answered — 57 options, `ENABLE_PREUPDATE_HOOK` and `ENABLE_SESSION`
+present, `ENABLE_NORMALIZE` absent — rather than off the derivation, precisely
+because the section above says the derivation is not evidence of what answered.
+
+**One bound, and it matters for anything written for users.** The nixpkgs sqlite
+that job resolved was one specific store path, from the flake registry pin that
+runner had on 2026-09-10. A user on another nixpkgs revision may resolve a
+different one. That is unmeasured and unmeasurable from here.
+
 ## SQLite: attribution hazards for a query-to-tables map
 
 **UNSTAMPED.** These were measured while the authorizer hook was built, but the

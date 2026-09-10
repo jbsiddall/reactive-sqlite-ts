@@ -56,6 +56,63 @@ message. The library compares `sqlite3_libversion()` against the driver's
 `sqlite_version()` and refuses to attach on a mismatch, which catches the
 realistic mistake but is not proof of one file.
 
+**Under a `deno` that links `libsqlite3` itself, `DENO_SQLITE_PATH` cannot
+choose your SQLite at all.** Every `dlopen` is answered by that binary's own
+copy, whatever path you gave and whatever SONAME the file you gave carries.
+Measured 2026-09-10 on x86_64 Linux with the Deno 2.9.6 from nixpkgs: three
+different libraries — Debian's 3.45.1, this project's vendored 3.53.4, and
+nixpkgs' 3.53.3 — all reported `3.53.3`, and so did a copy of the vendored build
+renamed to a SONAME that collides with nothing. The variable is not merely
+unreliable there: as a way of selecting which SQLite answers, it is void. It is
+not inert, though — naming a library that is not the one answering is exactly
+how the process comes to die of `SIGSEGV`.
+
+The official Deno install carries SQLite statically and does not do this; under
+it each of those three libraries reported its own version. The version guard
+described above cannot catch the nixpkgs case, because both sides of the
+comparison read the same substituted library and therefore agree.
+
+### On Nix
+
+There is nothing to configure here, and that is the finding rather than a
+convenience. Under a nixpkgs `deno`, nixpkgs' own sqlite answers whatever you
+do; the working setup is the one that names that same library, so that the file
+you name and the code that runs are at least the same build:
+
+```sh
+NIXOUT=$(nix build --no-link --print-out-paths nixpkgs#sqlite.out)
+DENO_SQLITE_PATH=$(find "$NIXOUT" -name 'libsqlite3.so*' -type f | head -1)
+[ -n "$DENO_SQLITE_PATH" ] || { echo "no libsqlite3 under $NIXOUT" >&2; exit 1; }
+export DENO_SQLITE_PATH
+```
+
+**This works, and it does not work because the path was honoured.** It works
+because the library that answers regardless is nixpkgs' sqlite, and nixpkgs'
+sqlite happens to be compiled with the hooks this project needs. Same outcome as
+a configuration, arrived at for an entirely different reason: you have not
+selected anything.
+
+Measured 2026-09-10 on x86_64 Linux with those exact commands: 459 of the
+suite's tests pass, 0 fail, 1 skips. The skip was predicted before the run —
+nixpkgs' build lacks `SQLITE_ENABLE_NORMALIZE`, so exactly one named test was
+expected to skip and everything else to pass, and a second skip or a different
+one would have falsified it. It held, alone. A subscription over a real
+`INSERT`, `UPDATE` and `DELETE` produced three row events in that order.
+
+Pointing `DENO_SQLITE_PATH` at this project's vendored build under a nixpkgs
+`deno` instead dies of `SIGSEGV` — exit 139, no exception, not one verdict line
+emitted.
+
+**Even the working setup is not answered by the file it names.** In that same
+measurement the path resolved to `libsqlite3.so.3.53.3` and the code that ran
+came from `libsqlite3.so` beside it: same store path, same version, different
+file — and this project has no check that can tell you which library answered.
+
+**How far that reaches.** x86_64 Linux only, and one store path —
+`xcv2rrfly0za0kdhzvmc0j2a6074zkib-sqlite-3.53.3`, which is what the flake
+registry pin on that machine resolved on 2026-09-10. Another nixpkgs revision
+resolves another one, and nothing here measures it.
+
 ## Usage
 
 Reject rows that fail validation, by vetoing the commit:
