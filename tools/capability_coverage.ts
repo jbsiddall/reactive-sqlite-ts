@@ -83,6 +83,19 @@
  * redundant with the live controls. On the system 3.45.1 library they overlap;
  * on a normalize-enabled one they are the entire foundation.
  *
+ * AND IT IS LOAD-BEARING SOMEWHERE ELSE. The same `normalizedSql` absence is
+ * the only row on which the two live columns of the capability table still
+ * disagree -- see `liveVariance` in tools/capability_table.ts. So the distro
+ * rebuild that costs this audit its only positive control is the SAME event
+ * that leaves that table rendering columns which no longer distinguish two
+ * libraries. One fact, two loads, and neither failure announces itself: this
+ * file would still report cleanly off its synthetic fixtures, and that table
+ * would still regenerate and pass `--check`. The structural parity check is
+ * no help -- it asserts the rows match the fields of `Capabilities` and says
+ * nothing about the values in the cells. The one thing that does speak is the
+ * table gate's live-variance control, which fails at zero carriers and names
+ * this file in its failure text. Do not weaken it to a warning.
+ *
  *   deno task test:capability-coverage
  *
  * Needs a libsqlite3 (see //libsqlite3) plus --allow-run to re-run the suite.

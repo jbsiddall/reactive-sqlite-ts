@@ -177,6 +177,16 @@ on the date given for its column, and was not there — not an unchecked cell. I
 the repository the `table` task rewrites this block and the `test:table` gate
 fails if it is stale; neither script is in the published package.
 
+One row is doing two jobs. `normalizedSql` is the only row on which the `system`
+and `vendored` columns still disagree, and it is also the only branch the
+capability-coverage audit can watch a real library reach by genuinely lacking a
+symbol. If a distribution rebuilds its libsqlite3 with SQLITE_ENABLE_NORMALIZE,
+both of those go at once: this table would keep rendering columns that no longer
+distinguish two libraries, and that audit would keep printing a clean report
+backed only by synthetic fixtures. The gate refuses a run in which these two
+columns agree everywhere, and says so naming the audit — but nothing else here
+would.
+
 | Capability      | system 3.45.1 | vendored 3.53.4 | @db/sqlite prebuilt 3.46.0 (frozen 2026-09-09) |
 | --------------- | ------------- | --------------- | ---------------------------------------------- |
 | `hooks`         | yes           | yes             | yes                                            |

@@ -506,6 +506,16 @@ function blockFor(columns: Column[], date: string): string {
     `block and the \`test:table\` gate fails if it is stale; neither script ` +
     `is in the published package.`,
     ``,
+    `One row is doing two jobs. \`normalizedSql\` is the only row on which the ` +
+    `\`system\` and \`vendored\` columns still disagree, and it is also the ` +
+    `only branch the capability-coverage audit can watch a real library reach ` +
+    `by genuinely lacking a symbol. If a distribution rebuilds its libsqlite3 ` +
+    `with SQLITE_ENABLE_NORMALIZE, both of those go at once: this table would ` +
+    `keep rendering columns that no longer distinguish two libraries, and ` +
+    `that audit would keep printing a clean report backed only by synthetic ` +
+    `fixtures. The gate refuses a run in which these two columns agree ` +
+    `everywhere, and says so naming the audit — but nothing else here would.`,
+    ``,
     table,
     ``,
     ...paths,
@@ -579,6 +589,55 @@ function frozenStale(mtime: Date | null, frozen: string): string | null {
   return null;
 }
 
+/**
+ * The rows on which the two LIVE columns disagree.
+ *
+ * Pure, and fixtured below, because the state it exists to catch cannot be
+ * produced on demand: it arrives when somebody else's build of libsqlite3
+ * changes. Compares `system` against `vendored` only. The prebuilt column is
+ * deliberately excluded -- it is a frozen historical artefact, so a table
+ * whose only remaining difference lived there would be reporting a difference
+ * between today and last week rather than between two libraries anyone runs.
+ */
+function liveVariance(
+  a: Capabilities,
+  b: Capabilities,
+): (keyof Capabilities)[] {
+  return ROWS.map(({ key }) => key).filter((k) =>
+    (a[k] === true) !== (b[k] === true)
+  );
+}
+
+/**
+ * Why a live-variance count is a problem, or `null`.
+ *
+ * THE COUPLING THIS EXISTS FOR. `normalizedSql` is currently the only row on
+ * which the two live columns differ, and it is ALSO the only positive control
+ * the capability-coverage audit has -- the one branch that audit can watch
+ * being reached by a library that genuinely lacks the symbol. Those are two
+ * separate loads on one fact. A distro rebuild of the system libsqlite3 with
+ * SQLITE_ENABLE_NORMALIZE would take out both at once and neither would say
+ * so: this table would go on rendering three columns that no longer
+ * distinguish two libraries, and that audit would go on printing a clean
+ * report resting only on its synthetic fixtures. The structural parity check
+ * does not cover this. It asserts that the ROWS correspond to the fields of
+ * `Capabilities`; it says nothing whatever about the VALUES in the cells.
+ *
+ * So the count is asserted rather than watched. Zero is a failure, and the
+ * failure text is where the reader is told what else just broke.
+ */
+function livePairProblem(carriers: readonly string[]): string | null {
+  if (carriers.length === 0) {
+    return "the system and vendored libraries now agree on every row, so the " +
+      "table no longer distinguishes them and its rendered columns are " +
+      "unfalsifiable. Check tools/capability_coverage.ts in the same breath: " +
+      "if the row that vanished was normalizedSql, that audit has just lost " +
+      "its only positive control and is now resting on synthetic fixtures " +
+      "alone. Neither of those two losses announces itself";
+  }
+  return null;
+}
+
 /** The gate. Nothing this file measures is reportable until every one passes. */
 async function gate(columns: Column[]): Promise<void> {
   const real = columns.map((c) => Deno.realPathSync(c.path));
@@ -586,6 +645,32 @@ async function gate(columns: Column[]): Promise<void> {
     pass(`three distinct libraries: ${real.join(", ")}`);
   } else {
     fail("three distinct libraries", `resolved to ${real.join(", ")}`);
+  }
+
+  // The two columns anyone actually runs against. The all-three control above
+  // stays green while these two collapse into each other, because the frozen
+  // prebuilt differs from both -- so it cannot see this.
+  {
+    const sys = columns.find((c) => c.name === "system");
+    const ven = columns.find((c) => c.name === "vendored");
+    const what = "the system and vendored columns still differ somewhere";
+    if (sys === undefined || ven === undefined) {
+      fail(what, "one of the two live columns is missing from the run");
+    } else {
+      const carriers = liveVariance(sys.caps, ven.caps);
+      const problem = livePairProblem(carriers);
+      if (problem === null) {
+        pass(
+          `${what} — carried by ${carriers.join(", ")} (${carriers.length} row${
+            carriers.length === 1 ? "" : "s"
+          }${
+            carriers.length === 1
+              ? "; the sole carrier, and also the capability-coverage audit's only positive control"
+              : ""
+          })`,
+        );
+      } else fail(what, problem);
+    }
   }
 
   const rendered = columns.map((c) =>
@@ -1208,6 +1293,74 @@ async function structure(): Promise<void> {
     pass("refusal: the two refusals say different things");
   } else {
     fail("refusal: the two refusals say different things", "identical text");
+  }
+
+  // The live-variance control. Its real red state needs somebody else's
+  // libsqlite3 to change, so it is fixtured here instead: a heterogeneous set,
+  // one accepted and three rejected, and the rejecting cases differ from each
+  // other so a helper that refused everything would not satisfy them alone.
+  {
+    const all: Capabilities = {
+      hooks: true,
+      preupdate: true,
+      wal: true,
+      trace: true,
+      progress: true,
+      busy: true,
+      authorize: true,
+      collation: true,
+      normalizedSql: true,
+    };
+    for (
+      const c of [
+        {
+          name: "today: they differ on normalizedSql alone",
+          a: { ...all, normalizedSql: false },
+          b: all,
+          want: ["normalizedSql"],
+        },
+        {
+          name: "the distro adds SQLITE_ENABLE_NORMALIZE",
+          a: all,
+          b: all,
+          want: [],
+        },
+        {
+          name: "two rows differ",
+          a: { ...all, normalizedSql: false, progress: false },
+          b: all,
+          want: ["progress", "normalizedSql"],
+        },
+        {
+          name: "a row outside normalizedSql differs on its own",
+          a: { ...all, wal: false },
+          b: all,
+          want: ["wal"],
+        },
+      ]
+    ) {
+      const got = liveVariance(c.a, c.b);
+      const what = `live-variance control: ${c.name}`;
+      if (got.join(",") === c.want.join(",")) {
+        pass(`${what} → ${got.length === 0 ? "nothing" : got.join(", ")}`);
+      } else fail(what, `carriers were ${got.join(", ") || "none"}`);
+      const problem = livePairProblem(got);
+      const verdict = `${what}, and a count of ${got.length} is ${
+        c.want.length === 0 ? "refused" : "accepted"
+      }`;
+      if ((problem !== null) === (c.want.length === 0)) {
+        pass(verdict);
+      } else fail(verdict, `said ${problem ?? "ok"}`);
+    }
+    // The refusal must name the other thing that breaks, or it is a message
+    // about this table only and the coupling stays silent after all.
+    const msg = livePairProblem([]) ?? "";
+    const what = "the live-variance refusal names the coverage audit too";
+    if (
+      msg.includes("capability_coverage.ts") && msg.includes("normalizedSql")
+    ) {
+      pass(what);
+    } else fail(what, `said ${JSON.stringify(msg)}`);
   }
 
   // The distinctness control, which the refusal above would otherwise have

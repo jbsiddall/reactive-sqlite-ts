@@ -18,6 +18,18 @@
     "path resolution pick a system library and pass that same value to the FFI.",
     "No task needs --allow-net: the driver never downloads a library."
   ],
+  "//allow-run": [
+    "Do not read the two --allow-run=git tasks as the house style. Five tasks",
+    "below take --allow-run UNSCOPED: test:crash, table, test:table,",
+    "test:capability-coverage and test:publish. Each of those spawns",
+    "Deno.execPath(), whose value is not known until run time, so there is no",
+    "literal to scope to and inventing one would be a scope that lies. Only",
+    "test:docs-literals and test:commits spawn a program named in advance --",
+    "git -- and those two are scoped. So the honest summary is: we scope where",
+    "the child is a fixed name and we do not where it is the running binary,",
+    "which is most of them. An unscoped --allow-run can spawn anything at all;",
+    "what limits these five is the code, not the flag."
+  ],
   "tasks": {
     "fmt": "deno fmt",
     "lint": "deno lint",
