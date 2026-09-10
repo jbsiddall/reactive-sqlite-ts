@@ -14,11 +14,30 @@ it would take.
 
 ## The `@db/sqlite` driver
 
-**Version:** `@db/sqlite` 0.13.0 — the version pinned in `deno.json`. Read from
-the JSR source (`https://jsr.io/@db/sqlite/0.13.0/src/statement.ts`) and
-confirmed by running against it. **Observed 2026-09-09**, against system SQLite
-3.45.1 and the vendored 3.53.4; nothing here depends on which of the two is
-loaded.
+**Version:** `@db/sqlite` 0.13.0. **The number is right; the reason this line
+used to give for it was false.** It said 0.13.0 was "the version pinned in
+`deno.json`", and there is no such pin: `836b676` vendored the driver into
+`driver/` and removed the specifier from `imports`, which the WITHDRAWN entry
+further down this file narrates. So do not correct the number — correct the
+licence, which is what follows.
+
+Two things license 0.13.0 and they say different things, so both are here. It is
+the release these facts were READ AND MEASURED AGAINST: the JSR source
+(`https://jsr.io/@db/sqlite/0.13.0/src/statement.ts`), confirmed by running
+against it. And it is the release `driver/` was VENDORED FROM, recorded in
+`DRIVER_DEFECTS.md` and `NOTICE` — which is why observations of somebody else's
+0.13.0 still describe the ancestor of the code in this tree, and why they are
+worth keeping now that the package is gone from `imports`.
+
+What does NOT license it is the prebuilt in `$DENO_DIR/plug/`. That artefact's
+metadata names the same release, so it is the obvious thing to reach for, but
+what it holds is a compiled `libsqlite3.so` and every fact in this section is
+about the driver's TypeScript. A shared object cannot be the source of a claim
+about own properties on `Statement`. It licenses a different claim — which
+SQLite build that prebuilt contains — and that claim is made elsewhere.
+
+**Observed 2026-09-09**, against system SQLite 3.45.1 and the vendored 3.53.4;
+nothing here depends on which of the two is loaded.
 
 ### Statement methods are own properties when there are no bind parameters
 
