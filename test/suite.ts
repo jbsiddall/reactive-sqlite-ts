@@ -109,6 +109,32 @@ const CASE_SCRIPT = new URL("./crash_cases.ts", import.meta.url).pathname;
 /** Generous enough for the slowest legitimate case, short enough to catch a hang. */
 const CASE_TIMEOUT_MS = 60_000;
 
+// How much of a failing child's output goes on the FAIL line, from each end.
+// 400 each because a Deno uncaught error's message line plus the first few
+// stack frames fit in that, and 400 from the end keeps everything the previous
+// tail-only excerpt showed with room to spare. Both ends, never one: the
+// message is at the TOP of an uncaught error and the frames are at the bottom,
+// so a tail-only excerpt deletes the diagnosis and keeps the scenery.
+const EXCERPT_HEAD = 400;
+const EXCERPT_TAIL = 400;
+
+/**
+ * The part of a child's output that a FAIL line carries.
+ *
+ * Shorter than the two budgets together and it is printed once, whole — a
+ * truncation that prints its input twice on the short path is worse than no
+ * truncation. Longer, and the elision is marked with the count of what was
+ * dropped, so a reader can see that something was cut instead of wondering.
+ */
+function excerpt(raw: string): string {
+  const text = raw.trim();
+  if (text.length <= EXCERPT_HEAD + EXCERPT_TAIL) return text;
+  const elided = text.length - EXCERPT_HEAD - EXCERPT_TAIL;
+  return `${
+    text.slice(0, EXCERPT_HEAD)
+  }\n... [${elided} characters elided] ...\n${text.slice(-EXCERPT_TAIL)}`;
+}
+
 /** Run one crash case in a child process and assert on how it died. */
 async function runCase(name: string): Promise<void> {
   const expected = CASES[name]!;
@@ -150,9 +176,7 @@ async function runCase(name: string): Promise<void> {
   if (code !== expected.code) {
     fail(
       name,
-      `exit ${code}, wanted ${expected.code}. Output: ${
-        text.trim().slice(-300)
-      }`,
+      `exit ${code}, wanted ${expected.code}. Output: ${excerpt(text)}`,
     );
     return;
   }
@@ -160,7 +184,7 @@ async function runCase(name: string): Promise<void> {
     fail(
       name,
       `output did not contain ${JSON.stringify(expected.match)}. Got: ${
-        text.trim().slice(-300)
+        excerpt(text)
       }`,
     );
     return;
