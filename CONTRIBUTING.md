@@ -91,6 +91,27 @@ The gated test prints a visible `SKIP` line naming the library when it takes the
 absent branch, so a run that quietly proved nothing is not mistakable for a run
 that proved something.
 
+### Open: CI tests the system library, and the gate procedure tests the vendored one
+
+CI pins `DENO_SQLITE_PATH` at `/usr/lib/x86_64-linux-gnu/libsqlite3.so.0` — the
+system 3.45.1 — so every suite that has ever run there ran against that library.
+The procedure we run before pushing pins the vendored 3.53.4. Both are in the
+ledger above, so neither is untested, but the two differ in exactly the places
+the ledger's right-hand column is about: `normalizedSql` is present in one and
+absent in the other, and it is the absent branch that CI exercises.
+
+This is the same mechanism-versus-outcome split the capability table carries:
+the mechanism is "whatever `DENO_SQLITE_PATH` names", and which library that
+turns out to be is a separate fact that has to be stated rather than inferred.
+
+Not decided here, because it is a decision about what CI should cover and not a
+repair: whether CI should pin the vendored build instead, or run the suite
+twice, once against each.
+
+**Trigger:** decide it before the vendored library becomes the one this package
+ships to users — that is the point at which a green CI run against 3.45.1 stops
+describing what anybody actually runs.
+
 ### The refusal branches are a separate question, and mostly the answer is no
 
 The table above is about the branch taken when a capability is PRESENT. Each

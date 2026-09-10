@@ -38,10 +38,29 @@ jobs:
         os: [ubuntu-24.04]
     runs-on: ${{ matrix.os }}
 
+    # ONLY A PRECONDITION MAY GATE A LATER STEP. A failed step skips every
+    # later one by default, so a subordinate check placed ahead of the primary
+    # ones costs all the coverage behind it and still reports as a single red
+    # step — which reads as a small problem while being a total one. Four
+    # steps are preconditions in the strict sense, because if any of them
+    # fails nothing downstream can mean anything: checkout, setup-deno,
+    # "Install libsqlite3" and "Pin DENO_SQLITE_PATH". Every other step
+    # carries `if: "!cancelled()"` and runs regardless — including "Tests",
+    # "Crash matrix" and "Publish manifest" themselves, since a Tests failure
+    # hiding a Publish manifest failure is the same defect in miniature.
+    #
+    # `!cancelled()` rather than `always()`: a run someone cancelled should
+    # stop, not grind through every remaining step.
+    #
+    # test/ci_workflow.ts holds this. It is not a convention; an invariant
+    # whose only expression is "four steps happen to lack a line of YAML" is
+    # one pull request away from being violated by a new step.
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out the repository
+        uses: actions/checkout@v4
 
-      - uses: denoland/setup-deno@v2
+      - name: Install Deno
+        uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
 
@@ -51,9 +70,16 @@ jobs:
       # nothing. Running it first means it still reports on a runner where
       # installing libsqlite3 fails — and a structural mismatch is reported as
       # itself rather than buried under an environment failure it has nothing
-      # to do with. Do not move it below the two steps that follow.
+      # to do with.
       - name: Capability table structure
+        if: "!cancelled()"
         run: deno task test:table-structure
+
+      # Whether any step in this job can suppress any other. Opens no library
+      # either, so it reports on a runner where the install fails.
+      - name: CI step guards
+        if: "!cancelled()"
+        run: deno task test:ci-guards
 
       # Ubuntu 24.04 ships SQLite 3.45.x built with SQLITE_ENABLE_PREUPDATE_HOOK
       # (verified: the sqlite3_preupdate_* symbols are exported from
@@ -64,12 +90,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libsqlite3-0
 
-      # One library, chosen here, used by BOTH the @db/sqlite driver and our own
-      # dlopen. @db/sqlite reads DENO_SQLITE_PATH once at import time and
-      # otherwise downloads its own prebuilt library; if the two differ, the
-      # sqlite3* handle we borrow belongs to a foreign build and the process
-      # dies of SIGSEGV — exit 139, no stack, no message. Setting it in
-      # GITHUB_ENV makes every later step in this job inherit the same value.
+      # One library, chosen here, used by BOTH the vendored driver in driver/
+      # and our own dlopen. The driver reads DENO_SQLITE_PATH once at import
+      # time and otherwise falls back to the build in vendor/lib/; it
+      # downloads nothing, and has not since the driver was vendored. If the
+      # two halves open different files the sqlite3* handle we borrow belongs
+      # to a foreign build and the process dies of SIGSEGV — exit 139, no
+      # stack, no message. Setting it in GITHUB_ENV makes every later step in
+      # this job inherit the same value.
       - name: Pin DENO_SQLITE_PATH
         run: |
           set -euo pipefail
@@ -82,6 +110,7 @@ jobs:
       # library we just pinned. A missing symbol is a build-flag problem, and
       # it is far better to say so here than to have a test fail obscurely.
       - name: Verify the library exports the hook symbols
+        if: "!cancelled()"
         run: |
           set -euo pipefail
           SYMS=$(nm -D --defined-only "$DENO_SQLITE_PATH")
@@ -93,60 +122,86 @@ jobs:
           echo "all hook symbols present"
 
       - name: deno fmt --check
+        if: "!cancelled()"
         run: deno fmt --check
 
       - name: deno lint
+        if: "!cancelled()"
         run: deno lint
 
       - name: deno check
+        if: "!cancelled()"
         run: deno check
 
-      # Proves, before any suite runs, that the driver and our FFI really did
-      # load the same SQLite. If this passes and a later suite still segfaults,
-      # the bug is ours; if this fails, the environment is wrong. Either way no
-      # suite can "pass" by quietly not exercising FFI at all.
+      # Proves, before any suite runs, that the driver can open the library
+      # pinned above and execute against it. If this passes and a later suite
+      # still segfaults, the bug is ours; if this fails, the environment is
+      # wrong, and it says so here rather than as an obscure suite failure.
       #
-      # The driver is imported by its bare specifier and resolved through the
-      # repository's own import map, so this step tests the version the suites
-      # test. Restating a version here once let it drift a minor behind the map
-      # without anything noticing.
-      - name: FFI/driver agreement smoke test
+      # It does NOT compare two independent readings, and is not named as
+      # though it does. The step this replaced claimed to prove the driver and
+      # our FFI had loaded the same SQLite, by reading the version through
+      # each and comparing. That was meaningful while the driver was a
+      # third-party package that resolved a library of its own; once the
+      # driver was vendored, both halves came to read the same environment
+      # variable, and the comparison became one that cannot fail. Measured
+      # rather than assumed: with two different libraries on disk, 3.45.1 and
+      # 3.53.4, the old script was run under DENO_SQLITE_PATH pinned at each
+      # in turn and reported agreement both times — 3.45.1 on both sides, then
+      # 3.53.4 on both sides. The only way it could still go red was the FFI
+      # half failing to dlopen at all, which is not what it claimed to prove.
+      #
+      # For the same reason the script below does not assert that the path the
+      # driver reports equals the pinned one: the driver's `libraryPath` IS
+      # DENO_SQLITE_PATH when the variable is set, so that comparison is the
+      # same string read twice. It is printed as a record, not asserted.
+      #
+      # What IS asserted can go red. The variable being unset fails the first
+      # line, which is what a "Pin DENO_SQLITE_PATH" step that did not
+      # propagate through GITHUB_ENV looks like. Importing the driver dlopens
+      # the pinned file and binds every symbol the driver needs, so a file
+      # that is not a libsqlite3, or one missing a symbol, throws there —
+      # both seen red before this step was trusted. Executing a statement
+      # covers the rest.
+      #
+      # `-c` is still required even though the script imports the driver by
+      # PATH and no longer by a bare specifier: driver/database.ts imports
+      # `@std/path`, which is a bare specifier, and a script in $RUNNER_TEMP
+      # resolves it only through the repository's import map. Dropping `-c`
+      # was measured to fail here with `Import "@std/path" not a dependency`.
+      - name: Driver opens the pinned library and executes against it
+        if: "!cancelled()"
         run: |
           set -euo pipefail
-          cat > "$RUNNER_TEMP/smoke.ts" <<'TS'
-          const lib = Deno.env.get("DENO_SQLITE_PATH");
-          if (!lib) throw new Error("DENO_SQLITE_PATH is not set");
-          const ffi = Deno.dlopen(lib, {
-            sqlite3_libversion: { parameters: [], result: "pointer" },
-          });
-          const ptr = ffi.symbols.sqlite3_libversion();
-          if (ptr === null) throw new Error("sqlite3_libversion returned NULL");
-          const viaFfi = new Deno.UnsafePointerView(ptr).getCString();
-          const { Database } = await import("@db/sqlite");
+          cat > "$RUNNER_TEMP/opens.ts" <<'TS'
+          const pinned = Deno.env.get("DENO_SQLITE_PATH");
+          if (!pinned) throw new Error("DENO_SQLITE_PATH is not set");
+          const { Database, libraryPath } = await import(
+            `${Deno.env.get("GITHUB_WORKSPACE")}/driver/mod.ts`
+          );
           const db = new Database(":memory:");
-          const viaDriver =
-            db.prepare("select sqlite_version() as v").get<{ v: string }>()!.v;
+          const row = db.prepare("select sqlite_version() as v").get();
           db.close();
-          ffi.close();
-          console.log(`ffi=${viaFfi} driver=${viaDriver} lib=${lib}`);
-          if (viaFfi !== viaDriver) {
-            throw new Error(
-              `libsqlite3 mismatch: FFI ${viaFfi} vs driver ${viaDriver}. The FFI tests would SIGSEGV.`,
-            );
+          if (!row) {
+            throw new Error("the driver opened the library but returned no row");
           }
+          console.log(`driver opened ${libraryPath} and reports ${row.v}`);
           TS
-          deno run -c "$GITHUB_WORKSPACE/deno.json" --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write --allow-net "$RUNNER_TEMP/smoke.ts"
+          deno run -c "$GITHUB_WORKSPACE/deno.json" --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write "$RUNNER_TEMP/opens.ts"
 
       - name: Tests
+        if: "!cancelled()"
         run: deno task test
 
       # Runs each crash case in its own child process and asserts on the exit
       # code, so a real segfault (139) cannot be reported as a pass.
       - name: Crash matrix
+        if: "!cancelled()"
         run: deno task test:crash
 
       # What actually ships. Asserts on the file list deno publish reports,
       # not on the exclude patterns, so a rule that catches LICENSE or NOTICE
       # by accident fails here rather than in a published package.
       - name: Publish manifest
+        if: "!cancelled()"
         run: deno task test:publish

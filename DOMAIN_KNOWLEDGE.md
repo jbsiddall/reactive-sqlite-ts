@@ -608,26 +608,51 @@ good as the known answer.
 
 ### A bare specifier needs `-c`, and `-c` is enough — the file need not be in the repo
 
-A script anywhere on disk resolves `@db/sqlite` **only** when `deno` is given
-the config that carries the import map. Measured with a one-line script in a
-scratch directory outside the repository:
+A script anywhere on disk resolves a bare specifier **only** when `deno` is
+given the config that carries the import map. Re-measured **2026-09-10** with a
+one-line script in a scratch directory outside the repository, against
+`@std/path`, under `--cached-only`:
 
-| invocation                              | result                                   |
-| --------------------------------------- | ---------------------------------------- |
-| `deno run <script>` (no `-c`)           | fails: `@db/sqlite` is not a dependency  |
-| `deno run -c <repo>/deno.json <script>` | resolves, and `deno info` shows `0.13.0` |
+| invocation                              | result                                 |
+| --------------------------------------- | -------------------------------------- |
+| `deno run <script>` (no `-c`)           | fails: `@std/path` is not a dependency |
+| `deno run -c <repo>/deno.json <script>` | resolves, and runs                     |
 
-`deno check` behaves the same way. Neither the script's directory nor the
-current working directory matters; only the `-c` path does. So a CI step that
-generates a script into a temp directory can still import the driver by its bare
-specifier, and therefore never has to restate a version that can drift from the
-map. Restating one is exactly how the FFI/driver smoke test came to pin
-`jsr:@db/sqlite@0.12` while `deno.json` pinned `0.13.0` — a minor apart, with
-nothing in the repository able to notice.
+`deno check` behaves the same way — `TS2307` without `-c`, clean with it — and
+`deno info` resolves `jsr.io/@std/path/1.1.6/mod.ts`. Neither the script's
+directory nor the current working directory matters; only the `-c` path does. So
+a CI step that generates a script into a temp directory can still import through
+the map, and therefore never has to restate a version that can drift from it.
+
+`--no-remote` is not a substitute for `--cached-only` here: it refuses the JSR
+`meta.json` fetch even for a package that is already cached.
 
 **Control seen to fail:** pointing the config at a directory with no `deno.json`
-makes the same step exit non-zero rather than silently falling back to an
-unmapped resolution.
+makes the same step exit non-zero — `Error reading config file` — rather than
+silently falling back to an unmapped resolution.
+
+**WITHDRAWN, 2026-09-10: the same passage measured against `@db/sqlite`.** As
+first written on 2026-09-09 this entry used `@db/sqlite` as its specimen, and
+its table's second row recorded that `deno info` showed `0.13.0`. Both were true
+on that date and stopped being true the same day: `836b676` vendored the driver
+into `driver/` and removed `@db/sqlite` from `deno.json`'s `imports`, so there
+is no longer a mapping for that specifier to resolve, and `deno.lock` carries no
+entry for it. Nothing about the mechanism changed — only the specimen — which is
+why the finding is re-measured above rather than deleted.
+
+The entry also concluded that restating a version in a CI step "is exactly how
+the FFI/driver smoke test came to pin `jsr:@db/sqlite@0.12` while `deno.json`
+pinned `0.13.0`". That history is real, but the step it describes no longer
+exists: it was deleted once the driver was vendored, because with both halves of
+its comparison reading `DENO_SQLITE_PATH` it could no longer fail.
+
+**The mechanism is still load-bearing, and by a route the original measurement
+did not name.** The CI step that replaced the smoke test imports the driver by
+absolute PATH rather than by a bare specifier — and still needs `-c`, because
+`driver/database.ts` imports `@std/path`. Dropping `-c` was measured on
+2026-09-10 to fail with `Import "@std/path" not a dependency`. A script in
+`$RUNNER_TEMP` reaches the map or it reaches nothing, whatever it names in its
+own first line.
 
 ### `vendor/probe.ts`, `vendor/select.ts` and `tools/capability_table.ts` do NOT dlopen at import time
 
