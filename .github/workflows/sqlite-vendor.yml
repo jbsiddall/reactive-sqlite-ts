@@ -25,6 +25,18 @@
 name: sqlite-vendor
 
 on:
+  # ci.yml runs on direct pushes to main; without the same trigger here, a
+  # direct push would be the one path past review that runs no vendor build
+  # at all. The paths filter keeps the trigger to the files the build is
+  # made of, so an ordinary docs push to main buys nothing.
+  push:
+    branches: [main]
+    paths:
+      - "vendor/**"
+      - ".github/workflows/sqlite-vendor.yml"
+      - ".github/workflows/sqlite-vendor-build.yml"
+      - ".github/workflows/sqlite-vendor-release.yml"
+      - ".github/scripts/**"
   pull_request:
     paths:
       - "vendor/**"
