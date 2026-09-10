@@ -38,20 +38,117 @@
  * document here does; if one ever does, this comment is the warning that the
  * scan needs a real tokeniser rather than a patch.
  *
- * Reads only Markdown. Opens no library, needs no FFI and no git.
+ * WHERE THE DOCUMENT SET COMES FROM, and why it is not written down. This
+ * began as a hand-written list of four, and the list was already wrong: it
+ * omitted vendor/README.md, 317 lines carrying 278 backticks and 121 code
+ * spans, which no check had ever read. A hand-maintained list is an invariant
+ * held by attention, and attention failing is the entire subject of this file
+ * -- so the list is gone and the set is asked for instead.
+ *
+ * WHY `git ls-files` RATHER THAN A DIRECTORY WALK, which is the interesting
+ * choice because the walk is cheaper. These are not two ways to compute one
+ * answer at different prices. They compute DIFFERENT SETS. `git ls-files` is
+ * the Markdown this repository tracks and ships. A `readDir` walk is whatever
+ * Markdown happens to be on the disk of whoever ran it: untracked scratch,
+ * build output, a draft somebody left lying around. The domain this check is
+ * about is the documents the project publishes, and that is the tracked set.
+ *
+ * The walk was measured before being rejected, so that nobody has to price it
+ * again. MEASURED at the time of writing: the two agree exactly, five files
+ * each, and the walk would have kept this task at `--allow-read` alone -- it
+ * was deliberately the one task in the gate needing neither FFI nor a
+ * subprocess. That placement is real and it loses. The walk's extra hits are
+ * not harmless noise: a check that fires on files nobody ships teaches people
+ * to ignore it, and the first fix anyone reaches for is an exclusion list --
+ * a hand-maintained set, which is the exact class this derivation exists to
+ * delete, returning one layer down. Buying the permission back by matching
+ * exactly over the wrong domain is the defect being fixed here, committed
+ * knowingly inside its own fix.
+ *
+ * So the task grants `--allow-run=git`, scoped to git and to nothing else.
+ * The tradeoff is priced above rather than merely asserted; the price is one
+ * subprocess permission on the only task that had none.
+ *
+ * Deriving opens a hole that naming did not, and it is guarded below. A
+ * listing that returns nothing -- not a repository, a wrong cwd, a pathspec
+ * that stops matching -- scans zero documents and prints exactly like a clean
+ * tree. `test/commit_trailers.ts` already refuses that shape for an empty
+ * commit range; a check that knows how to refuse a vacuous pass should not
+ * have a sibling that accepts one. So the set must be non-empty AND must
+ * contain `REQUIRED`, and both refusals are watched firing below.
+ *
+ * `git ls-files` reads the index, so it answers at depth 1 and none of this
+ * touches how deep a checkout is.
+ *
+ * Reads only Markdown, and asks git which. Opens no library and needs no FFI.
  *
  * Run: deno task test:docs-literals
  *
  * @module
  */
 
-/** The documents this scans. Relative to the repository root. */
-const DOCUMENTS: readonly string[] = [
-  "README.md",
-  "DOMAIN_KNOWLEDGE.md",
-  "DRIVER_DEFECTS.md",
-  "CONTRIBUTING.md",
-];
+/**
+ * A document that must turn up in any correct listing of this repository.
+ *
+ * README.md, because it cannot plausibly leave: `deno.json` publishes it, it
+ * is the first thing a consumer of the package reads, and the capability table
+ * is spliced into it by `tools/capability_table.ts` on every run. If a listing
+ * comes back without it, it is not a listing of this repository, and every
+ * clean result below is about something else.
+ */
+export const REQUIRED = "README.md";
+
+/** The repository root: this file lives in test/. */
+const ROOT = new URL("../", import.meta.url);
+
+/**
+ * The Markdown files git tracks, as repository-relative paths, sorted.
+ *
+ * `pathspec` is a parameter only so the empty case can be produced from the
+ * real command rather than simulated: a pathspec matching nothing exercises
+ * the same subprocess, the same parse and the same refusal that a broken
+ * checkout would. Callers other than that control pass nothing.
+ *
+ * A failed git invocation returns an empty list rather than throwing, which
+ * `setProblem` then refuses -- an unanswerable question is UNKNOWN, and
+ * UNKNOWN is a failure here, not a pass.
+ */
+export function trackedMarkdown(pathspec = "*.md"): string[] {
+  let out: string;
+  try {
+    const r = new Deno.Command("git", {
+      // cwd and --full-name together, because `git ls-files` reports paths
+      // relative to where it was run: without both, running the task from a
+      // subdirectory would list a different set under different names.
+      cwd: ROOT,
+      args: ["ls-files", "-z", "--full-name", "--", pathspec],
+      stdout: "piped",
+      stderr: "piped",
+    }).outputSync();
+    if (!r.success) return [];
+    out = new TextDecoder().decode(r.stdout);
+  } catch {
+    return [];
+  }
+  return out.split("\0").filter((p) => p.length > 0).sort();
+}
+
+/**
+ * What is wrong with a derived document set, or null if nothing is.
+ *
+ * Pure, so both refusals can be seen firing on inputs no listing would return.
+ */
+export function setProblem(docs: readonly string[]): string | null {
+  if (docs.length === 0) {
+    return "git tracks no Markdown here — a scan over zero documents reports every literal intact, which prints identically to a clean tree";
+  }
+  if (!docs.includes(REQUIRED)) {
+    return `the listing has ${docs.length} document${
+      docs.length === 1 ? "" : "s"
+    } but not ${REQUIRED}, which cannot be absent from this repository — so this is not a listing of it, and the results below are about another tree`;
+  }
+  return null;
+}
 
 interface Span {
   /** 1-based line on which the span opens. */
@@ -193,7 +290,75 @@ for (const f of FIXTURES) {
   pass(`${what} → ${got.length}`);
 }
 
+/**
+ * The refusals the derived set needs, each watched failing.
+ *
+ * A refusal that has never fired is an argument, not a control, and these two
+ * are exactly the cases a live tree will not produce on demand.
+ */
+const SET_FIXTURES: readonly {
+  name: string;
+  docs: string[];
+  rejected: boolean;
+}[] = [
+  { name: "the listing came back empty", docs: [], rejected: true },
+  {
+    name: `the listing came back without ${REQUIRED}`,
+    docs: ["CONTRIBUTING.md", "vendor/README.md"],
+    rejected: true,
+  },
+  {
+    name: "a set with documents in it, one of them the required one",
+    docs: [REQUIRED, "vendor/README.md"],
+    rejected: false,
+  },
+  {
+    name: `a set of one, the required one`,
+    docs: [REQUIRED],
+    rejected: false,
+  },
+];
+
+for (const f of SET_FIXTURES) {
+  const problem = setProblem(f.docs);
+  const what = `control: ${f.name}`;
+  if (f.rejected && problem === null) {
+    fail(what, "accepted — the refusal did not fire");
+  } else if (!f.rejected && problem !== null) {
+    fail(what, `rejected — ${problem}`);
+  } else {
+    pass(`${what} → ${problem === null ? "accepted" : problem}`);
+  }
+}
+
+// And git itself, invoked for real with a pathspec nothing matches. The
+// fixtures above exercise the predicate on sets no repository would return;
+// this exercises the code that BUILDS the set -- the subprocess, its exit
+// status, the NUL parse -- so an empty result is observed rather than
+// supposed. If git were missing or this were not a repository, the same line
+// would go red, which is the behaviour wanted.
+{
+  const none = trackedMarkdown("*.no-such-extension");
+  const what = "control: the tracked listing for a pathspec nothing matches";
+  const problem = setProblem(none);
+  if (none.length !== 0) {
+    fail(what, `found ${none.length}: ${none.join(", ")}`);
+  } else if (problem === null) {
+    fail(what, "the listing returned nothing and the set was accepted anyway");
+  } else {
+    pass(`${what} → 0 files, refused: ${problem}`);
+  }
+}
+
 console.log("\nthe documents\n");
+
+const DOCUMENTS = trackedMarkdown();
+
+const problem = setProblem(DOCUMENTS);
+if (problem !== null) fail("git produced a usable document set", problem);
+else {pass(
+    `git tracks ${DOCUMENTS.length} Markdown files, ${REQUIRED} among them`,
+  );}
 
 // The enumeration receipt. A scan that read no spans would report every
 // document clean, and "0 wrapped" and "0 examined" print identically unless
@@ -205,7 +370,7 @@ let read = 0;
 for (const doc of DOCUMENTS) {
   let text: string;
   try {
-    text = Deno.readTextFileSync(new URL(`../${doc}`, import.meta.url));
+    text = Deno.readTextFileSync(new URL(doc, ROOT));
   } catch (e) {
     fail(`${doc} was read`, `${e}`);
     continue;
@@ -230,11 +395,11 @@ for (const doc of DOCUMENTS) {
 
 if (read !== DOCUMENTS.length) {
   fail(
-    "every listed document was read",
+    "every document git listed was read",
     `${read} of ${DOCUMENTS.length} — the findings above are about a subset`,
   );
 } else {
-  pass(`every listed document was read (${read})`);
+  pass(`every document git listed was read (${read})`);
 }
 
 if (examined === 0) {
