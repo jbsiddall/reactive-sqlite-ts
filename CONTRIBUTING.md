@@ -22,15 +22,33 @@ deno task test        # the in-process suite
 deno task test:crash  # the out-of-process crash matrix
 deno task test:table  # README's capability table still matches the libraries
 deno task test:table-structure  # ...and its rows still match `Capabilities`
+deno task test:docs-literals  # no code span in the docs is wrapped across a line
+deno task test:commits  # the commit-message constraints nothing else enforces
 ```
 
-`test:table` needs all THREE libraries on disk — the system one, a vendored
-build (`deno task vendor:build`), and the prebuilt `@db/sqlite` downloads when
-`DENO_SQLITE_PATH` is unset. It is therefore not in CI, which builds neither of
-the last two; it is a developer-machine check, and it says which library it
-loaded from which path before it asserts anything. Run it after anything that
+### Which of these CI runs, and why the rest do not
+
+CI runs everything above except `test:table` and `test:commits`, and those two
+are absent for different reasons. Neither is an oversight, and neither is
+waiting for someone to wire it up.
+
+`test:table` CANNOT be in CI. It needs all THREE libraries on disk — the system
+one, a vendored build (`deno task vendor:build`), and the prebuilt `@db/sqlite`
+downloads when `DENO_SQLITE_PATH` is unset — and no runner has them; CI builds
+neither of the last two. That is a property of what the check measures, not a
+gap in the workflow. It is a developer-machine check, and it says which library
+it loaded from which path before it asserts anything. Run it after anything that
 changes `Capabilities` or the vendored build's flags, and `deno task table` to
 regenerate.
+
+`test:commits` is not in CI because of an OPEN question, not an impossibility.
+It reads a commit range with `git rev-list`, and CI checks out at depth 1, so
+the range is not there to read. Raising `fetch-depth` would make it runnable;
+whether that is worth doing on every push has not been decided. Until it is, the
+commit-message constraints are held by whoever runs the gate locally.
+
+`test:docs-literals` used to be in this second category and no longer is: it
+needs only the checkout, so CI runs it early, before libsqlite3 is installed.
 
 `test:table-structure` is the half of that question needing no library at all:
 whether every field of `Capabilities` has a row, every row and every exemption

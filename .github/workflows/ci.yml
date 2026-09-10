@@ -81,6 +81,19 @@ jobs:
         if: "!cancelled()"
         run: deno task test:ci-guards
 
+      # Whether the formatter has wrapped a code span across a newline in any
+      # tracked Markdown, which leaves the literal inside it un-greppable and
+      # silently stops the span being a citation. Placed here, before the
+      # library, for the same measured reason as the two steps above: it opens
+      # no library and needs no FFI. Its one child process is `git ls-files`,
+      # which is how it learns which documents to read rather than being told
+      # by a hand-maintained list -- so it needs the checkout and nothing else.
+      # A shallow checkout is enough: the index lists every tracked path at
+      # depth 1.
+      - name: Wrapped code spans in the documents
+        if: "!cancelled()"
+        run: deno task test:docs-literals
+
       # Ubuntu 24.04 ships SQLite 3.45.x built with SQLITE_ENABLE_PREUPDATE_HOOK
       # (verified: the sqlite3_preupdate_* symbols are exported from
       # libsqlite3.so.0). libsqlite3-0 is normally already present; installing
