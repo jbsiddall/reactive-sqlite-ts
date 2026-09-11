@@ -40,6 +40,16 @@ reading five of them.
   outside CI: the aarch64 asset ran on native arm hardware before it was
   uploaded, but no consumer has followed the install with it — no arm host is
   available here; that leg is pending on a runner or the user's side.
+- **The consumer path is exercised on release day, by CI.**
+  `.github/workflows/release-consumption.yml` (PR #8, merged 2026-09-11) runs on
+  `release: published` and by manual dispatch, on both `ubuntu-24.04` and
+  `ubuntu-24.04-arm`: it downloads the released `.so` and `SHA256SUMS`, verifies
+  the checksum, imports the package by the documented specifiers pinned to the
+  commit the tag names, fires a hook, and asserts `sqlite_version()` equals the
+  version the tag names. Its steps were dry-run by hand against the shipped
+  release (x86_64) before landing; the aarch64 leg still waits on its first real
+  run — dispatching a workflow needs a credential this one does not have (HTTP
+  403), so the run is on the user's side, or automatic at the next release.
 - **Consumption from GitHub is documented and exercised.** The README no longer
   describes a first release that does not exist. It documents the path of record
   — an import map pinning the package specifier to a commit on
@@ -56,7 +66,9 @@ reading five of them.
 | -- | -------------------------------------------------------------------------------------- |
 | #1 | Closed by observation: the publish job ran and the release shipped (2026-09-10)        |
 | #2 | Closed: `sqlite-vendor.yml` now also runs on direct pushes to main (PR #6, 2026-09-10) |
-| #3 | x86_64 leg done; aarch64 leg not yet exercised outside CI                              |
+| #3 | x86_64 leg done; aarch64 leg exercised by release-consumption.yml, but its first arm   |
+|    | run has not happened yet — dispatch is HTTP 403 to this credential (see the bullet     |
+|    | above; runs at the next release, or by manual dispatch)                                |
 | #4 | Unresolved: which library-provenance instrument tells the truth                        |
 | #5 | Branches deleted 2026-09-10. The four probe runs could not be: run deletion is denied  |
 |    | to this credential (HTTP 403); the denial came back, not its reason. Delete via the    |
