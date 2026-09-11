@@ -1,0 +1,202 @@
+# Follow the install the way a consumer would, on the hardware each asset
+# targets, for every release -- and on demand for the ones already published.
+#
+# Read-only: contents: read is the only permission, and this workflow uploads
+# nothing, so like ci.yml it needs no guards. It deliberately does NOT touch
+# sqlite-vendor-release.yml -- that workflow publishes; this one only checks
+# that what was published works.
+#
+# WHY THIS EXISTS
+# ---------------
+# The release job proves each asset runs on its native runner before upload.
+# What it does not prove is the thing a consumer actually does: download the
+# asset from the release, checksum it, import the package the way the README
+# says to -- from a raw.githubusercontent.com URL pinned to a commit -- and
+# fire a hook. That path was first exercised by hand for x86_64 (issue #3,
+# x86_64 leg, 2026-09-10); the aarch64 leg had never been followed outside the
+# build job. Triggering on `release: published` closes both legs for every
+# future release; workflow_dispatch reaches back to the releases that shipped
+# before this workflow existed.
+#
+# WHAT A RUN ASSERTS, in order:
+#   1. the release's SHA256SUMS covers this runner's .so, and the downloaded
+#      asset matches it (sha256sum -c, exit 0),
+#   2. the import map from README -- the two exact keys for this package's
+#     exports plus `@std/path` -- resolves against raw.githubusercontent.com,
+#     pinned to the COMMIT the tag names, not the tag: the README pins
+#     commits, so the exercise must too,
+#   3. a hook actually fires against the downloaded library, and
+#   4. sqlite_version() from that library equals the version the tag names,
+#     so the binary cannot be some other build wearing the tag's name.
+#
+# WHY A SCRATCH DIRECTORY, NOT THE CHECKED-OUT TREE. A consumer has no
+# checkout. Everything the consumer needs is either downloaded (the asset) or
+# remote (the modules); the import map and the exercise script are written to
+# $RUNNER_TEMP. Checking out the repo would let the exercise accidentally read
+# vendor/ or the working tree and pass for a reason a consumer does not have.
+name: release-consumption
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to exercise (e.g. sqlite-vendor-v3.53.4)"
+        required: true
+        default: "sqlite-vendor-v3.53.4"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-consumption-${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  consume:
+    # Every assertion in this workflow is about a vendored-library release:
+    # the asset names, SHA256SUMS, and the version encoded in the tag. A
+    # release of any other kind would resolve its commit and then fail red on
+    # the asset 404 -- loud, but noise. Only vendor tags get exercised.
+    if: startsWith(github.event.release.tag_name || inputs.tag, 'sqlite-vendor-v')
+    name: consume ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      # The release event carries tag_name; the dispatched one carries the
+      # input. The env above normalizes them, so every step below is
+      # identical whichever path got us here.
+      - name: Resolve the tag to the commit it names
+        # The README's import map pins a commit. Tags here are annotated, so
+        # ls-remote for the peeled ref (^{}) gets the commit; the fallback
+        # covers a lightweight tag, where the ref IS the commit. No token:
+        # ls-remote over https needs none for a public repository.
+        run: |
+          peeled="$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${TAG}^{}" | cut -f1)"
+          if [ -z "$peeled" ]; then
+            peeled="$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${TAG}" | cut -f1)"
+          fi
+          if [ -z "$peeled" ]; then
+            echo "::error::tag ${TAG} did not resolve to any commit"
+            exit 1
+          fi
+          echo "COMMIT_SHA=${peeled}" >> "$GITHUB_ENV"
+          echo "tag ${TAG} resolves to commit ${peeled}"
+
+      - name: Map the runner to the release asset
+        # The asset names encode the target triple, and the runner's uname
+        # decides which one this job is for. Unknown architecture: fail here,
+        # loudly, rather than downloading and checksumming nothing.
+        run: |
+          case "$(uname -m)" in
+            x86_64)  echo "TARGET=linux-x86_64-gnu"   >> "$GITHUB_ENV" ;;
+            aarch64) echo "TARGET=linux-aarch64-gnu"  >> "$GITHUB_ENV" ;;
+            *) echo "::error::no release asset for $(uname -m)"; exit 1 ;;
+          esac
+
+      - name: Download the library and SHA256SUMS
+        # Public release assets download over plain https with no token. The
+        # release event's own assets would work too, but building the same
+        # URL the dispatch path uses keeps the two triggers on one code path.
+        working-directory: ${{ runner.temp }}
+        run: |
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          # --retry-all-errors, not plain --retry: a 404 is exactly the case
+          # that needs retrying here. On a release: published run the webhook
+          # can fire while the release job is still uploading its nine
+          # assets, and the queue time before a runner starts (minutes on
+          # ubuntu-24.04-arm) is not a guarantee the uploads finished.
+          curl -fsSL --retry 5 --retry-all-errors -O "$base/libsqlite3-${TARGET}.so"
+          curl -fsSL --retry 5 --retry-all-errors -O "$base/SHA256SUMS"
+          ls -l "libsqlite3-${TARGET}.so" SHA256SUMS
+
+      - name: Verify the checksum
+        # Only this runner's .so line is checked, but SHA256SUMS as a whole
+        # was downloaded, so the format is real: a checksums file that lost
+        # the line would fail the grep, not pass vacuously.
+        working-directory: ${{ runner.temp }}
+        run: |
+          grep "libsqlite3-${TARGET}\.so$" SHA256SUMS | sha256sum -c -
+
+      - name: Write the consumer's import map
+        # The exact map from README: one key per export, no trailing-slash
+        # key -- a subpath under a prefix key resolves to a directory URL and
+        # raw.githubusercontent.com 404s it (measured 2026-09-10) -- plus the
+        # one consumer-side entry the package needs, `@std/path`.
+        working-directory: ${{ runner.temp }}
+        run: |
+          cat > deno.json <<JSON
+          {
+            "imports": {
+              "@jbsiddall/reactive-sqlite": "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${COMMIT_SHA}/mod.ts",
+              "@jbsiddall/reactive-sqlite/driver": "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${COMMIT_SHA}/driver/mod.ts",
+              "@std/path": "jsr:@std/path@^1"
+            }
+          }
+          JSON
+          cat deno.json
+
+      - name: Write the exercise
+        # The consumer script: import by the documented specifiers, fire a
+        # hook, read the version. DENO_SQLITE_PATH must hold the downloaded
+        # asset's path BEFORE the import runs -- the driver reads it once at
+        # import time, and a consumer tree has no vendor/ fallback.
+        working-directory: ${{ runner.temp }}
+        run: |
+          cat > consume.ts <<'TS'
+          import { Database } from "@jbsiddall/reactive-sqlite/driver";
+          import { withEvents } from "@jbsiddall/reactive-sqlite";
+
+          const libPath = Deno.env.get("DENO_SQLITE_PATH");
+          if (!libPath) throw new Error("DENO_SQLITE_PATH is not set");
+          const expected = Deno.env.get("EXPECTED_VERSION");
+          if (!expected) throw new Error("EXPECTED_VERSION is not set");
+
+          const db = new Database("consume.db");
+          db.exec("CREATE TABLE demo (id INTEGER PRIMARY KEY, v TEXT)");
+
+          let commits = 0;
+          await withEvents(db, (ev) => {
+            if (ev.type === "postcommit") commits++;
+          }, libPath);
+
+          db.exec("INSERT INTO demo (v) VALUES ('hello')");
+          const version = db.prepare("select sqlite_version() as v").value<[string]>()![0];
+          db.close();
+
+          if (commits < 1) {
+            throw new Error("no postcommit event was observed");
+          }
+          if (version !== expected) {
+            throw new Error(
+              `sqlite_version() reported ${version}, but the tag names ${expected}`,
+            );
+          }
+          console.log(
+            `consumption ok: ${commits} postcommit event(s), sqlite ${version}, library ${libPath}`,
+          );
+          TS
+          cat consume.ts
+
+      - name: Install Deno
+        uses: denoland/setup-deno@v2
+        with:
+          # Same pin as sqlite-vendor.yml. (ci.yml pins v2.x, which floats.)
+          deno-version: "2.8.2"
+
+      - name: Run the exercise
+        # The version assertion is the tag's own promise: the part of the
+        # tag after `sqlite-vendor-v` must be what the downloaded library
+        # reports, or this run exercised something other than the release.
+        working-directory: ${{ runner.temp }}
+        env:
+          EXPECTED_VERSION: ${{ env.TAG }}
+          DENO_SQLITE_PATH: ${{ runner.temp }}/libsqlite3-${{ env.TARGET }}.so
+        run: |
+          EXPECTED_VERSION="${EXPECTED_VERSION#sqlite-vendor-v}"
+          deno run --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write consume.ts
