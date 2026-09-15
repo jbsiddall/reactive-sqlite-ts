@@ -72,8 +72,11 @@ deno run --unstable-ffi --allow-ffi --allow-env --allow-read --allow-write app.t
 ### Installing the prebuilt library, in three steps
 
 The asset names and the URL shape are frozen by the release workflow; the tagged
-release `sqlite-vendor-v3.53.4` is live, and the steps below are the ones every
-`sqlite-vendor-v*` tag makes work.
+release `sqlite-vendor-v3.53.4-r2` is live, and the steps below are the ones
+every `sqlite-vendor-v*` tag makes work. A tag may carry a `-rN` revision
+suffix: the same SQLite version, rebuilt. `sqlite-vendor-v3.53.4-r2` is the
+first such tag — it is `3.53.4` built with the link flag the original lacked,
+and it is the one to use. See the note on the first release in `TODO.md`.
 
 A tagged release publishes, for each target, a `.tar.gz` and a bare
 `libsqlite3-<target>.so`. These steps use the bare `.so`, because `Deno.dlopen`
@@ -91,7 +94,7 @@ to build its own with `vendor/build.sh`, which ships inside the package.
 **1. Download the `.so` for your target.**
 
 ```sh
-TAG=sqlite-vendor-v3.53.4
+TAG=sqlite-vendor-v3.53.4-r2
 TARGET=linux-x86_64-gnu   # or linux-aarch64-gnu; there is no musl target
 BASE=https://github.com/jbsiddall/reactive-sqlite-ts/releases/download/$TAG
 

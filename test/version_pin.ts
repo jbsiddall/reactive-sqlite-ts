@@ -33,6 +33,25 @@
  * formatting change that defeats the extraction is exactly the event that must
  * not pass silently.
  *
+ * THE REVISION SUFFIX, AND WHY THE STRICTNESS SURVIVES IT
+ * ------------------------------------------------------
+ * A release tag may carry a revision suffix: `sqlite-vendor-v3.53.4-r2`. The
+ * suffix exists because a rebuild of the same SQLite version still needs a name
+ * of its own -- the vendored library's link line changed, the version did not.
+ *
+ * The suffix is admitted by TAG_VERSION below and STRIPPED before the
+ * comparison, so the base part is still required to equal `vendor/build.sh`'s
+ * pin: a tag whose base moved without build.sh moving still goes red. The gate
+ * this check is built around is intact, not widened.
+ *
+ * What it cannot see is whether a release for that exact suffix was ever
+ * published -- `-r9` on the first rebuild would pass here. That is not this
+ * check's job: `release-consumption.yml` runs against the real release and
+ * downloads the real asset, so a suffix nobody published fails there.
+ *
+ * The build.sh side takes NO suffix. `SEMVER` remains exact, because
+ * `SQLITE_VERSION` is a version sqlite.org published and nothing else.
+ *
  * A NOTE ON A TEMPTING SHORTCUT. `grep -o '[0-9.]*'` over that region of
  * build.sh does not work: `SQLITE_AMALGAMATION="sqlite-amalgamation-3530400"`
  * sits on the next line and yields `3530400`, a plausible-looking number that
@@ -46,6 +65,16 @@ const ROOT = new URL("../", import.meta.url);
 
 /** Three parts, optionally four — SQLite uses both (3.53.4, 3.45.1, 3.8.10.2). */
 const SEMVER = /^\d+\.\d+\.\d+(?:\.\d+)?$/;
+
+/**
+ * A version as a RELEASE TAG carries it: the same shape, plus an optional
+ * `-rN` revision suffix naming a rebuild of that same version. Only a tag may
+ * carry one; see the note on the revision suffix above.
+ */
+const TAG_VERSION = /^\d+\.\d+\.\d+(?:\.\d+)?(?:-r\d+)?$/;
+
+/** A tag's version without its revision suffix: `3.53.4-r2` -> `3.53.4`. */
+const baseVersion = (version: string): string => version.replace(/-r\d+$/, "");
 
 /**
  * The tag glob, as prose writes it. It is not a version and must not be read as
@@ -146,7 +175,7 @@ export function versionPinResults(): Result[] {
     );
     return results;
   }
-  const bad = quoted.filter((v) => !SEMVER.test(v));
+  const bad = quoted.filter((v) => !TAG_VERSION.test(v));
   if (bad.length > 0) {
     add(
       "README.md quotes a release tag",
@@ -173,11 +202,12 @@ export function versionPinResults(): Result[] {
   );
 
   const readme = distinct[0]!;
+  const readmeBase = baseVersion(readme);
   add(
     "the documented download URL names the version build.sh builds",
-    readme === built.version,
-    readme === built.version
-      ? built.version
+    readmeBase === built.version,
+    readmeBase === built.version
+      ? readme
       : `README.md says ${readme}, vendor/build.sh builds ${built.version}`,
   );
   return results;

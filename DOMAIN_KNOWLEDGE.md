@@ -239,20 +239,42 @@ different one. That is unmeasured and unmeasurable from here.
 
 ### `-Wl,-Bsymbolic` is the link flag that survives the interposing host (2026-09-15)
 
-**Observed in the consuming project, not here, and on a different host from
-every measurement above.** Deno 2.9.5 from nixpkgs, whose `DT_NEEDED` names the
-unversioned `libsqlite3.so` (nixpkgs' sqlite 3.53.3) — the interposing shape
-described above, one Deno version and one platform away from the 2026-09-10
-observation. A probe through `Deno.dlopen` on a `vendor/build.sh` artefact with
-no `-Bsymbolic` on its link line: `sqlite3_libversion()` returned **3.53.3**,
-and both `sqlite3_initialize()` and `sqlite3_open_v2()` killed the process with
-`SIGSEGV`. The same probe on the same build linked **with** `-Wl,-Bsymbolic`
-returned **3.53.4** and initialized cleanly. The flag is now on that link line.
+**Observed in the consuming project, then reproduced here, and on a different
+host from every measurement above.** Deno 2.9.5 from nixpkgs, whose `DT_NEEDED`
+names the unversioned `libsqlite3.so` (nixpkgs' sqlite 3.53.3) — the interposing
+shape described above, one Deno version and one platform away from the
+2026-09-10 observation. A probe through `Deno.dlopen` on a `vendor/build.sh`
+artefact with no `-Bsymbolic` on its link line: `sqlite3_libversion()` returned
+**3.53.3**, and both `sqlite3_initialize()` and `sqlite3_open_v2()` killed the
+process with `SIGSEGV`. The same probe on the same build linked **with**
+`-Wl,-Bsymbolic` returned **3.53.4** and initialized cleanly. The flag is now on
+that link line.
+
+**Reproduced 2026-09-15, first-hand, outside this tree and against this
+repository's own output.** The two arms above were re-run from a scratch
+directory, one process per arm, on the two artifacts side by side: the published
+2026-09-10 asset (`libsqlite3-linux-x86_64-gnu.so`, no flag) and a local
+`vendor/build.sh` build of this branch (flag). One process per arm is not
+styling: the failing arm dies of `SIGSEGV`, and a single process running both
+arms would never reach the second one. Results, verbatim from the run,
+`deno 2.9.5 (stable, release, x86_64-unknown-linux-gnu)`:
+
+```
+old asset: libversion = 3.53.3   -> SIGSEGV (core dumped), EXIT=139
+new build: libversion = 3.53.4   initialize = 0   open_v2 = 0   SURVIVED, EXIT=0
+```
+
+The old arm's `3.53.3` is nixpkgs' version, not the file's own 3.53.4 — the
+second independent sighting of that substitution, and consistent with the
+SONAME-collision reading of the 2026-09-10 result above. The new arm's `3.53.4`
+is this build's, reported by a call the flag kept inside it. The reproduction
+host is not necessarily the consuming project's host, so the two are recorded
+separately; the first observation stands as the consuming-side one.
 
 **This does not un-falsify the SONAME result above, and the difference is the
 point.** That measurement renamed the artefact's SONAME and changed nothing.
 `-Bsymbolic` changes something else: at link time it binds the file's own
-references to its own definitions, so a call made *inside* `sqlite3.c` cannot be
+references to its own definitions, so a call made _inside_ `sqlite3.c` cannot be
 resolved to an earlier-loaded definition the host exports. A rename cannot do
 that, and neither can a consumer, because the binding is a property of how the
 file was linked.

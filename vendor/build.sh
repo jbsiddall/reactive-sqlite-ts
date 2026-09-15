@@ -219,15 +219,17 @@ for f in "${FLAGS[@]}"; do DEFINES+=("-D${f}"); done
 # The failure it prevents is version skew, not a SONAME collision; the SONAME
 # does not enter into it either way.
 #
-# Measured 2026-09-15, NOT on this machine and not in this repository: in the
-# consuming project (top-hat), under a nixpkgs Deno 2.9.5 whose DT_NEEDED names
-# the unversioned libsqlite3.so (3.53.3), which is the interposing shape. A
-# probe through Deno.dlopen against this build: without the flag
-# sqlite3_libversion() returned 3.53.3, and sqlite3_initialize() and
-# sqlite3_open_v2() each killed the process with SIGSEGV; with the flag the same
-# probe reports 3.53.4 and both initialize cleanly. That is a second host and a
-# second Deno from the 2026-09-10 observation above, and neither is a claim
-# about the other.
+# Measured 2026-09-15, in the consuming project (top-hat), and then reproduced
+# the same day outside this tree against this script's own output: a probe
+# through Deno.dlopen under a nixpkgs Deno 2.9.5 whose DT_NEEDED names the
+# unversioned libsqlite3.so (3.53.3), which is the interposing shape. Without
+# the flag sqlite3_libversion() answered 3.53.3 and sqlite3_initialize() killed
+# the process with SIGSEGV (exit 139); with it the same probe reports 3.53.4,
+# initializes, opens a database and exits 0. Recorded here, in the repository
+# that owns the flag, even though the first observation was a consumer's: the
+# reproduction was run against the artifact this line produces. That is a
+# second host and a second Deno from the 2026-09-10 observation above, and
+# neither is a claim about the other.
 COMMON=(-fPIC -O2 -DNDEBUG -I"${AMALG}")
 if [ "$OS" = darwin ]; then
   LINK=(-dynamiclib -install_name "@rpath/${SO_NAME}")

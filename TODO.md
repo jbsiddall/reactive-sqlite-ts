@@ -32,23 +32,31 @@ reading five of them.
   the four assets plus `SHA256SUMS` — non-draft, with byte sizes matching the
   records in `vendor/README.md`. The download URLs in `README.md` resolve and
   the x86_64 asset verifies against `SHA256SUMS` (`sha256sum -c` exit 0).
-- **That first asset is defective, and is being replaced under the same tag.**
-  Its link line lacked `-Wl,-Bsymbolic`, so on a host that exports its own
-  `libsqlite3` — the nixpkgs Deno, whose `DT_NEEDED` names the unversioned
-  `libsqlite3.so` — the library's internal calls resolve to the host's copy.
-  Measured 2026-09-15 in the consuming project: without the flag
-  `sqlite3_initialize()` and `sqlite3_open_v2()` each kill the process with
-  `SIGSEGV`; with it, the same probe initializes cleanly and reports 3.53.4.
-  Every check that shipped passed, because nothing above opens a database
-  through the interposing host. The fix is one flag in `vendor/build.sh`. The
-  SQLite version does not change, so the tag cannot either — `test/version_pin.ts`
-  requires the README's tag to be the version `vendor/build.sh` builds, and
-  `release-consumption.yml` requires the tag's suffix to equal the library's
-  reported `sqlite_version()`; **no suffix is usable**. So the rebuilt asset
-  republishes as `sqlite-vendor-v3.53.4`, the tag force-moved to the fix commit
-  and the 2026-09-10 Release deleted first. The bullet above records what was
-  true on 2026-09-10 and is not being rewritten; the x86_64 end-to-end run and
-  the byte sizes it cites belong to the asset that is going away.
+- **That first asset is defective, and is replaced under a NEW tag.** Its link
+  line lacked `-Wl,-Bsymbolic`, so on a host that exports its own `libsqlite3` —
+  the nixpkgs Deno, whose `DT_NEEDED` names the unversioned `libsqlite3.so` —
+  the library's internal calls resolve to the host's copy. Measured 2026-09-15
+  in the consuming project, and reproduced the same day outside this tree
+  against `vendor/build.sh`'s own output on a host with that Deno 2.9.5: without
+  the flag `sqlite3_libversion()` answers 3.53.3 and `sqlite3_initialize()`
+  kills the process with `SIGSEGV` (exit 139); with it the same probe reports
+  3.53.4, initializes, opens a database and exits 0. Every check that shipped
+  passed, because nothing above opens a database through the interposing host.
+  The fix is one flag in `vendor/build.sh`.
+- **The rebuild ships as `sqlite-vendor-v3.53.4-r2`, not under the old tag.**
+  The SQLite version does not change, so the tag cannot either without a
+  revision suffix: `test/version_pin.ts` requires the README's tag to name the
+  version `vendor/build.sh` builds, and `release-consumption.yml` requires the
+  same of the library's reported `sqlite_version()`. Both now accept and strip a
+  trailing `-rN`, which is the smallest change that lets a rebuild have a name
+  of its own; the base version is still required to match, so neither check lost
+  its teeth. `sqlite-vendor-v3.53.4` and its 2026-09-10 Release (id 386666609)
+  are **left exactly as they are** — a force-move was considered and rejected:
+  anyone who already fetched those URLs keeps getting the bytes they
+  checksummed, and the defective asset is superseded rather than swapped out
+  from under them. The bullet above records what was true on 2026-09-10 and is
+  not being rewritten; the x86_64 end-to-end run and the byte sizes it cites
+  belong to the old asset, which remains published and is not the one to use.
 - **The install has been followed end to end, x86_64.** A scratch project
   outside this tree downloaded the release asset, verified it, imported the
   driver and hooks from a pinned commit, and observed a fired update hook and
