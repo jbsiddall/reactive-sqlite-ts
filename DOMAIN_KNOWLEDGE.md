@@ -237,6 +237,41 @@ that job resolved was one specific store path, from the flake registry pin that
 runner had on 2026-09-10. A user on another nixpkgs revision may resolve a
 different one. That is unmeasured and unmeasurable from here.
 
+### `-Wl,-Bsymbolic` is the link flag that survives the interposing host (2026-09-15)
+
+**Observed in the consuming project, not here, and on a different host from
+every measurement above.** Deno 2.9.5 from nixpkgs, whose `DT_NEEDED` names the
+unversioned `libsqlite3.so` (nixpkgs' sqlite 3.53.3) — the interposing shape
+described above, one Deno version and one platform away from the 2026-09-10
+observation. A probe through `Deno.dlopen` on a `vendor/build.sh` artefact with
+no `-Bsymbolic` on its link line: `sqlite3_libversion()` returned **3.53.3**,
+and both `sqlite3_initialize()` and `sqlite3_open_v2()` killed the process with
+`SIGSEGV`. The same probe on the same build linked **with** `-Wl,-Bsymbolic`
+returned **3.53.4** and initialized cleanly. The flag is now on that link line.
+
+**This does not un-falsify the SONAME result above, and the difference is the
+point.** That measurement renamed the artefact's SONAME and changed nothing.
+`-Bsymbolic` changes something else: at link time it binds the file's own
+references to its own definitions, so a call made *inside* `sqlite3.c` cannot be
+resolved to an earlier-loaded definition the host exports. A rename cannot do
+that, and neither can a consumer, because the binding is a property of how the
+file was linked.
+
+**Mechanism (inferred, unverified).** It would explain both observations at once
+if `sqlite3_libversion()` is a thin wrapper over `sqlite3_libversion_number()`:
+the entry point reached through the handle is this build's, while the internal
+call it makes is a relocation the host's earlier definition wins. That is
+consistent with `dladdr` naming this file while the version string answered with
+nixpkgs' — the entry point is where the caller says it is, and the answer comes
+from one call deeper. Stated as inference because it was not tested; what was
+tested is the before-and-after above.
+
+**What this does NOT establish.** That a `-Bsymbolic` build is safe on every
+interposing host. One host, one Deno, one library version. It removes the
+measured failure mode on the measured configuration, and the failure mode it
+removes is the one that shipped in the first release asset — see the note on
+that release in `TODO.md`.
+
 ## SQLite: attribution hazards for a query-to-tables map
 
 **UNSTAMPED.** These were measured while the authorizer hook was built, but the

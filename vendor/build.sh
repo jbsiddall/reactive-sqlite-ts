@@ -211,12 +211,29 @@ for f in "${FLAGS[@]}"; do DEFINES+=("-D${f}"); done
 # SONAME colliding with nothing behaved identically. So the SONAME here buys
 # tidiness, not isolation: nothing about this link line guarantees that the file
 # a caller names is the file that answers.
+#
+# -Wl,-Bsymbolic is the flag that does buy that isolation, and it was missing
+# here. It binds this file's internal references to its own definitions at link
+# time, so a call made inside sqlite3.c reaches the sqlite3.c that made it
+# rather than an earlier-loaded definition the host process happens to export.
+# The failure it prevents is version skew, not a SONAME collision; the SONAME
+# does not enter into it either way.
+#
+# Measured 2026-09-15, NOT on this machine and not in this repository: in the
+# consuming project (top-hat), under a nixpkgs Deno 2.9.5 whose DT_NEEDED names
+# the unversioned libsqlite3.so (3.53.3), which is the interposing shape. A
+# probe through Deno.dlopen against this build: without the flag
+# sqlite3_libversion() returned 3.53.3, and sqlite3_initialize() and
+# sqlite3_open_v2() each killed the process with SIGSEGV; with the flag the same
+# probe reports 3.53.4 and both initialize cleanly. That is a second host and a
+# second Deno from the 2026-09-10 observation above, and neither is a claim
+# about the other.
 COMMON=(-fPIC -O2 -DNDEBUG -I"${AMALG}")
 if [ "$OS" = darwin ]; then
   LINK=(-dynamiclib -install_name "@rpath/${SO_NAME}")
   LIBS=(-lpthread)
 else
-  LINK=(-shared -Wl,-soname,"${SO_NAME}")
+  LINK=(-shared -Wl,-Bsymbolic -Wl,-soname,"${SO_NAME}")
   LIBS=(-lpthread -lm -ldl)
 fi
 
